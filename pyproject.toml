@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "r3dsplat"
+version = "0.1.0"
+description = "Internal RED R3D to 4D Gaussian Splatting pipeline"
+requires-python = ">=3.11"
+dependencies = [
+  "torch>=2.1",
+  "typer>=0.12",
+  "pyyaml>=6.0",
+  "numpy>=1.26",
+  "pillow>=10.0",
+]
+
+[project.scripts]
+r3dsplat = "r3dsplat.cli:app"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.pytest.ini_options]
+markers = [
+  "real_backend: environment-gated tests that require real external backends",
+]
