@@ -3,9 +3,10 @@ from __future__ import annotations
 import importlib
 import math
 import os
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -13,7 +14,9 @@ import torch
 from .metadata import CameraInfo, CameraRecord, ClipRecord, ColorInfo, ExposureInfo, FrameRecord, MotionInfo
 
 
-DecodedFrames = List[Tuple[FrameRecord, torch.Tensor]]
+DecodedFrame = Tuple[FrameRecord, torch.Tensor]
+DecodedFrames = Iterable[DecodedFrame]
+ProgressCallback = Callable[[Dict[str, Any]], None]
 
 
 class IngestBackend(ABC):
@@ -24,7 +27,15 @@ class IngestBackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def decode_clip(self, source_path: str) -> Tuple[ClipRecord, DecodedFrames]:
+    def decode_clip(
+        self,
+        source_path: str,
+        *,
+        start_frame: int = 0,
+        max_frames: Optional[int] = None,
+        frame_step: int = 1,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> Tuple[ClipRecord, DecodedFrames]:
         raise NotImplementedError
 
     def diagnostics(self) -> Dict[str, Any]:
@@ -52,59 +63,88 @@ class MockIngestBackend(IngestBackend):
             color_info=ColorInfo(color_space="linear", gamma_curve="linear", raw_bit_depth=16),
         )
 
-    def decode_clip(self, source_path: str) -> Tuple[ClipRecord, DecodedFrames]:
+    def decode_clip(
+        self,
+        source_path: str,
+        *,
+        start_frame: int = 0,
+        max_frames: Optional[int] = None,
+        frame_step: int = 1,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> Tuple[ClipRecord, DecodedFrames]:
         clip = self.inspect_clip(source_path)
-        frames: DecodedFrames = []
+        selected_indices = _select_frame_indices(
+            total_frames=clip.total_frames,
+            start_frame=start_frame,
+            max_frames=max_frames,
+            frame_step=frame_step,
+        )
         yy, xx = torch.meshgrid(
             torch.linspace(-1.0, 1.0, clip.height),
             torch.linspace(-1.0, 1.0, clip.width),
             indexing="ij",
         )
-        for frame_index in range(clip.total_frames):
-            t = frame_index / clip.fps
-            cx = math.sin(t * 2.0) * 0.35
-            cy = math.cos(t * 1.5) * 0.25
-            gaussian = torch.exp(-(((xx - cx) ** 2) + ((yy - cy) ** 2)) / 0.12)
-            rgb = torch.stack(
-                [
-                    gaussian,
-                    torch.exp(-(((xx + cx * 0.7) ** 2) + ((yy - cy * 0.2) ** 2)) / 0.18),
-                    0.5 * gaussian + 0.3,
-                ],
-                dim=0,
-            ).clamp(0.0, 1.0)
-            camera = CameraInfo(
-                fx=60.0,
-                fy=60.0,
-                cx=clip.width / 2.0,
-                cy=clip.height / 2.0,
-                view_matrix=[
-                    [1.0, 0.0, 0.0, 0.0],
-                    [0.0, 1.0, 0.0, 0.0],
-                    [0.0, 0.0, 1.0, -3.0],
-                    [0.0, 0.0, 0.0, 1.0],
-                ],
-            )
-            record = FrameRecord(
-                clip_id=clip.clip_id,
-                frame_index=frame_index,
-                timestamp_seconds=t,
-                timecode=f"00:00:00:{frame_index:02d}",
-                decode_status="decoded",
-                camera_record_id=f"{clip.clip_id}:{frame_index:06d}:camera",
-                exposure_info=ExposureInfo(iso=800.0, shutter_seconds=1.0 / clip.fps),
-                white_balance=5600.0,
-                orientation="landscape",
-                color_info=clip.color_info,
-                motion_info=MotionInfo(
-                    camera_translation=[0.0, 0.0, -3.0],
-                    camera_rotation_quat_wxyz=[1.0, 0.0, 0.0, 0.0],
-                ),
-                camera=camera,
-                cache_path="",
-            )
-            frames.append((record, rgb.to(dtype=torch.float32)))
-        return clip, frames
+        start_time = time.perf_counter()
+
+        def iterator() -> Iterator[DecodedFrame]:
+            for completed, frame_index in enumerate(selected_indices, start=1):
+                t = frame_index / clip.fps
+                cx = math.sin(t * 2.0) * 0.35
+                cy = math.cos(t * 1.5) * 0.25
+                gaussian = torch.exp(-(((xx - cx) ** 2) + ((yy - cy) ** 2)) / 0.12)
+                rgb = torch.stack(
+                    [
+                        gaussian,
+                        torch.exp(-(((xx + cx * 0.7) ** 2) + ((yy - cy * 0.2) ** 2)) / 0.18),
+                        0.5 * gaussian + 0.3,
+                    ],
+                    dim=0,
+                ).clamp(0.0, 1.0)
+                camera = CameraInfo(
+                    fx=60.0,
+                    fy=60.0,
+                    cx=clip.width / 2.0,
+                    cy=clip.height / 2.0,
+                    view_matrix=[
+                        [1.0, 0.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0, 0.0],
+                        [0.0, 0.0, 1.0, -3.0],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ],
+                )
+                record = FrameRecord(
+                    clip_id=clip.clip_id,
+                    frame_index=frame_index,
+                    timestamp_seconds=t,
+                    timecode=f"00:00:00:{frame_index:02d}",
+                    decode_status="decoded",
+                    camera_record_id=f"{clip.clip_id}:{frame_index:06d}:camera",
+                    exposure_info=ExposureInfo(iso=800.0, shutter_seconds=1.0 / clip.fps),
+                    white_balance=5600.0,
+                    orientation="landscape",
+                    color_info=clip.color_info,
+                    motion_info=MotionInfo(
+                        camera_translation=[0.0, 0.0, -3.0],
+                        camera_rotation_quat_wxyz=[1.0, 0.0, 0.0, 0.0],
+                    ),
+                    camera=camera,
+                    cache_path="",
+                )
+                if progress_callback is not None:
+                    elapsed = max(time.perf_counter() - start_time, 1e-6)
+                    progress_callback(
+                        {
+                            "frame_index": frame_index,
+                            "completed": completed,
+                            "total": len(selected_indices),
+                            "percent": (completed / len(selected_indices)) * 100.0 if selected_indices else 100.0,
+                            "elapsed_seconds": elapsed,
+                            "decode_fps": completed / elapsed,
+                        }
+                    )
+                yield record, rgb.to(dtype=torch.float32)
+
+        return clip, iterator()
 
     def diagnostics(self) -> Dict[str, Any]:
         return {
@@ -135,16 +175,45 @@ class RedSdkIngestBackend(IngestBackend):
         payload = self._decoder.inspect_clip(source_path)
         return ClipRecord.from_dict(payload)
 
-    def decode_clip(self, source_path: str) -> Tuple[ClipRecord, DecodedFrames]:
+    def decode_clip(
+        self,
+        source_path: str,
+        *,
+        start_frame: int = 0,
+        max_frames: Optional[int] = None,
+        frame_step: int = 1,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> Tuple[ClipRecord, DecodedFrames]:
         clip = self.inspect_clip(source_path)
         frames_payload = self._decoder.list_frames(source_path)
-        frames: DecodedFrames = []
-        for item in frames_payload["frames"]:
-            decoded = self._decoder.decode_frame(source_path, item["frame_index"])
-            frame_tensor = self._decode_tensor_payload(decoded["frame"])
-            frame_record = self._normalize_frame_record(clip, item, decoded.get("frame_metadata", {}))
-            frames.append((frame_record, frame_tensor))
-        return clip, frames
+        selected_items = _select_frame_items(
+            frames_payload["frames"],
+            start_frame=start_frame,
+            max_frames=max_frames,
+            frame_step=frame_step,
+        )
+        start_time = time.perf_counter()
+
+        def iterator() -> Iterator[DecodedFrame]:
+            for completed, item in enumerate(selected_items, start=1):
+                decoded = self._decoder.decode_frame(source_path, item["frame_index"])
+                frame_tensor = self._decode_tensor_payload(decoded["frame"])
+                frame_record = self._normalize_frame_record(clip, item, decoded.get("frame_metadata", {}))
+                if progress_callback is not None:
+                    elapsed = max(time.perf_counter() - start_time, 1e-6)
+                    progress_callback(
+                        {
+                            "frame_index": int(item["frame_index"]),
+                            "completed": completed,
+                            "total": len(selected_items),
+                            "percent": (completed / len(selected_items)) * 100.0 if selected_items else 100.0,
+                            "elapsed_seconds": elapsed,
+                            "decode_fps": completed / elapsed,
+                        }
+                    )
+                yield frame_record, frame_tensor
+
+        return clip, iterator()
 
     def diagnostics(self) -> Dict[str, Any]:
         diagnostics = dict(self._decoder.sdk_diagnostics())
@@ -250,3 +319,44 @@ def ingest_backend_summary(backend: str = "auto", sdk_root: Optional[str] = None
         return RedSdkIngestBackend(sdk_root=sdk_root, allow_unavailable=True).diagnostics()
     except Exception:
         return MockIngestBackend().diagnostics()
+
+
+def _select_frame_indices(
+    *,
+    total_frames: int,
+    start_frame: int = 0,
+    max_frames: Optional[int] = None,
+    frame_step: int = 1,
+) -> List[int]:
+    if start_frame < 0:
+        raise ValueError("start_frame must be >= 0")
+    if frame_step <= 0:
+        raise ValueError("frame_step must be >= 1")
+    indices = list(range(start_frame, total_frames, frame_step))
+    if max_frames is not None:
+        if max_frames <= 0:
+            raise ValueError("max_frames must be >= 1 when provided")
+        indices = indices[:max_frames]
+    if not indices:
+        raise ValueError(
+            f"frame selection produced no frames (start_frame={start_frame}, max_frames={max_frames}, frame_step={frame_step}, total_frames={total_frames})"
+        )
+    return indices
+
+
+def _select_frame_items(
+    items: List[Dict[str, Any]],
+    *,
+    start_frame: int = 0,
+    max_frames: Optional[int] = None,
+    frame_step: int = 1,
+) -> List[Dict[str, Any]]:
+    indices = set(
+        _select_frame_indices(
+            total_frames=len(items),
+            start_frame=start_frame,
+            max_frames=max_frames,
+            frame_step=frame_step,
+        )
+    )
+    return [item for item in items if int(item["frame_index"]) in indices]

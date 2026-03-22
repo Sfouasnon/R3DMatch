@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from .cache import SequenceCache
 from .ingest_backends import resolve_ingest_backend
@@ -17,14 +18,34 @@ def ingest_clip(
     dataset_dir: str,
     backend: str = "auto",
     sdk_root: Optional[str] = None,
+    start_frame: int = 0,
+    max_frames: Optional[int] = None,
+    frame_step: int = 1,
+    progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> Path:
     decoder = resolve_ingest_backend(backend=backend, sdk_root=sdk_root)
-    clip, decoded = decoder.decode_clip(source_path)
+    ingest_started = time.perf_counter()
+    clip, decoded = decoder.decode_clip(
+        source_path,
+        start_frame=start_frame,
+        max_frames=max_frames,
+        frame_step=frame_step,
+        progress_callback=progress_callback,
+    )
     cache = SequenceCache(dataset_dir)
+    selected_frame_indices = list(range(start_frame, clip.total_frames, frame_step))
+    if max_frames is not None:
+        selected_frame_indices = selected_frame_indices[:max_frames]
     transforms_log = [
         "decode_backend: {backend}".format(backend=decoder.name),
         "cache: frame tensors serialized as torch .pt files in CHW float32 layout",
         "dataset: temporal ordering preserved exactly as decoded",
+        "frame_selection: start_frame={start_frame}, max_frames={max_frames}, frame_step={frame_step}, selected_count={selected_count}".format(
+            start_frame=start_frame,
+            max_frames="all" if max_frames is None else max_frames,
+            frame_step=frame_step,
+            selected_count=len(selected_frame_indices),
+        ),
     ]
 
     frame_records: list[FrameRecord] = []
@@ -57,6 +78,10 @@ def ingest_clip(
         frames=frame_records,
         camera_records=camera_records,
         backend_report=BackendReport(ingest_backend=decoder.name),
-        transforms_log=transforms_log,
+        transforms_log=transforms_log
+        + [
+            "ingest_elapsed_seconds: {elapsed:.3f}".format(elapsed=time.perf_counter() - ingest_started),
+            "dataset_dir: {dataset_dir}".format(dataset_dir=dataset_dir),
+        ],
     )
     return Path(dataset_dir)

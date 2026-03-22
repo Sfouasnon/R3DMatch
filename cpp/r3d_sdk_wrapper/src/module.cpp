@@ -38,10 +38,10 @@ py::dict metadata_to_dict(const Metadata &metadata) {
     for (size_t i = 0; i < metadata.MetadataCount(); ++i) {
         const std::string key = metadata.MetadataItemKey(i);
         switch (metadata.MetadataItemType(i)) {
-            case MetadataType_Int:
+            case MetadataTypeInt:
                 out[py::str(key)] = metadata.MetadataItemAsInt(i);
                 break;
-            case MetadataType_Float:
+            case MetadataTypeFloat:
                 out[py::str(key)] = metadata.MetadataItemAsFloat(i);
                 break;
             default:
@@ -57,10 +57,10 @@ py::dict clip_metadata_to_dict(const Clip &clip) {
     for (size_t i = 0; i < clip.MetadataCount(); ++i) {
         const std::string key = clip.MetadataItemKey(i);
         switch (clip.MetadataItemType(i)) {
-            case MetadataType_Int:
+            case MetadataTypeInt:
                 out[py::str(key)] = clip.MetadataItemAsInt(i);
                 break;
-            case MetadataType_Float:
+            case MetadataTypeFloat:
                 out[py::str(key)] = clip.MetadataItemAsFloat(i);
                 break;
             default:
@@ -185,7 +185,7 @@ public:
         }
 
         VideoDecodeJob job;
-        job.Mode = DECODE_FULL_RES_GOOD;
+        job.Mode = DECODE_FULL_RES_PREMIUM;
         job.PixelType = PixelType_16Bit_RGB_Planar;
         job.OutputBuffer = buffer;
         job.OutputBufferSize = mem_needed;
@@ -232,7 +232,7 @@ private:
     }
 
     RedSdkConfig config_;
-    InitializeStatus init_status_ = ISCouldNotLoadLibraries;
+    InitializeStatus init_status_ = ISLibraryNotLoaded;
     bool initialized_ = false;
 };
 

@@ -16,3 +16,4 @@ colmap-main/
 *.pt
 *.pth
 *.log
+.venv39validate/

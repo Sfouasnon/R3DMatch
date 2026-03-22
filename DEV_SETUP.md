@@ -69,19 +69,52 @@ The Python-side architecture already consumes this boundary through `RedSdkInges
 Synthetic ingest and 4D training:
 
 ```bash
-PYTHONPATH=python python -m r3dsplat ingest synthetic.R3D --out /tmp/r3dsplat_dataset --backend mock
-PYTHONPATH=python python -m r3dsplat train-4d /tmp/r3dsplat_dataset --out /tmp/r3dsplat_run --epochs 6 --window-size 3 --num-gaussians 64
-PYTHONPATH=python python -m r3dsplat eval-4d /tmp/r3dsplat_run/train-4d.pt
-PYTHONPATH=python python -m r3dsplat render-sequence /tmp/r3dsplat_run/train-4d.pt
+PYTHONPATH=python python -m r3dsplat ingest synthetic.R3D --out ~/Desktop/r3dsplat_mock_dataset --backend mock
+PYTHONPATH=python python -m r3dsplat train-4d ~/Desktop/r3dsplat_mock_dataset --out ~/Desktop/r3dsplat_mock_run --epochs 6 --window-size 3 --num-gaussians 64
+PYTHONPATH=python python -m r3dsplat eval-4d ~/Desktop/r3dsplat_mock_run/train-4d.pt
+PYTHONPATH=python python -m r3dsplat render-sequence ~/Desktop/r3dsplat_mock_run/train-4d.pt
 ```
 
 Fiducial and COLMAP geometry steps:
 
 ```bash
-PYTHONPATH=python python -m r3dsplat solve-fiducials /tmp/r3dsplat_dataset --backend mock
-PYTHONPATH=python python -m r3dsplat solve-colmap /tmp/r3dsplat_dataset --mode standard
-PYTHONPATH=python python -m r3dsplat align-world /tmp/r3dsplat_dataset
+PYTHONPATH=python python -m r3dsplat solve-fiducials ~/Desktop/r3dsplat_mock_dataset --backend mock
+PYTHONPATH=python python -m r3dsplat solve-colmap ~/Desktop/r3dsplat_mock_dataset --mode standard
+PYTHONPATH=python python -m r3dsplat align-world ~/Desktop/r3dsplat_mock_dataset
 ```
+
+## Lightweight Real-Footage Validation
+
+For remote Linux workstations, start with a small subset instead of a full 6K clip ingest.
+
+Recommended quick validation:
+
+- first 24 selected frames
+- `frame-step 2`
+- `num-gaussians 64`
+- `epochs 1`
+- `window-size 2`
+
+Example:
+
+```bash
+PYTHONPATH=python python -m r3dsplat ingest /path/to/real_clip.R3D \
+  --out ~/Desktop/r3d_real_test \
+  --backend red-sdk \
+  --max-frames 24 \
+  --frame-step 2
+
+PYTHONPATH=python python -m r3dsplat solve-fiducials ~/Desktop/r3d_real_test
+PYTHONPATH=python python -m r3dsplat align-world ~/Desktop/r3d_real_test
+
+PYTHONPATH=python python -m r3dsplat train-4d ~/Desktop/r3d_real_test \
+  --out ~/Desktop/r3d_real_run \
+  --epochs 1 \
+  --window-size 2 \
+  --num-gaussians 64
+```
+
+The ingest command now prints visible per-frame progress and a final summary including frame range, frames written, manifest path, and elapsed time.
 
 Run tests:
 

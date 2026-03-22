@@ -4,8 +4,10 @@ from pathlib import Path
 
 import pytest
 import torch
+from typer.testing import CliRunner
 
 from r3dsplat.cache import SequenceCache
+from r3dsplat.cli import app
 from r3dsplat.colmap_bridge import ColmapCliBridge, ColmapConfig, parse_images_txt
 from r3dsplat.dataset import TemporalSequenceDataset
 from r3dsplat.fiducials import FiducialConfig, solve_fiducials
@@ -19,6 +21,7 @@ from r3dsplat.training_bridge import GSplatRendererBridge
 
 
 pytestmark = []
+runner = CliRunner()
 
 
 def _make_dataset(tmp_path: Path) -> Path:
@@ -68,6 +71,25 @@ def test_cache_manifest_roundtrip_and_backend_report(tmp_path: Path) -> None:
     assert manifest.backend_report.ingest_backend == "mock"
     first = cache.read_frame(manifest.frames[0])
     assert tuple(first.shape) == (3, 64, 64)
+
+
+def test_ingest_subset_controls_and_progress_callback(tmp_path: Path) -> None:
+    dataset_dir = tmp_path / "subset"
+    progress_events = []
+    ingest_clip(
+        "synthetic.R3D",
+        str(dataset_dir),
+        backend="mock",
+        start_frame=2,
+        max_frames=4,
+        frame_step=2,
+        progress_callback=progress_events.append,
+    )
+    manifest = DatasetManifest.load(dataset_dir)
+    assert [frame.frame_index for frame in manifest.frames] == [2, 4, 6, 8]
+    assert len(progress_events) == 4
+    assert progress_events[-1]["completed"] == 4
+    assert progress_events[-1]["total"] == 4
 
 
 def test_model_forward_shapes() -> None:
@@ -152,6 +174,30 @@ def test_debug_poses_reports_trajectory_summary(tmp_path: Path) -> None:
     assert summary["camera_count"] == 12
     assert summary["status"] == "ok"
     assert "aligned_to_fiducial_world" in summary["alignment_statuses"]
+
+
+def test_ingest_cli_reports_progress_and_summary(tmp_path: Path) -> None:
+    dataset_dir = tmp_path / "cli-dataset"
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "synthetic.R3D",
+            "--out",
+            str(dataset_dir),
+            "--backend",
+            "mock",
+            "--max-frames",
+            "3",
+            "--frame-step",
+            "2",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "[ingest]" in result.stdout
+    assert "[ingest-summary]" in result.stdout
+    manifest = DatasetManifest.load(dataset_dir)
+    assert len(manifest.frames) == 3
 
 
 def test_training_step_executes_with_masks(tmp_path: Path) -> None:
