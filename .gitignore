@@ -17,3 +17,6 @@ colmap-main/
 *.pth
 *.log
 .venv39validate/
+Prog/
+txt/
+*.tar.gz
