@@ -163,8 +163,8 @@ class RedSdkIngestBackend(IngestBackend):
     def __init__(self, sdk_root: Optional[str] = None, allow_unavailable: bool = False):
         self._native_module = importlib.import_module("r3dsplat._r3d_native")
         self._config = self._native_module.RedSdkConfig(
-            sdk_root=sdk_root,
-            libraries_path=os.environ.get("RED_SDK_REDISTRIBUTABLE_DIR"),
+            sdk_root=sdk_root or "",
+            libraries_path=os.environ.get("RED_SDK_REDISTRIBUTABLE_DIR") or "",
         )
         self._decoder = self._native_module.RedDecoderBackend(self._config)
         self._allow_unavailable = allow_unavailable

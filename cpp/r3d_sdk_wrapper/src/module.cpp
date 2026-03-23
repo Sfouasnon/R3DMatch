@@ -237,11 +237,14 @@ private:
 };
 
 PYBIND11_MODULE(_r3d_native, m) {
-    py::class_<RedSdkConfig>(m, "RedSdkConfig")
-        .def(py::init<>())
-        .def_readwrite("sdk_root", &RedSdkConfig::sdk_root)
-        .def_readwrite("libraries_path", &RedSdkConfig::libraries_path)
-        .def_readwrite("use_gpu_decoder", &RedSdkConfig::use_gpu_decoder);
+py::class_<RedSdkConfig>(m, "RedSdkConfig")
+    .def(py::init<const std::string&, const std::string&, bool>(),
+         py::arg("sdk_root") = "",
+         py::arg("libraries_path") = "",
+         py::arg("use_gpu_decoder") = false)
+    .def_readwrite("sdk_root", &RedSdkConfig::sdk_root)
+    .def_readwrite("libraries_path", &RedSdkConfig::libraries_path)
+    .def_readwrite("use_gpu_decoder", &RedSdkConfig::use_gpu_decoder);
 
     py::class_<RedDecoderBackend>(m, "RedDecoderBackend")
         .def(py::init<RedSdkConfig>(), py::arg("config") = RedSdkConfig{})
