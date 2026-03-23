@@ -92,6 +92,25 @@ def test_ingest_subset_controls_and_progress_callback(tmp_path: Path) -> None:
     assert progress_events[-1]["total"] == 4
 
 
+def test_ingest_resize_updates_manifest_and_dataset_shape(tmp_path: Path) -> None:
+    dataset_dir = tmp_path / "resized"
+    ingest_clip(
+        "synthetic.R3D",
+        str(dataset_dir),
+        backend="mock",
+        max_frames=4,
+        max_width=32,
+    )
+    manifest = DatasetManifest.load(dataset_dir)
+    assert manifest.backend_report.ingest_settings["original_width"] == 64
+    assert manifest.backend_report.ingest_settings["cached_width"] == 32
+    assert manifest.frames[0].cached_width == 32
+    dataset = TemporalSequenceDataset(dataset_dir, window_size=2, stride=1)
+    sample = dataset[0]
+    assert sample["frames"].shape == (2, 3, 32, 32)
+    assert sample["cameras"]["Ks"][0, 0, 0].item() == pytest.approx(30.0)
+
+
 def test_model_forward_shapes() -> None:
     canonical = CanonicalGaussianModel(num_gaussians=32, feature_dim=3)
     deform = TimeConditionedDeformationModel(feature_dim=3)
@@ -195,9 +214,32 @@ def test_ingest_cli_reports_progress_and_summary(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0
     assert "[ingest]" in result.stdout
+    assert "[ingest-settings]" in result.stdout
+    assert "[ingest-estimate]" in result.stdout
     assert "[ingest-summary]" in result.stdout
     manifest = DatasetManifest.load(dataset_dir)
     assert len(manifest.frames) == 3
+
+
+def test_ingest_cli_dry_run_writes_no_dataset(tmp_path: Path) -> None:
+    dataset_dir = tmp_path / "dry-run"
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "synthetic.R3D",
+            "--out",
+            str(dataset_dir),
+            "--backend",
+            "mock",
+            "--preset",
+            "quick-test",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "[ingest-dry-run]" in result.stdout
+    assert not dataset_dir.exists()
 
 
 def test_training_step_executes_with_masks(tmp_path: Path) -> None:

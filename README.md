@@ -13,7 +13,7 @@ R3DSplat is an internal Linux-first pipeline for native RED `.R3D` ingest into a
 ## Main Commands
 
 - `r3dsplat inspect <clip.R3D>`
-- `r3dsplat ingest <clip.R3D> --out <dataset_dir> [--start-frame N] [--max-frames N] [--frame-step N]`
+- `r3dsplat ingest <clip.R3D> --out <dataset_dir> [--preset NAME] [--start-frame N] [--max-frames N] [--frame-step N] [--decode-mode MODE] [--resize-scale S | --max-width W --max-height H] [--dry-run]`
 - `r3dsplat solve-fiducials <dataset_dir>`
 - `r3dsplat solve-colmap <dataset_dir>`
 - `r3dsplat align-world <dataset_dir>`
@@ -32,8 +32,19 @@ Example ingest:
 PYTHONPATH=python python -m r3dsplat ingest /path/to/clip.R3D \
   --out ~/Desktop/r3d_real_test \
   --backend red-sdk \
+  --preset quick-test
+```
+
+Equivalent explicit quick-test style ingest:
+
+```bash
+PYTHONPATH=python python -m r3dsplat ingest /path/to/clip.R3D \
+  --out ~/Desktop/r3d_real_test \
+  --backend red-sdk \
   --max-frames 24 \
-  --frame-step 2
+  --frame-step 2 \
+  --decode-mode half-good \
+  --max-width 960
 ```
 
 Example lightweight training:
@@ -44,6 +55,16 @@ PYTHONPATH=python python -m r3dsplat train-4d ~/Desktop/r3d_real_test \
   --epochs 1 \
   --window-size 2 \
   --num-gaussians 64
+```
+
+Dry-run estimate:
+
+```bash
+PYTHONPATH=python python -m r3dsplat ingest /path/to/clip.R3D \
+  --out ~/Desktop/r3d_real_test \
+  --backend red-sdk \
+  --preset desktop-review \
+  --dry-run
 ```
 
 See [DEV_SETUP.md](/Users/sfouasnon/Desktop/R3DSplat/DEV_SETUP.md) and [LOCAL_RED_SDK_SETUP.md](/Users/sfouasnon/Desktop/R3DSplat/LOCAL_RED_SDK_SETUP.md) for environment details.

@@ -160,11 +160,17 @@ class MockIngestBackend(IngestBackend):
 class RedSdkIngestBackend(IngestBackend):
     name = "red-sdk"
 
-    def __init__(self, sdk_root: Optional[str] = None, allow_unavailable: bool = False):
+    def __init__(
+        self,
+        sdk_root: Optional[str] = None,
+        allow_unavailable: bool = False,
+        decode_mode: Optional[str] = None,
+    ):
         self._native_module = importlib.import_module("r3dsplat._r3d_native")
         self._config = self._native_module.RedSdkConfig(
             sdk_root=sdk_root or "",
             libraries_path=os.environ.get("RED_SDK_REDISTRIBUTABLE_DIR") or "",
+            decode_mode=decode_mode or "full-premium",
         )
         self._decoder = self._native_module.RedDecoderBackend(self._config)
         self._allow_unavailable = allow_unavailable
@@ -220,6 +226,7 @@ class RedSdkIngestBackend(IngestBackend):
         diagnostics["backend"] = self.name
         diagnostics["capability"] = self._capability()
         diagnostics["native_module"] = getattr(self._native_module, "__file__", "unknown")
+        diagnostics["decode_mode"] = getattr(self._config, "decode_mode", "full-premium")
         return diagnostics
 
     def _capability(self) -> str:
@@ -287,28 +294,45 @@ class RedSdkIngestBackend(IngestBackend):
 def resolve_ingest_backend(
     backend: str = "auto",
     sdk_root: Optional[str] = None,
+    decode_mode: Optional[str] = None,
 ) -> IngestBackend:
     normalized = backend.lower()
     if normalized == "mock":
         return MockIngestBackend()
     if normalized == "red-sdk":
-        return RedSdkIngestBackend(sdk_root=sdk_root, allow_unavailable=False)
+        return RedSdkIngestBackend(
+            sdk_root=sdk_root,
+            allow_unavailable=False,
+            decode_mode=decode_mode,
+        )
     if normalized != "auto":
         raise ValueError("backend must be one of: auto, mock, red-sdk")
 
     try:
-        return RedSdkIngestBackend(sdk_root=sdk_root, allow_unavailable=False)
+        return RedSdkIngestBackend(
+            sdk_root=sdk_root,
+            allow_unavailable=False,
+            decode_mode=decode_mode,
+        )
     except Exception:
         return MockIngestBackend()
 
 
-def ingest_backend_summary(backend: str = "auto", sdk_root: Optional[str] = None) -> Dict[str, Any]:
+def ingest_backend_summary(
+    backend: str = "auto",
+    sdk_root: Optional[str] = None,
+    decode_mode: Optional[str] = None,
+) -> Dict[str, Any]:
     normalized = backend.lower()
     if normalized == "mock":
         return MockIngestBackend().diagnostics()
     if normalized == "red-sdk":
         try:
-            return RedSdkIngestBackend(sdk_root=sdk_root, allow_unavailable=True).diagnostics()
+            return RedSdkIngestBackend(
+                sdk_root=sdk_root,
+                allow_unavailable=True,
+                decode_mode=decode_mode,
+            ).diagnostics()
         except Exception as exc:
             return {
                 "backend": "red-sdk",
@@ -316,7 +340,11 @@ def ingest_backend_summary(backend: str = "auto", sdk_root: Optional[str] = None
                 "message": str(exc),
             }
     try:
-        return RedSdkIngestBackend(sdk_root=sdk_root, allow_unavailable=True).diagnostics()
+        return RedSdkIngestBackend(
+            sdk_root=sdk_root,
+            allow_unavailable=True,
+            decode_mode=decode_mode,
+        ).diagnostics()
     except Exception:
         return MockIngestBackend().diagnostics()
 

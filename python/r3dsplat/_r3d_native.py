@@ -9,6 +9,7 @@ class RedSdkConfig:
     sdk_root: Optional[str] = None
     libraries_path: Optional[str] = None
     use_gpu_decoder: bool = False
+    decode_mode: str = "full-premium"
 
 
 class RedDecoderBackend:

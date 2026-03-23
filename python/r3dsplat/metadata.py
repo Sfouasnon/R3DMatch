@@ -216,10 +216,17 @@ class BackendReport(JsonMixin):
     fiducial_backend: str = "unset"
     colmap_backend: str = "unset"
     renderer_backend: str = "unset"
+    ingest_settings: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "BackendReport":
-        return cls(**payload)
+        return cls(
+            ingest_backend=payload.get("ingest_backend", "unknown"),
+            fiducial_backend=payload.get("fiducial_backend", "unset"),
+            colmap_backend=payload.get("colmap_backend", "unset"),
+            renderer_backend=payload.get("renderer_backend", "unset"),
+            ingest_settings=payload.get("ingest_settings", {}),
+        )
 
 
 @dataclass
@@ -251,6 +258,10 @@ class FrameRecord(JsonMixin):
         )
     )
     mask_path: Optional[str] = None
+    decoded_width: Optional[int] = None
+    decoded_height: Optional[int] = None
+    cached_width: Optional[int] = None
+    cached_height: Optional[int] = None
 
     @property
     def frame_record_id(self) -> str:
@@ -273,6 +284,10 @@ class FrameRecord(JsonMixin):
             motion_info=MotionInfo.from_dict(payload.get("motion_info", {})),
             camera=CameraInfo.from_dict(payload["camera"]),
             mask_path=payload.get("mask_path"),
+            decoded_width=payload.get("decoded_width"),
+            decoded_height=payload.get("decoded_height"),
+            cached_width=payload.get("cached_width"),
+            cached_height=payload.get("cached_height"),
         )
 
     def payload(self) -> Dict[str, Any]:

@@ -33,6 +33,33 @@ void *aligned_malloc_16(size_t &adjustment, size_t size) {
     return buffer + adjustment;
 }
 
+VideoDecodeMode decode_mode_from_string(const std::string &mode) {
+    if (mode.empty() || mode == "full-premium") {
+        return DECODE_FULL_RES_PREMIUM;
+    }
+    if (mode == "half-premium") {
+        return DECODE_HALF_RES_PREMIUM;
+    }
+    if (mode == "half-good") {
+        return DECODE_HALF_RES_GOOD;
+    }
+    throw std::runtime_error("Unsupported RED decode mode: " + mode);
+}
+
+std::pair<size_t, size_t> decoded_dimensions_for_mode(
+    const std::string &mode,
+    size_t full_width,
+    size_t full_height
+) {
+    if (mode.empty() || mode == "full-premium") {
+        return {full_width, full_height};
+    }
+    if (mode == "half-premium" || mode == "half-good") {
+        return {(full_width + 1U) / 2U, (full_height + 1U) / 2U};
+    }
+    throw std::runtime_error("Unsupported RED decode mode: " + mode);
+}
+
 py::dict metadata_to_dict(const Metadata &metadata) {
     py::dict out;
     for (size_t i = 0; i < metadata.MetadataCount(); ++i) {
@@ -77,6 +104,7 @@ struct RedSdkConfig {
     std::string sdk_root;
     std::string libraries_path;
     bool use_gpu_decoder = false;
+    std::string decode_mode = "full-premium";
 };
 
 class RedDecoderBackend {
@@ -102,6 +130,7 @@ public:
         diagnostics["sdk_root"] = config_.sdk_root;
         diagnostics["libraries_path"] = resolve_libraries_path();
         diagnostics["sdk_version"] = GetSdkVersion();
+        diagnostics["decode_mode"] = config_.decode_mode;
         diagnostics["message"] = initialized_
             ? "RED SDK initialized successfully"
             : "Failed to initialize RED SDK. Check RED SDK paths and runtime libraries.";
@@ -175,8 +204,11 @@ public:
         if (clip.Status() != LSClipLoaded) {
             throw std::runtime_error("Failed to load clip via RED SDK");
         }
-        const size_t width = clip.Width();
-        const size_t height = clip.Height();
+        const size_t full_width = clip.Width();
+        const size_t full_height = clip.Height();
+        const auto decoded_dims = decoded_dimensions_for_mode(config_.decode_mode, full_width, full_height);
+        const size_t width = decoded_dims.first;
+        const size_t height = decoded_dims.second;
         const size_t mem_needed = width * height * 3U * 2U;
         size_t adjustment = 0U;
         unsigned char *buffer = static_cast<unsigned char *>(aligned_malloc_16(adjustment, mem_needed));
@@ -185,7 +217,7 @@ public:
         }
 
         VideoDecodeJob job;
-        job.Mode = DECODE_FULL_RES_PREMIUM;
+        job.Mode = decode_mode_from_string(config_.decode_mode);
         job.PixelType = PixelType_16Bit_RGB_Planar;
         job.OutputBuffer = buffer;
         job.OutputBufferSize = mem_needed;
@@ -238,13 +270,15 @@ private:
 
 PYBIND11_MODULE(_r3d_native, m) {
 py::class_<RedSdkConfig>(m, "RedSdkConfig")
-    .def(py::init<const std::string&, const std::string&, bool>(),
+    .def(py::init<const std::string&, const std::string&, bool, const std::string&>(),
          py::arg("sdk_root") = "",
          py::arg("libraries_path") = "",
-         py::arg("use_gpu_decoder") = false)
+         py::arg("use_gpu_decoder") = false,
+         py::arg("decode_mode") = "full-premium")
     .def_readwrite("sdk_root", &RedSdkConfig::sdk_root)
     .def_readwrite("libraries_path", &RedSdkConfig::libraries_path)
-    .def_readwrite("use_gpu_decoder", &RedSdkConfig::use_gpu_decoder);
+    .def_readwrite("use_gpu_decoder", &RedSdkConfig::use_gpu_decoder)
+    .def_readwrite("decode_mode", &RedSdkConfig::decode_mode);
 
     py::class_<RedDecoderBackend>(m, "RedDecoderBackend")
         .def(py::init<RedSdkConfig>(), py::arg("config") = RedSdkConfig{})

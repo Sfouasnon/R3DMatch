@@ -36,6 +36,8 @@ class TemporalSequenceDataset(Dataset[dict[str, Any]]):
         self.frames = sorted(self.manifest.frames, key=lambda frame: frame.frame_index)
         self.camera_records = self.manifest.camera_by_frame_id()
         self.mask_records = self.manifest.masks_by_frame_index()
+        self.cached_width = self.frames[0].cached_width or self.frames[0].decoded_width or self.manifest.clip.width
+        self.cached_height = self.frames[0].cached_height or self.frames[0].decoded_height or self.manifest.clip.height
         self.validation_report = self._validate_manifest()
         if len(self.frames) < self.window_size:
             raise ValueError("dataset contains fewer frames than requested temporal window")
@@ -57,7 +59,7 @@ class TemporalSequenceDataset(Dataset[dict[str, Any]]):
         stacked_masks = None
         if any(mask is not None for mask in masks):
             stacked_masks = torch.stack(
-                [mask if mask is not None else torch.zeros((self.manifest.clip.height, self.manifest.clip.width), dtype=torch.float32) for mask in masks],
+                [mask if mask is not None else torch.zeros((self.cached_height, self.cached_width), dtype=torch.float32) for mask in masks],
                 dim=0,
             )
         return {
@@ -137,15 +139,17 @@ class TemporalSequenceDataset(Dataset[dict[str, Any]]):
             raise ValueError("dataset manifest timestamps must be strictly increasing")
         return {
             "frame_count": len(self.frames),
-            "width": self.manifest.clip.width,
-            "height": self.manifest.clip.height,
+            "width": self.cached_width,
+            "height": self.cached_height,
+            "original_width": self.manifest.clip.width,
+            "original_height": self.manifest.clip.height,
             "camera_record_count": len(self.manifest.camera_records),
             "mask_count": len(self.manifest.masks),
         }
 
     def _validate_frames(self, records: list[FrameRecord], frames: list[torch.Tensor]) -> None:
         for record, frame in zip(records, frames):
-            expected_shape = (3, self.manifest.clip.height, self.manifest.clip.width)
+            expected_shape = (3, self.cached_height, self.cached_width)
             if tuple(frame.shape) != expected_shape:
                 raise ValueError(
                     f"frame shape mismatch for frame_index={record.frame_index}: got={tuple(frame.shape)} expected={expected_shape}"
@@ -157,7 +161,7 @@ class TemporalSequenceDataset(Dataset[dict[str, Any]]):
         for record, mask in zip(records, masks):
             if mask is None:
                 continue
-            expected_shape = (self.manifest.clip.height, self.manifest.clip.width)
+            expected_shape = (self.cached_height, self.cached_width)
             if tuple(mask.shape) != expected_shape:
                 raise ValueError(
                     f"mask shape mismatch for frame_index={record.frame_index}: got={tuple(mask.shape)} expected={expected_shape}"

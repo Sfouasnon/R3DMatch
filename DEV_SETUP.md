@@ -91,6 +91,8 @@ Recommended quick validation:
 
 - first 24 selected frames
 - `frame-step 2`
+- `decode-mode half-good`
+- `max-width 960`
 - `num-gaussians 64`
 - `epochs 1`
 - `window-size 2`
@@ -101,8 +103,7 @@ Example:
 PYTHONPATH=python python -m r3dsplat ingest /path/to/real_clip.R3D \
   --out ~/Desktop/r3d_real_test \
   --backend red-sdk \
-  --max-frames 24 \
-  --frame-step 2
+  --preset quick-test
 
 PYTHONPATH=python python -m r3dsplat solve-fiducials ~/Desktop/r3d_real_test
 PYTHONPATH=python python -m r3dsplat align-world ~/Desktop/r3d_real_test
@@ -115,6 +116,7 @@ PYTHONPATH=python python -m r3dsplat train-4d ~/Desktop/r3d_real_test \
 ```
 
 The ingest command now prints visible per-frame progress and a final summary including frame range, frames written, manifest path, and elapsed time.
+It also prints resolved settings plus approximate cache-size estimates before decoding. Use `--dry-run` when you want the estimate without writing any dataset.
 
 Run tests:
 
