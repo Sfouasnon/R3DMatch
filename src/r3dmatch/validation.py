@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 
 from .calibration import discover_clips, load_color_calibration, load_exposure_calibration
 from .identity import clip_id_from_path, group_key_from_clip_id
+from .rmd import rmd_filename_for_clip_id, write_rmds_from_analysis
 from .sidecar import sidecar_filename_for_clip_id
 from .transcode import build_redline_command_variants, load_sidecar
 
@@ -24,7 +25,7 @@ def validate_pipeline(
     if not clips:
         raise ValueError(f"No .R3D clips found under {input_path}")
     clip_ids = [clip_id_from_path(str(path)) for path in clips]
-    group_keys = [group_key_from_clip_id(clip_id) for clip_id in clip_ids]
+    group_keys: list[str] = []
     if len(set(clip_ids)) != len(clip_ids):
         raise ValueError("clip_id collision detected in discovered clips")
 
@@ -33,6 +34,8 @@ def validate_pipeline(
     analysis_json_dir = analysis_root / "analysis"
     if not sidecar_dir.exists() or not analysis_json_dir.exists():
         raise FileNotFoundError("analysis_dir must contain analysis/ and sidecars/ directories")
+    rmd_manifest = write_rmds_from_analysis(str(analysis_root))
+    rmd_dir = Path(rmd_manifest["rmd_dir"])
 
     exposure = load_exposure_calibration(exposure_calibration_path) if exposure_calibration_path else None
     color = load_color_calibration(color_calibration_path) if color_calibration_path else None
@@ -45,28 +48,54 @@ def validate_pipeline(
             raise FileNotFoundError(f"Missing sidecar for {clip_id}: {sidecar_path}")
         if not analysis_path.exists():
             raise FileNotFoundError(f"Missing analysis JSON for {clip_id}: {analysis_path}")
+        analysis_payload = json.loads(analysis_path.read_text(encoding="utf-8"))
+        analysis_group_key = str(analysis_payload.get("group_key", group_key_from_clip_id(clip_id)))
+        group_keys.append(analysis_group_key)
+        rmd_path = rmd_dir / rmd_filename_for_clip_id(clip_id)
+        if not rmd_path.exists():
+            raise FileNotFoundError(f"Missing RMD for {clip_id}: {rmd_path}")
         sidecar_payload = load_sidecar(str(sidecar_path))
         if sidecar_payload.get("clip_id") != clip_id:
             raise ValueError(f"Sidecar clip_id mismatch for {clip_id}")
         if Path(sidecar_path).name != sidecar_filename_for_clip_id(clip_id):
             raise ValueError(f"Sidecar filename mismatch for {clip_id}")
+        if Path(rmd_path).name != rmd_filename_for_clip_id(clip_id):
+            raise ValueError(f"RMD filename mismatch for {clip_id}")
         variants = build_redline_command_variants(
             str(clip),
             render_dir=str(Path(out_dir).expanduser().resolve() / "renders"),
-            sidecar_path=str(sidecar_path),
+            sidecar_path=None,
+            rmd_path=str(rmd_path),
             redline_executable=redline_executable,
             output_ext=output_ext,
             sidecar_payload=sidecar_payload,
         )
+        variant_records = []
+        for variant in variants:
+            uses_rmd = bool(variant.get("uses_rmd"))
+            command = variant["command"]
+            command_uses_exact_rmd = str(rmd_path) in command if uses_rmd else False
+            if uses_rmd and not command_uses_exact_rmd:
+                raise ValueError(f"REDLine command does not reference expected RMD for {clip_id}")
+            variant_records.append(
+                {
+                    "variant": variant["variant"],
+                    "uses_rmd": uses_rmd,
+                    "command_uses_exact_rmd": command_uses_exact_rmd,
+                }
+            )
         clip_records.append(
             {
                 "clip_id": clip_id,
-                "group_key": group_key_from_clip_id(clip_id),
+                "group_key": analysis_group_key,
                 "analysis_path": str(analysis_path),
                 "sidecar_path": str(sidecar_path),
+                "rmd_path": str(rmd_path),
                 "sidecar_name_matches_clip_id": True,
+                "rmd_name_matches_clip_id": True,
                 "redline_variant_count": len(variants),
                 "redline_variants": [variant["variant"] for variant in variants],
+                "redline_variant_records": variant_records,
             }
         )
 
@@ -88,6 +117,10 @@ def validate_pipeline(
         "calibrations": {
             "exposure_loaded": exposure is not None,
             "color_loaded": color is not None,
+        },
+        "rmd": {
+            "rmd_dir": str(rmd_dir),
+            "clip_count": rmd_manifest["clip_count"],
         },
         "clips": clip_records,
     }

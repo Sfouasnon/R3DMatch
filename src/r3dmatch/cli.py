@@ -7,6 +7,7 @@ import typer
 from .calibration import calibrate_card_path, calibrate_color_path, calibrate_exposure_path, calibrate_sphere_path
 from .matching import analyze_path
 from .report import build_contact_sheet_report
+from .rmd import write_rmds_from_analysis
 from .transcode import write_transcode_plan
 from .validation import validate_pipeline
 
@@ -140,6 +141,7 @@ def transcode_command(
     out: str = typer.Option(..., "--out", help="Transcode plan output directory"),
     analysis_dir: Optional[str] = typer.Option(None, "--analysis-dir", help="Analysis directory that contains generated sidecars"),
     use_generated_sidecar: bool = typer.Option(False, "--use-generated-sidecar", help="Load sidecars from the analysis output"),
+    use_generated_rmd: bool = typer.Option(False, "--use-generated-rmd", help="Generate and use .RMD files from the analysis output"),
     redline_executable: str = typer.Option("REDLine", "--redline-executable", help="REDLine executable"),
     output_ext: str = typer.Option("mov", "--output-ext", help="Rendered output extension"),
     execute: bool = typer.Option(False, "--execute", help="Execute commands instead of just writing plans"),
@@ -149,10 +151,22 @@ def transcode_command(
         out_dir=out,
         analysis_dir=analysis_dir,
         use_generated_sidecar=use_generated_sidecar,
+        use_generated_rmd=use_generated_rmd,
         redline_executable=redline_executable,
         output_ext=output_ext,
         execute=execute,
     )
+    typer.echo(str(payload))
+
+
+@app.command("write-rmd")
+def write_rmd_command(
+    input_path: str,
+    analysis_dir: str = typer.Option(..., "--analysis-dir", help="Analysis directory that contains generated sidecars"),
+    out: Optional[str] = typer.Option(None, "--out", help="Optional RMD output directory; defaults to analysis_dir/rmd"),
+) -> None:
+    del input_path
+    payload = write_rmds_from_analysis(analysis_dir, out_dir=out)
     typer.echo(str(payload))
 
 

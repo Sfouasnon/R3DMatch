@@ -107,9 +107,9 @@ def analyze_path(
     final_results: list[ClipResult] = []
     for item in provisional:
         derived_group_baseline = group_baselines[item.group_key]
-        clip_trim = item.raw_offset_stops - derived_group_baseline
+        clip_trim = 0.0
         applied_baseline = calibrated_baselines.get(item.clip_id, calibrated_baselines.get(item.group_key, derived_group_baseline))
-        final_offset = max(-clamp_stops, min(clamp_stops, applied_baseline + clip_trim))
+        final_offset = max(-clamp_stops, min(clamp_stops, applied_baseline))
         confidence = compute_confidence(item.frame_stats, unclamped_offset=item.raw_offset_stops, clamp_stops=clamp_stops)
         exposure_provenance = (
             {

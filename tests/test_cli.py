@@ -12,6 +12,7 @@ from r3dmatch.identity import group_key_from_clip_id, rmd_name_for_clip_id
 from r3dmatch.matching import analyze_path, camera_group_from_clip_id, discover_clips
 from r3dmatch.models import GrayCardROI, SamplingRegion, SphereROI
 from r3dmatch.report import build_contact_sheet_report
+from r3dmatch.rmd import render_rmd_xml, rmd_filename_for_clip_id, write_rmds_from_analysis
 from r3dmatch.ui import build_table_rows, load_review_bundle
 from r3dmatch.sdk import MockR3DBackend, RedSdkDecoder, resolve_backend
 from r3dmatch.sidecar import build_sidecar_payload, sidecar_filename_for_clip_id
@@ -116,6 +117,10 @@ def test_exact_sidecar_naming_from_clip_id() -> None:
     assert sidecar_filename_for_clip_id("G007_D060_0324M6_001") == "G007_D060_0324M6_001.sidecar.json"
 
 
+def test_exact_rmd_naming_from_clip_id() -> None:
+    assert rmd_filename_for_clip_id("G007_D060_0324M6_001") == "G007_D060_0324M6_001.RMD"
+
+
 def test_analyze_path_writes_manifest_and_sidecar(tmp_path: Path) -> None:
     clip_a = tmp_path / "G007_D060_0324M6_001.R3D"
     clip_b = tmp_path / "G007_D061_0324M6_002.R3D"
@@ -127,6 +132,52 @@ def test_analyze_path_writes_manifest_and_sidecar(tmp_path: Path) -> None:
     assert clip_summary["group_key"] == derive_array_group_key(str(tmp_path))
     assert sidecar_payload["rmd_name"] == f"{clip_summary['clip_id']}.RMD"
     assert (tmp_path / "out" / "array_calibration.json").exists()
+
+
+def test_sidecar_to_rmd_conversion_exposure_only() -> None:
+    payload = {
+        "schema": "r3dmatch_v2",
+        "clip_id": "G007_D060_0324M6_001",
+        "source_path": "/tmp/G007_D060_0324M6_001.R3D",
+        "calibration_state": {
+            "exposure_calibration_loaded": True,
+            "exposure_baseline_applied_stops": 0.4,
+            "color_calibration_loaded": False,
+            "rgb_neutral_gains": None,
+            "color_gains_state": None,
+        },
+        "rmd_mapping": {
+            "exposure": {"final_offset_stops": 0.4},
+            "color": {"rgb_neutral_gains": None},
+        },
+    }
+    xml = render_rmd_xml(payload)
+    assert "G007_D060_0324M6_001.RMD" in xml
+    assert 'final_offset_stops="0.4"' in xml
+    assert 'calibration_loaded="true"' in xml
+
+
+def test_sidecar_to_rmd_conversion_with_color() -> None:
+    payload = {
+        "schema": "r3dmatch_v2",
+        "clip_id": "G007_D060_0324M6_001",
+        "source_path": "/tmp/G007_D060_0324M6_001.R3D",
+        "calibration_state": {
+            "exposure_calibration_loaded": True,
+            "exposure_baseline_applied_stops": 0.4,
+            "color_calibration_loaded": True,
+            "rgb_neutral_gains": {"r": 1.1, "g": 1.0, "b": 0.9},
+            "color_gains_state": "pending",
+        },
+        "rmd_mapping": {
+            "exposure": {"final_offset_stops": 0.4},
+            "color": {"rgb_neutral_gains": [1.1, 1.0, 0.9]},
+        },
+    }
+    xml = render_rmd_xml(payload)
+    assert 'rgb_neutral_gains=' in xml
+    assert "1.1" in xml
+    assert 'state="pending"' in xml
 
 
 def test_sidecar_generation_with_exposure_only(tmp_path: Path) -> None:
@@ -689,6 +740,16 @@ def test_cli_analyze_and_transcode(tmp_path: Path) -> None:
     assert transcode_result.exit_code == 0
 
 
+def test_cli_write_rmd(tmp_path: Path) -> None:
+    clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
+    clip_path.write_bytes(b"")
+    analysis_dir = tmp_path / "analysis"
+    runner.invoke(app, ["analyze", str(clip_path), "--out", str(analysis_dir), "--backend", "mock", "--mode", "scene"], catch_exceptions=False)
+    write_result = runner.invoke(app, ["write-rmd", str(clip_path), "--analysis-dir", str(analysis_dir)])
+    assert write_result.exit_code == 0
+    assert (analysis_dir / "rmd" / "G007_D060_0324M6_001.RMD").exists()
+
+
 def test_cli_validate_pipeline_and_report(tmp_path: Path) -> None:
     clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
     clip_path.write_bytes(b"")
@@ -707,6 +768,15 @@ def test_build_redline_command_includes_sidecar(tmp_path: Path) -> None:
     sidecar_path.write_text("{}", encoding="utf-8")
     command = build_redline_command(str(clip_path), render_dir=str(tmp_path / "renders"), sidecar_path=str(sidecar_path), redline_executable="REDLine", output_ext="mov")
     assert command[0] == "REDLine"
+
+
+def test_write_rmds_from_analysis_creates_exact_clip_rmd(tmp_path: Path) -> None:
+    clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
+    clip_path.write_bytes(b"")
+    analyze_path(str(tmp_path), out_dir=str(tmp_path / "analysis-out"), mode="scene", backend="mock", lut_override=None, calibration_path=None, sample_count=4, sampling_strategy="uniform")
+    manifest = write_rmds_from_analysis(str(tmp_path / "analysis-out"))
+    assert manifest["clip_count"] == 1
+    assert (tmp_path / "analysis-out" / "rmd" / "G007_D060_0324M6_001.RMD").exists()
 
 
 def test_redline_command_generation_variants(tmp_path: Path) -> None:
@@ -729,11 +799,38 @@ def test_redline_command_generation_variants(tmp_path: Path) -> None:
     assert [variant["variant"] for variant in variants] == ["original", "exposure", "color", "both"]
 
 
+def test_transcode_plan_with_generated_rmds(tmp_path: Path) -> None:
+    clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
+    clip_path.write_bytes(b"")
+    analyze_path(str(tmp_path), out_dir=str(tmp_path / "analysis-out"), mode="scene", backend="mock", lut_override=None, calibration_path=None, sample_count=4, sampling_strategy="uniform")
+    payload = write_transcode_plan(
+        str(clip_path),
+        out_dir=str(tmp_path / "transcode"),
+        analysis_dir=str(tmp_path / "analysis-out"),
+        use_generated_sidecar=False,
+        use_generated_rmd=True,
+        redline_executable="REDLine",
+        output_ext="mov",
+        execute=False,
+    )
+    clip_payload = payload["clips"][0]
+    assert clip_payload["rmd_name_matches_clip_id"] is True
+    assert clip_payload["rmd_path"].endswith("G007_D060_0324M6_001.RMD")
+    assert any(variant["uses_rmd"] for variant in clip_payload["variants"] if variant["variant"] != "original")
+
+
 def test_transcode_requires_analysis_dir_for_generated_sidecars(tmp_path: Path) -> None:
     clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
     clip_path.write_bytes(b"")
     with pytest.raises(ValueError):
-        write_transcode_plan(str(clip_path), out_dir=str(tmp_path / "transcode"), analysis_dir=None, use_generated_sidecar=True, redline_executable="REDLine", output_ext="mov", execute=False)
+        write_transcode_plan(str(clip_path), out_dir=str(tmp_path / "transcode"), analysis_dir=None, use_generated_sidecar=True, use_generated_rmd=False, redline_executable="REDLine", output_ext="mov", execute=False)
+
+
+def test_transcode_requires_analysis_dir_for_generated_rmds(tmp_path: Path) -> None:
+    clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
+    clip_path.write_bytes(b"")
+    with pytest.raises(ValueError):
+        write_transcode_plan(str(clip_path), out_dir=str(tmp_path / "transcode"), analysis_dir=None, use_generated_sidecar=False, use_generated_rmd=True, redline_executable="REDLine", output_ext="mov", execute=False)
 
 
 def test_validate_pipeline_behavior(tmp_path: Path) -> None:
@@ -751,6 +848,8 @@ def test_validate_pipeline_behavior(tmp_path: Path) -> None:
     )
     assert payload["clip_count"] == 1
     assert payload["clips"][0]["sidecar_name_matches_clip_id"] is True
+    assert payload["clips"][0]["rmd_name_matches_clip_id"] is True
+    assert all(record["command_uses_exact_rmd"] for record in payload["clips"][0]["redline_variant_records"] if record["uses_rmd"])
 
 
 def test_report_contact_sheet_scaffold(tmp_path: Path) -> None:

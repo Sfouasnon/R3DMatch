@@ -15,6 +15,7 @@ Current prototype capabilities:
 - supports `full_frame`, `center_crop`, and detected ROI sampling for calibration work
 - writes independent exposure and color calibration JSONs for later RMD-side integration
 - writes per-clip analysis manifests and structured sidecars
+- writes a first supported subset of per-clip `.RMD` files from those sidecars
 - emits REDLine command plans for validation workflows
 - scaffolds contact-sheet report metadata and HTML output from analysis results
 
@@ -33,7 +34,9 @@ r3dmatch calibrate-exposure /path/to/folder --target-log2 -2.0 --sampling-mode c
 r3dmatch calibrate-color /path/to/folder --sampling-mode detected_roi --out ./cal/color
 r3dmatch validate-pipeline /path/to/folder --analysis-dir ./out --out ./validation
 r3dmatch report-contact-sheet ./out --out ./report
+r3dmatch write-rmd /path/to/folder --analysis-dir ./out
 r3dmatch transcode /path/to/clip.R3D --analysis-dir ./out --use-generated-sidecar --out ./renders
+r3dmatch transcode /path/to/clip.R3D --analysis-dir ./out --use-generated-rmd --out ./renders
 streamlit run src/r3dmatch/ui.py -- --output-folder ./out
 ```
 
@@ -93,28 +96,54 @@ The generated `exposure_calibration.json` and `color_calibration.json` files are
 - color only
 - or both together
 
-## Sidecars And REDLine
+## Sidecars, RMDs, And REDLine
 
 The current sidecar format is an exact per-clip intermediate JSON named from `clip_id` only:
 
 - `G007_D060_0324M6_001.sidecar.json`
-- planned RMD name: `G007_D060_0324M6_001.RMD`
+- generated RMD name: `G007_D060_0324M6_001.RMD`
 
-This sidecar is not a full RMD writer yet. It is a stable intermediate contract that carries:
+The sidecar remains the canonical intermediate contract. The current RMD writer generates an initial supported subset from it, using exact `clip_id` naming only:
 
 - exposure offsets and applied baseline state
 - color gains as pending/applied metadata
 - calibration provenance paths
 - exact clip identity for downstream REDLine/RMD mapping
 
-REDLine planning uses that exact clip-to-sidecar pairing and generates deterministic command variants for:
+The current `.RMD` subset writes:
+
+- exposure offset from `final_offset_stops`
+- exposure calibration-loaded state
+- applied exposure baseline
+- optional neutral RGB gains
+- color gain state and basic provenance
+
+This is intentionally not a full camera-metadata round trip yet.
+
+Generate `.RMD` files directly from an analysis folder with:
+
+```bash
+r3dmatch write-rmd /path/to/folder --analysis-dir ./out
+```
+
+REDLine planning can use either generated sidecars or generated `.RMD` files and keeps the exact clip-to-metadata pairing deterministic:
 
 - original
 - exposure
 - color
 - both
 
-where the sidecar content makes those variants meaningful.
+Use generated `.RMD` files in planning with:
+
+```bash
+r3dmatch transcode /path/to/folder --analysis-dir ./out --use-generated-rmd --out ./renders
+```
+
+Use sidecars instead with:
+
+```bash
+r3dmatch transcode /path/to/folder --analysis-dir ./out --use-generated-sidecar --out ./renders
+```
 
 ## Review UI
 
