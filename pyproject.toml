@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "r3dmatch"
+version = "0.1.0"
+description = "Mac-first prototype for automatic exposure matching of RED R3D clips"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "typer>=0.12",
+  "numpy>=1.26",
+  "streamlit>=1.32",
+]
+
+[project.scripts]
+r3dmatch = "r3dmatch.cli:app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["r3dmatch", "r3dmatch.*"]

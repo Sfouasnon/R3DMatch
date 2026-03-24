@@ -1,0 +1,65 @@
+Nikon N-RAW (.NEV) support was introduced in SDK 9.0.0 and works similar to R3D clips.
+The following Nikon cameras support N-RAW recording: Z6 III, Z 8, Z 9 & ZR. 
+
+Most SDK features are supported, including GPU image processing, lower resolution decodes,
+most IPP2 decode settings and audio.
+
+
+Sample clips
+-----------------------------------------------
+* https://www.nikonusa.com/content/z6iii-raw-video-downloads
+* https://www.nikonusa.com/content/z-8-raw-video-downloads
+
+
+N-RAW differences from R3D
+-----------------------------------------------
+* single .NEV file recorded per clip in the root of the mag
+* each clip is consecutively named: DSC_0164.NEV, DSC_0165.NEV, etc.
+	* NOTE: unlike R3D, these files are separate clips and should not be treated as a single one!
+* always decodes in IPP2 (ColorVersion3, see Clip::MinimumColorVersion() & Clip::DefaultColorVersion() APIs)
+* clips can have high-speed playback/project rates of 100 or 120 fps
+* timecode:
+	* edge/run-record timecode is optional and if missing will default to 01:00:00:00
+	* timecode can be drop-frame, i.e.: 01:00:00;00
+	* timecode will run at playback/project rate, including 100 or 120 fps (3-digit frame numbers)
+* different/higher ISO values may be set per default: 64, 8000, 10000, 16000, 20000 or 25600
+	* Nikon ISO 1250 will be mapped to SDK ISO 1280 + small Exposure Adjust setting
+* clips can have Auto White Balance and/or Auto Exposure modes, see the section on this below
+* RMD_REDCODE metadata is "N-RAW" and RMD_SENSOR_NAME is "NIKON"
+
+
+SDK features unavailable with N-RAW
+-----------------------------------------------
+* GPU decode (decompression). GpuDecoder::DecodeSupportedForClip() will return DSUnsupportedClipFormat
+* R3D trim & snapshot as well as camera streaming through R3DStream or R3DStream2 APIs
+* FlashingPixelAdjustment & MasklineAdjust settings
+* HDRx, Extended Highlights, Broadcast image processing pipe & IMU track
+* RMD_CAMERA_ID, RMD_CAMERA_POSITION, RMD_CLIP_ID, RMD_ORIGINAL_FILENAME, RMD_REEL_ID*'s and frame guide metadata
+
+
+Auto Exposure (AE)
+-----------------------------------------------
+If Auto Exposure is enabled when a NEV clip is shot, the recorded ISO metadata will be shown
+as 800 and ISO control will work in a relative manner, i.e. setting to ISO 800 will render
+the clip as shot, tracking all exposure changes over the length of the clip.
+
+When ISO is set to 1600 the entire clip will render 1 stop brighter than shot, tracking all
+exposure changes. Similarly, if the ISO is set to 400, the entire clip will render 1 stop
+darker, tracking all exposure changes. In all cases the in-camera exposure changes from the
+Auto Exposure will be honored in the rendering.
+ 
+ 
+Auto White Balance (AWB)
+-----------------------------------------------
+If Auto White Balance is enabled when a NEV clip is shot, the shot can be rendered in one of
+two ways - as shot where the in-camera white balance changes track over the length of the shot,
+or the entire shot can be rendered at a set white balance via the usual Kelvin and Tint settings.
+ 
+When an AWB clip is loaded, the metadata values returned for the white balance Kelvin and Tint
+represent the first frame of the AWB clip. If the Kelvin and Tint values are not changed, the
+clip will render as shot, where the in-camera white balance changes track over the length of
+the shot. If the Kelvin and Tint values are changed, the clip will render at those custom values
+and not honor the in-camera auto white balance changes.
+
+
+(c) 2008-2026 RED DIGITAL CINEMA. All rights reserved.
