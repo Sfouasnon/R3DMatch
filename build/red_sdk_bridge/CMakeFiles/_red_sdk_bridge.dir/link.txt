@@ -1,0 +1,1 @@
+/usr/bin/c++  -arch arm64 -bundle -Wl,-headerpad_max_install_names -Xlinker -undefined -Xlinker dynamic_lookup -o _red_sdk_bridge.so CMakeFiles/_red_sdk_bridge.dir/red_sdk_bridge.cpp.o   -L/Users/sfouasnon/Desktop/R3DSplat/R3DMatch/src/RED_SDK/R3DSDKv9_2_0/Lib/mac64  -Wl,-rpath,/Users/sfouasnon/Desktop/R3DSplat/R3DMatch/src/RED_SDK/R3DSDKv9_2_0/Lib/mac64 -lR3DSDK-libcpp

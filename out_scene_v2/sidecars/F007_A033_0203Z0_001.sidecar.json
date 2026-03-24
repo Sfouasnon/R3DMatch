@@ -1,0 +1,24 @@
+{
+  "clip_id": "F007_A033_0203Z0_001",
+  "source_path": "/Volumes/TProps_6TB/Test_FTP/F007_A033_0203Z0.RDC/F007_A033_0203Z0_001.R3D",
+  "camera_group": "F007",
+  "mode": "scene",
+  "raw_offset_stops": 1.5355738451606298,
+  "camera_baseline_stops": 1.408797149909165,
+  "final_offset_stops": 0.12677669525146484,
+  "confidence": 1.0,
+  "monitoring": {
+    "mode": "scene",
+    "ipp2_color_space": "REDWideGamutRGB",
+    "ipp2_gamma_curve": "Log3G10",
+    "active_lut_path": null,
+    "lut_override_path": null,
+    "resolved_lut_path": null
+  },
+  "redline_mapping": {
+    "prototype_note": "Map final_offset_stops into the local REDLine exposure/grade flag set during validation.",
+    "raw_offset_stops": 1.5355738451606298,
+    "camera_baseline_stops": 1.408797149909165,
+    "final_offset_stops": 0.12677669525146484
+  }
+}

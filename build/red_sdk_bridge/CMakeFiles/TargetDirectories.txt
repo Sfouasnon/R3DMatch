@@ -1,0 +1,3 @@
+/Users/sfouasnon/Desktop/R3DSplat/R3DMatch/build/red_sdk_bridge/CMakeFiles/_red_sdk_bridge.dir
+/Users/sfouasnon/Desktop/R3DSplat/R3DMatch/build/red_sdk_bridge/CMakeFiles/edit_cache.dir
+/Users/sfouasnon/Desktop/R3DSplat/R3DMatch/build/red_sdk_bridge/CMakeFiles/rebuild_cache.dir

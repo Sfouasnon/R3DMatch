@@ -1,0 +1,54 @@
+{
+  "target_log2_luminance": -2.7369654178619385,
+  "calibration_mode": "gray_card",
+  "object_type": "gray_card",
+  "cameras": [
+    {
+      "camera_group": "G007",
+      "clip_id": "G007_B057_0324YT_001",
+      "roi": {
+        "x": 18.0,
+        "y": 10.0,
+        "width": 50.0,
+        "height": 24.0
+      },
+      "measured_card_log2": -2.7369654178619385,
+      "camera_baseline_stops": 0.0,
+      "confidence": 0.5498448442117668,
+      "source_path": "/Users/sfouasnon/Desktop/R3DMatch_Calibration/G007_B057_0324YT.RDC/G007_B057_0324YT_001.R3D",
+      "frame_index": 0
+    },
+    {
+      "camera_group": "G007",
+      "clip_id": "G007_C057_0324GR_001",
+      "roi": {
+        "x": 13.0,
+        "y": 16.0,
+        "width": 55.0,
+        "height": 27.0
+      },
+      "measured_card_log2": -2.8889687061309814,
+      "camera_baseline_stops": 0.15200328826904297,
+      "confidence": 0.5889879514398949,
+      "source_path": "/Users/sfouasnon/Desktop/R3DMatch_Calibration/G007_C057_0324GR.RDC/G007_C057_0324GR_001.R3D",
+      "frame_index": 0
+    },
+    {
+      "camera_group": "G007",
+      "clip_id": "G007_D060_0324M6_001",
+      "roi": {
+        "x": 23.0,
+        "y": 10.0,
+        "width": 45.0,
+        "height": 24.0
+      },
+      "measured_card_log2": -2.8889687061309814,
+      "camera_baseline_stops": 0.15200328826904297,
+      "confidence": 0.6261993173721394,
+      "source_path": "/Users/sfouasnon/Desktop/R3DMatch_Calibration/G007_D060_0324M6.RDC/G007_D060_0324M6_001.R3D",
+      "frame_index": 0
+    }
+  ],
+  "roi_file": null,
+  "reference_camera": "G007_B057_0324YT_001"
+}

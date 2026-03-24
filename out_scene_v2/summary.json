@@ -1,0 +1,309 @@
+{
+  "input_path": "/Volumes/TProps_6TB/Test_FTP",
+  "mode": "scene",
+  "backend": "auto",
+  "clip_count": 36,
+  "analysis_dir": "/Users/sfouasnon/Desktop/R3DSplat/R3DMatch/out_scene_v2/analysis",
+  "sidecar_dir": "/Users/sfouasnon/Desktop/R3DSplat/R3DMatch/out_scene_v2/sidecars",
+  "camera_baselines": {
+    "A007": 1.459638362181809,
+    "B007": 1.1211772611266637,
+    "C007": 1.58946252371135,
+    "D007": 1.3498426725989843,
+    "E007": 1.1359499743110204,
+    "F007": 1.408797149909165,
+    "G007": 1.6262315561896825,
+    "H007": 1.41073436046901,
+    "I007": 1.410535817397263
+  },
+  "clips": [
+    {
+      "clip_id": "A007_A033_0202CB_001",
+      "camera_group": "A007",
+      "raw_offset_stops": 1.2919944574958349,
+      "camera_baseline_stops": 1.459638362181809,
+      "final_offset_stops": -0.16764390468597412,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "A007_B033_0203I5_001",
+      "camera_group": "A007",
+      "raw_offset_stops": 1.1871221115714574,
+      "camera_baseline_stops": 1.459638362181809,
+      "final_offset_stops": -0.27251625061035156,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "A007_C033_02038F_001",
+      "camera_group": "A007",
+      "raw_offset_stops": 1.6743580153113866,
+      "camera_baseline_stops": 1.459638362181809,
+      "final_offset_stops": 0.21471965312957764,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "A007_D033_0203Z0_001",
+      "camera_group": "A007",
+      "raw_offset_stops": 1.627282266867783,
+      "camera_baseline_stops": 1.459638362181809,
+      "final_offset_stops": 0.16764390468597412,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "B007_A033_0203MX_001",
+      "camera_group": "B007",
+      "raw_offset_stops": 1.1523256352073217,
+      "camera_baseline_stops": 1.1211772611266637,
+      "final_offset_stops": 0.03114837408065796,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "B007_B033_0203VW_001",
+      "camera_group": "B007",
+      "raw_offset_stops": 1.0900288870460058,
+      "camera_baseline_stops": 1.1211772611266637,
+      "final_offset_stops": -0.03114837408065796,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "B007_C033_0203XE_001",
+      "camera_group": "B007",
+      "raw_offset_stops": 1.5333432009345556,
+      "camera_baseline_stops": 1.1211772611266637,
+      "final_offset_stops": 0.41216593980789185,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "B007_D033_0203WZ_001",
+      "camera_group": "B007",
+      "raw_offset_stops": 1.0544526627189184,
+      "camera_baseline_stops": 1.1211772611266637,
+      "final_offset_stops": -0.06672459840774536,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "C007_A033_0203HR_001",
+      "camera_group": "C007",
+      "raw_offset_stops": 1.086943631423142,
+      "camera_baseline_stops": 1.58946252371135,
+      "final_offset_stops": -0.502518892288208,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "C007_B033_02039J_001",
+      "camera_group": "C007",
+      "raw_offset_stops": 1.770294313681748,
+      "camera_baseline_stops": 1.58946252371135,
+      "final_offset_stops": 0.18083178997039795,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "C007_C033_02035R_001",
+      "camera_group": "C007",
+      "raw_offset_stops": 1.408630733740952,
+      "camera_baseline_stops": 1.58946252371135,
+      "final_offset_stops": -0.18083178997039795,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "C007_D033_0203CJ_001",
+      "camera_group": "C007",
+      "raw_offset_stops": 1.7729510119086767,
+      "camera_baseline_stops": 1.58946252371135,
+      "final_offset_stops": 0.18348848819732666,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "D007_A033_0203TE_001",
+      "camera_group": "D007",
+      "raw_offset_stops": 1.3683869888907934,
+      "camera_baseline_stops": 1.3498426725989843,
+      "final_offset_stops": 0.018544316291809082,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "D007_B033_0203Y6_001",
+      "camera_group": "D007",
+      "raw_offset_stops": 1.3312983563071752,
+      "camera_baseline_stops": 1.3498426725989843,
+      "final_offset_stops": -0.018544316291809082,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "D007_C033_0203D6_001",
+      "camera_group": "D007",
+      "raw_offset_stops": 1.089392190230515,
+      "camera_baseline_stops": 1.3498426725989843,
+      "final_offset_stops": -0.26045048236846924,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "D007_D033_0203XI_001",
+      "camera_group": "D007",
+      "raw_offset_stops": 1.4509255936271215,
+      "camera_baseline_stops": 1.3498426725989843,
+      "final_offset_stops": 0.10108292102813721,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "E007_A033_0203JR_001",
+      "camera_group": "E007",
+      "raw_offset_stops": 1.2592542221671605,
+      "camera_baseline_stops": 1.1359499743110204,
+      "final_offset_stops": 0.12330424785614014,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "E007_B033_02030T_001",
+      "camera_group": "E007",
+      "raw_offset_stops": 1.186120157492783,
+      "camera_baseline_stops": 1.1359499743110204,
+      "final_offset_stops": 0.050170183181762695,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "E007_C033_020320_001",
+      "camera_group": "E007",
+      "raw_offset_stops": 1.0857797911292577,
+      "camera_baseline_stops": 1.1359499743110204,
+      "final_offset_stops": -0.050170183181762695,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "E007_D033_0203YW_001",
+      "camera_group": "E007",
+      "raw_offset_stops": 1.0546134760505224,
+      "camera_baseline_stops": 1.1359499743110204,
+      "final_offset_stops": -0.08133649826049805,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "F007_A033_0203Z0_001",
+      "camera_group": "F007",
+      "raw_offset_stops": 1.5355738451606298,
+      "camera_baseline_stops": 1.408797149909165,
+      "final_offset_stops": 0.12677669525146484,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "F007_B033_0203KK_001",
+      "camera_group": "F007",
+      "raw_offset_stops": 1.3689872076636815,
+      "camera_baseline_stops": 1.408797149909165,
+      "final_offset_stops": -0.0398099422454834,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "F007_C033_020379_001",
+      "camera_group": "F007",
+      "raw_offset_stops": 1.4486070921546483,
+      "camera_baseline_stops": 1.408797149909165,
+      "final_offset_stops": 0.0398099422454834,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "F007_D033_02032N_001",
+      "camera_group": "F007",
+      "raw_offset_stops": 1.1520797064429784,
+      "camera_baseline_stops": 1.408797149909165,
+      "final_offset_stops": -0.2567174434661865,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "G007_A033_0203SO_001",
+      "camera_group": "G007",
+      "raw_offset_stops": 1.5810090353614354,
+      "camera_baseline_stops": 1.6262315561896825,
+      "final_offset_stops": -0.04522252082824707,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "G007_B033_0203T6_001",
+      "camera_group": "G007",
+      "raw_offset_stops": 1.6714540770179296,
+      "camera_baseline_stops": 1.6262315561896825,
+      "final_offset_stops": 0.04522252082824707,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "G007_C033_0203MH_001",
+      "camera_group": "G007",
+      "raw_offset_stops": 1.773686533225205,
+      "camera_baseline_stops": 1.6262315561896825,
+      "final_offset_stops": 0.14745497703552246,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "G007_D033_0203E0_001",
+      "camera_group": "G007",
+      "raw_offset_stops": 1.1531851341849828,
+      "camera_baseline_stops": 1.6262315561896825,
+      "final_offset_stops": -0.4730464220046997,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "H007_A033_0203T3_001",
+      "camera_group": "H007",
+      "raw_offset_stops": 1.4106177141791845,
+      "camera_baseline_stops": 1.41073436046901,
+      "final_offset_stops": -0.00011664628982543945,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "H007_B033_02034L_001",
+      "camera_group": "H007",
+      "raw_offset_stops": 1.4108510067588353,
+      "camera_baseline_stops": 1.41073436046901,
+      "final_offset_stops": 0.00011664628982543945,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "H007_C033_0203VC_001",
+      "camera_group": "H007",
+      "raw_offset_stops": 1.292247061980393,
+      "camera_baseline_stops": 1.41073436046901,
+      "final_offset_stops": -0.11848729848861694,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "H007_D033_0203D0_001",
+      "camera_group": "H007",
+      "raw_offset_stops": 1.4938213875419164,
+      "camera_baseline_stops": 1.41073436046901,
+      "final_offset_stops": 0.0830870270729065,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "I007_A033_0203BR_001",
+      "camera_group": "I007",
+      "raw_offset_stops": 1.3311666300422216,
+      "camera_baseline_stops": 1.410535817397263,
+      "final_offset_stops": -0.0793691873550415,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "I007_B033_02039Q_001",
+      "camera_group": "I007",
+      "raw_offset_stops": 1.4899050047523046,
+      "camera_baseline_stops": 1.410535817397263,
+      "final_offset_stops": 0.0793691873550415,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "I007_C033_0203HZ_001",
+      "camera_group": "I007",
+      "raw_offset_stops": 1.0894509604102636,
+      "camera_baseline_stops": 1.410535817397263,
+      "final_offset_stops": -0.3210848569869995,
+      "confidence": 1.0
+    },
+    {
+      "clip_id": "I007_D033_0203KV_001",
+      "camera_group": "I007",
+      "raw_offset_stops": 1.578550224555161,
+      "camera_baseline_stops": 1.410535817397263,
+      "final_offset_stops": 0.16801440715789795,
+      "confidence": 1.0
+    }
+  ]
+}

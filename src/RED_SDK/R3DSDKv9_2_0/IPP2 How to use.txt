@@ -1,0 +1,55 @@
+Please read the "IPP2 Image Pipeline Stages.pdf" document for an introduction to IPP2
+and get a general overview of the features and how it works.
+
+Important note: when using the OpenCL GPU decoder please make sure to set clCreateImage3D
+in the EXT_OCLAPI_1_1 class, otherwise decoding will fail!
+
+IPP2 Image Pipeline is mostly a blank slate so most of the old ImageProcessingSettings
+parameters are no longer used and new IPP2 only settings have been added.
+
+For IPP2 *only* the following ImageProcessingSettings parameters need to be available
+for the end user to change (all others are unavailable in IPP2 mode):
+
+- Version (set to ColorVersion3)
+- ImagePipelineMode
+- ChromaNoiseReduction
+- FlashingPixelAdjustment
+- MasklineAdjust
+- Kelvin
+- Tint
+- ISO
+- ExposureAdjust
+- Curves
+- CdlSaturation, CdlRed, CdlGreen, CdlBlue & CdlEnabled
+- Lut3DEnabled (if a 3D LUT is loaded for the clip)
+- OutputToneMap
+- ColorSpace
+- GammaCurve
+- HighlightRollOff
+- HdrPeakNits
+
+The amount of color spaces & gamma curves available in IPP2 decode mode have been reduced
+and are all industry standard or well defined by RED (see "White Paper on REDWideGamutRGB
+and Log3G10.pdf" included with the SDK relase).
+
+There is also the ImagePipelineMode parameter which allows for the option to just do
+Primary RAW Development (see "IPP2 Image PIpeline Stages.pdf" document and the ImagePipeline
+enum for more information) and output REDWideGamutRGB and Log3G10 for further processing
+in your own application or somewhere else.
+
+Clips can be recorded on camera with a Creative 3D LUT attached which will be transmitted
+as a sidecar .cube file sitting next to the R3D files. This Creative 3D LUT will automatically
+be set on the ImageProcessingSettings structure after a call to GetDefaultImageProcessingSettings
+or GetClipImageProcessingSettings. To disable the use of this simply set CreativeLut to NULL.
+
+There are also APIs included to get the path to the Creative 3D LUT as well as load new ones.
+Creative 3D LUTs must be in the .cube format and there is both a Clip class API available as
+well as a global one.
+
+The Clip::LoadCreativeLut API can work with sidecar 3D LUT files by simply passing in just
+the filename instead of a full path. A call to CreateOrUpdateRmd will also set that properly
+in the RMD file.
+
+If the 3D LUT is not sitting next to the clip then either the Clip or the global version of
+LoadCreativeLut API can be used and in the case of the latter a separate path can also be
+specified in case the user has a certain folder where all the 3D LUTs are present.

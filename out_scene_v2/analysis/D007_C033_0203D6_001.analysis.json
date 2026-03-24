@@ -1,0 +1,126 @@
+{
+  "clip_id": "D007_C033_0203D6_001",
+  "source_path": "/Volumes/TProps_6TB/Test_FTP/D007_C033_0203D6.RDC/D007_C033_0203D6_001.R3D",
+  "backend": "mock",
+  "camera_group": "D007",
+  "clip_statistic_log2": -3.5633233785629272,
+  "camera_group_statistic_log2": -3.5633233785629272,
+  "global_reference_log2": -2.473931188332412,
+  "raw_offset_stops": 1.089392190230515,
+  "camera_baseline_stops": 1.3498426725989843,
+  "clip_trim_stops": -0.26045048236846924,
+  "final_offset_stops": -0.26045048236846924,
+  "confidence": 1.0,
+  "sample_plan": {
+    "strategy": "uniform",
+    "sample_count": 8,
+    "start_frame": 0,
+    "frame_step": 3,
+    "max_frames": 8
+  },
+  "monitoring": {
+    "mode": "scene",
+    "ipp2_color_space": "REDWideGamutRGB",
+    "ipp2_gamma_curve": "Log3G10",
+    "active_lut_path": null,
+    "lut_override_path": null,
+    "resolved_lut_path": null
+  },
+  "clip_metadata": {
+    "clip_id": "D007_C033_0203D6_001",
+    "source_path": "/Volumes/TProps_6TB/Test_FTP/D007_C033_0203D6.RDC/D007_C033_0203D6_001.R3D",
+    "fps": 24.0,
+    "width": 96,
+    "height": 54,
+    "total_frames": 24,
+    "reel_id": "D007",
+    "source_identifier": "C033",
+    "color_space": "REDWideGamutRGB",
+    "gamma_curve": "Log3G10",
+    "iso": 1040.0,
+    "shutter_seconds": 0.020833333333333332,
+    "aperture_t_stop": 2.8,
+    "active_lut_path": null,
+    "extra_metadata": {
+      "mock_digest": "18ab5321ffab773e52d0f7859ca283786c41facb"
+    }
+  },
+  "frame_stats": [
+    {
+      "frame_index": 0,
+      "timestamp_seconds": 0.0,
+      "log_luminance_median": -3.5615625381469727,
+      "clipped_fraction": 0.0,
+      "valid_fraction": 1.0,
+      "accepted": true,
+      "reason": null
+    },
+    {
+      "frame_index": 3,
+      "timestamp_seconds": 0.125,
+      "log_luminance_median": -3.5626373291015625,
+      "clipped_fraction": 0.0,
+      "valid_fraction": 1.0,
+      "accepted": true,
+      "reason": null
+    },
+    {
+      "frame_index": 6,
+      "timestamp_seconds": 0.25,
+      "log_luminance_median": -3.564009428024292,
+      "clipped_fraction": 0.0,
+      "valid_fraction": 1.0,
+      "accepted": true,
+      "reason": null
+    },
+    {
+      "frame_index": 9,
+      "timestamp_seconds": 0.375,
+      "log_luminance_median": -3.566187858581543,
+      "clipped_fraction": 0.0,
+      "valid_fraction": 1.0,
+      "accepted": true,
+      "reason": null
+    },
+    {
+      "frame_index": 12,
+      "timestamp_seconds": 0.5,
+      "log_luminance_median": -3.566305637359619,
+      "clipped_fraction": 0.0,
+      "valid_fraction": 1.0,
+      "accepted": true,
+      "reason": null
+    },
+    {
+      "frame_index": 15,
+      "timestamp_seconds": 0.625,
+      "log_luminance_median": -3.565441131591797,
+      "clipped_fraction": 0.0,
+      "valid_fraction": 1.0,
+      "accepted": true,
+      "reason": null
+    },
+    {
+      "frame_index": 18,
+      "timestamp_seconds": 0.75,
+      "log_luminance_median": -3.559864044189453,
+      "clipped_fraction": 0.0,
+      "valid_fraction": 1.0,
+      "accepted": true,
+      "reason": null
+    },
+    {
+      "frame_index": 21,
+      "timestamp_seconds": 0.875,
+      "log_luminance_median": -3.5590944290161133,
+      "clipped_fraction": 0.0,
+      "valid_fraction": 1.0,
+      "accepted": true,
+      "reason": null
+    }
+  ],
+  "diagnostics": {
+    "sampled_frames": 8,
+    "accepted_frames": 8
+  }
+}

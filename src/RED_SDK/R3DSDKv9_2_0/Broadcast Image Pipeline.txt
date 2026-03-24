@@ -1,0 +1,18 @@
+The Broadcast Image Pipeline (ColorVersionBC) introduced in R3D SDK 8.6.0 is available for all R3D
+clips shot in broadcast mode in-camera. Such clips can also be switched to IPP2 (ColorVersion3).
+
+The following ImageProcessingSettings structure fields are supported, all others are ignored:
+	- Kelvin
+	- Tint
+	- ISO
+	- GammaCurve, limited to ImageGammaBT1886, ImageGammaHDR2084 & ImageGammaHybridLogGamma
+	- ColorSpace, recommended to limit to ImageColorRec709 & ImageColorRec2020
+	- ChromaNoiseReduction
+	- FlashingPixelAdjustment
+	- ExposureAdjust
+	- MasklineAdjust
+
+Non-broadcast clips cannot be decoded with the Broadcast Image Pipeline and will automatically be
+switched to IPP2 to help in situations where pipeline setting might be per project etc. in applications.
+
+Sample broadcast clip: https://downloads.red.com/software/sdk/R3D/Broadcast_sample_clip.zip
