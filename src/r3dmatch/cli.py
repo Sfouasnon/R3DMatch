@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -201,6 +202,12 @@ def report_contact_sheet_command(
     color_calibration: Optional[str] = typer.Option(None, "--color-calibration", help="Optional color calibration JSON"),
     target_type: Optional[str] = typer.Option(None, "--target-type", help="Optional target type: gray_card, gray_sphere, or color_chart"),
     processing_mode: Optional[str] = typer.Option(None, "--processing-mode", help="Optional processing mode: exposure, color, or both"),
+    preview_mode: str = typer.Option("calibration", "--preview-mode", help="Preview mode: calibration or monitoring"),
+    preview_output_space: Optional[str] = typer.Option(None, "--preview-output-space", help="Preview output color space"),
+    preview_output_gamma: Optional[str] = typer.Option(None, "--preview-output-gamma", help="Preview output gamma"),
+    preview_highlight_rolloff: Optional[str] = typer.Option(None, "--preview-highlight-rolloff", help="Preview highlight rolloff"),
+    preview_shadow_rolloff: Optional[str] = typer.Option(None, "--preview-shadow-rolloff", help="Preview shadow rolloff"),
+    preview_lut: Optional[str] = typer.Option(None, "--preview-lut", help="Optional monitoring LUT (.cube)"),
 ) -> None:
     payload = build_contact_sheet_report(
         input_path,
@@ -209,6 +216,12 @@ def report_contact_sheet_command(
         color_calibration_path=color_calibration,
         target_type=target_type,
         processing_mode=processing_mode,
+        preview_mode=preview_mode,
+        preview_output_space=preview_output_space,
+        preview_output_gamma=preview_output_gamma,
+        preview_highlight_rolloff=preview_highlight_rolloff,
+        preview_shadow_rolloff=preview_shadow_rolloff,
+        preview_lut=preview_lut,
     )
     typer.echo(str(payload))
 
@@ -234,6 +247,12 @@ def review_calibration_command(
     roi_h: Optional[float] = typer.Option(None, "--roi-h", help="Shared normalized ROI height"),
     target_strategy: list[str] = typer.Option(["median"], "--target-strategy", help="Target strategy: median, brightest-valid, or manual; repeat to compare multiple"),
     reference_clip_id: Optional[str] = typer.Option(None, "--reference-clip-id", help="Reference clip ID for manual target strategy"),
+    preview_mode: str = typer.Option("calibration", "--preview-mode", help="Preview mode: calibration or monitoring"),
+    preview_output_space: Optional[str] = typer.Option(None, "--preview-output-space", help="Preview output color space"),
+    preview_output_gamma: Optional[str] = typer.Option(None, "--preview-output-gamma", help="Preview output gamma"),
+    preview_highlight_rolloff: Optional[str] = typer.Option(None, "--preview-highlight-rolloff", help="Preview highlight rolloff"),
+    preview_shadow_rolloff: Optional[str] = typer.Option(None, "--preview-shadow-rolloff", help="Preview shadow rolloff"),
+    preview_lut: Optional[str] = typer.Option(None, "--preview-lut", help="Optional monitoring LUT (.cube)"),
 ) -> None:
     calibration_roi = None
     roi_values = [roi_x, roi_y, roi_w, roi_h]
@@ -262,6 +281,12 @@ def review_calibration_command(
         calibration_roi=calibration_roi,
         target_strategies=target_strategy,
         reference_clip_id=reference_clip_id,
+        preview_mode=preview_mode,
+        preview_output_space=preview_output_space,
+        preview_output_gamma=preview_output_gamma,
+        preview_highlight_rolloff=preview_highlight_rolloff,
+        preview_shadow_rolloff=preview_shadow_rolloff,
+        preview_lut=preview_lut,
     )
     typer.echo(str(payload))
 
@@ -284,6 +309,13 @@ def clear_preview_cache_command(
 ) -> None:
     payload = clear_preview_cache(input_path, report_dir=report_dir)
     typer.echo(str(payload))
+
+
+@app.command("desktop-ui")
+def desktop_ui_command() -> None:
+    from .desktop_app import launch_desktop_ui
+
+    launch_desktop_ui(str(Path.cwd()))
 
 
 def main() -> None:

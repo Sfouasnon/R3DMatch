@@ -8,16 +8,18 @@ from typer.testing import CliRunner
 
 from r3dmatch.calibration import build_array_calibration_from_analysis, calibrate_card_path, calibrate_color_path, calibrate_exposure_path, calibrate_sphere_path, center_crop_roi, derive_array_group_key, detect_gray_card_roi, load_calibration, load_card_roi_file, load_color_calibration, load_exposure_calibration, measure_card_from_roi, measure_color_region, measure_sphere_from_roi, solve_neutral_gains
 from r3dmatch.cli import app
+from r3dmatch.desktop_app import build_review_command, run_ui_self_check, scan_calibration_sources
 from r3dmatch.identity import group_key_from_clip_id, rmd_name_for_clip_id
 from r3dmatch.matching import analyze_path, camera_group_from_clip_id, discover_clips, measure_frame_color_and_exposure
 from r3dmatch.models import GrayCardROI, SamplingRegion, SphereROI
-from r3dmatch.report import _build_strategy_payloads, build_contact_sheet_report, preview_filename_for_clip_id
+from r3dmatch.report import _build_strategy_payloads, _compute_image_difference_metrics, build_contact_sheet_report, preview_filename_for_clip_id, render_preview_frame
 from r3dmatch.rmd import render_rmd_xml, rmd_filename_for_clip_id, write_rmds_from_analysis
 from r3dmatch.ui import build_table_rows, load_review_bundle
 from r3dmatch.sdk import MockR3DBackend, RedSdkDecoder, resolve_backend
 from r3dmatch.sidecar import build_sidecar_payload, sidecar_filename_for_clip_id
 from r3dmatch.transcode import build_redline_command, build_redline_command_variants, write_transcode_plan
 from r3dmatch.validation import validate_pipeline
+from r3dmatch.web_app import build_review_web_command, create_app, scan_sources
 from r3dmatch.workflow import approve_master_rmd, clear_preview_cache, review_calibration
 
 runner = CliRunner()
@@ -27,10 +29,43 @@ def _install_fake_redline(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(command, capture_output, text, check):  # type: ignore[no-untyped-def]
         from PIL import Image
 
+        if "--help" in command:
+            help_text = "\n".join(
+                [
+                    "REDline Build 65.1.3   64bit Public Release",
+                    "--loadRMD <filename>",
+                    "--useRMD <int>",
+                    "--exposure <float>",
+                    "--redGain <float>",
+                    "--greenGain <float>",
+                    "--blueGain <float>",
+                    "--gammaCurve <int>",
+                    "--colorSpace <int>",
+                    "--outputToneMap <int>",
+                    "--rollOff <int>",
+                    "--shadow <float>",
+                    "--lut <filename>",
+                ]
+            )
+            return types.SimpleNamespace(returncode=0, stdout=help_text, stderr="")
+        if "--printMeta" in command:
+            if "--loadRMD" in command:
+                return types.SimpleNamespace(returncode=0, stdout="RMD metadata loaded\n", stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="CLI metadata loaded\n", stderr="")
         output_path = Path(command[command.index("--o") + 1])
         generated_path = output_path.with_name(f"{output_path.name}.000000.jpg")
         generated_path.parent.mkdir(parents=True, exist_ok=True)
-        Image.new("RGB", (32, 18), (128, 128, 128)).save(generated_path, format="JPEG")
+        exposure = 0.0
+        if "--exposure" in command:
+            exposure = float(command[command.index("--exposure") + 1])
+        red_gain = float(command[command.index("--redGain") + 1]) if "--redGain" in command else 1.0
+        green_gain = float(command[command.index("--greenGain") + 1]) if "--greenGain" in command else 1.0
+        blue_gain = float(command[command.index("--blueGain") + 1]) if "--blueGain" in command else 1.0
+        base = np.zeros((18, 32, 3), dtype=np.uint8)
+        base[..., 0] = np.clip(80.0 * (2.0**exposure) * red_gain, 0, 255)
+        base[..., 1] = np.clip(90.0 * (2.0**exposure) * green_gain, 0, 255)
+        base[..., 2] = np.clip(100.0 * (2.0**exposure) * blue_gain, 0, 255)
+        Image.fromarray(base, mode="RGB").save(generated_path, format="JPEG")
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("r3dmatch.report.subprocess.run", fake_run)
@@ -141,6 +176,209 @@ def test_preview_path_generation_from_clip_id() -> None:
         preview_filename_for_clip_id("G007_D060_0324M6_001", "both", strategy="median", run_id="batch01")
         == "G007_D060_0324M6_001.both.review.median.batch01.jpg"
     )
+
+
+def test_desktop_ui_review_command_uses_tcsh_and_preview_options() -> None:
+    command = build_review_command(
+        repo_root="/Users/sfouasnon/Desktop/R3DMatch",
+        input_path="/tmp/in",
+        output_path="/tmp/out",
+        backend="red",
+        target_type="gray_sphere",
+        processing_mode="both",
+        roi_x="0.1",
+        roi_y="0.2",
+        roi_w="0.3",
+        roi_h="0.4",
+        target_strategies=["median", "manual"],
+        reference_clip_id="G007_D060_0324M6_001",
+        preview_mode="monitoring",
+        preview_lut="/tmp/show.cube",
+    )
+    joined = " ".join(command)
+    assert command[0] == "/bin/tcsh"
+    assert "setenv PYTHONPATH" in joined
+    assert "--preview-mode monitoring" in joined
+    assert "--preview-lut /tmp/show.cube" in joined
+    assert "--reference-clip-id G007_D060_0324M6_001" in joined
+
+
+def test_scan_calibration_sources_discovers_rdc_media(tmp_path: Path) -> None:
+    rdc = tmp_path / "A001_C001_0001AB.RDC"
+    rdc.mkdir()
+    clip = rdc / "A001_C001_0001AB_001.R3D"
+    clip.write_bytes(b"")
+    hidden = rdc / "._A001_C001_0001AB_002.R3D"
+    hidden.write_bytes(b"")
+    summary = scan_calibration_sources(str(tmp_path))
+    assert summary["clip_count"] == 1
+    assert summary["rdc_count"] == 1
+    assert summary["r3d_count"] == 1
+    assert summary["clip_ids"] == ["A001_C001_0001AB_001"]
+    assert summary["warning"] is None
+
+
+def test_scan_calibration_sources_warns_on_empty_folder(tmp_path: Path) -> None:
+    summary = scan_calibration_sources(str(tmp_path))
+    assert summary["clip_count"] == 0
+    assert "No valid RED" in str(summary["warning"])
+
+
+def test_web_scan_sources_discovers_rdc_media(tmp_path: Path) -> None:
+    rdc = tmp_path / "A001_C001_0001AB.RDC"
+    rdc.mkdir()
+    clip = rdc / "A001_C001_0001AB_001.R3D"
+    clip.write_bytes(b"")
+    summary = scan_sources(str(tmp_path))
+    assert summary["clip_count"] == 1
+    assert summary["sample_clip_ids"] == ["A001_C001_0001AB_001"]
+    assert summary["warning"] is None
+
+
+def test_build_review_web_command_uses_tcsh_and_preview_options() -> None:
+    command = build_review_web_command(
+        "/Users/sfouasnon/Desktop/R3DMatch",
+        {
+            "input_path": "/tmp/in",
+            "output_path": "/tmp/out",
+            "backend": "red",
+            "target_type": "gray_sphere",
+            "processing_mode": "both",
+            "roi_x": "0.1",
+            "roi_y": "0.2",
+            "roi_w": "0.3",
+            "roi_h": "0.4",
+            "target_strategies": ["median", "manual"],
+            "reference_clip_id": "G007_D060_0324M6_001",
+            "preview_mode": "monitoring",
+            "preview_lut": "/tmp/show.cube",
+        },
+    )
+    joined = " ".join(command)
+    assert command[0] == "/bin/tcsh"
+    assert "setenv PYTHONPATH" in joined
+    assert "--preview-mode monitoring" in joined
+    assert "--preview-lut /tmp/show.cube" in joined
+    assert "--reference-clip-id G007_D060_0324M6_001" in joined
+
+
+def test_web_app_routes_and_validation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    started: dict[str, object] = {}
+
+    def fake_start(state, command, output_path, **kwargs):  # type: ignore[no-untyped-def]
+        started["command"] = command
+        started["output_path"] = output_path
+        started["kwargs"] = kwargs
+        state.task.command = " ".join(command)
+        state.task.output_path = output_path
+        state.task.status = "running"
+        state.task.logs = ["started\n"]
+        state.task.clip_count = int(kwargs.get("clip_count", 0) or 0)
+        state.task.strategies_text = str(kwargs.get("strategies_text", ""))
+        state.task.preview_mode = str(kwargs.get("preview_mode", ""))
+
+    monkeypatch.setattr("r3dmatch.web_app._start_command_task", fake_start)
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    app = create_app()
+    client = app.test_client()
+
+    index = client.get("/")
+    assert index.status_code == 200
+    assert b"R3DMatch" in index.data
+
+    invalid = client.post("/run-review", data={"input_path": "", "output_path": ""})
+    assert invalid.status_code == 200
+    assert b"Calibration folder path is required" in invalid.data
+
+    rdc = tmp_path / "A001_C001_0001AB.RDC"
+    rdc.mkdir()
+    clip = rdc / "A001_C001_0001AB_001.R3D"
+    clip.write_bytes(b"")
+    out_dir = tmp_path / "out"
+    scan_response = client.post("/scan", data={"input_path": str(tmp_path), "output_path": str(out_dir)})
+    assert scan_response.status_code == 200
+    assert b"found 1 RED clips" in scan_response.data
+    assert b"A001_C001_0001AB_001" in scan_response.data
+
+    run_response = client.post(
+        "/run-review",
+        data={
+            "input_path": str(tmp_path),
+            "output_path": str(out_dir),
+            "backend": "mock",
+            "target_type": "gray_sphere",
+            "processing_mode": "both",
+            "target_strategies": ["median"],
+            "preview_mode": "calibration",
+            "roi_mode": "center",
+        },
+    )
+    assert run_response.status_code == 200
+    assert started["output_path"] == str(out_dir)
+    assert "review-calibration" in " ".join(started["command"])
+    assert started["kwargs"]["clip_count"] == 1
+    assert started["kwargs"]["strategies_text"] == "median"
+    assert started["kwargs"]["preview_mode"] == "calibration"
+
+
+def test_web_app_status_progress_and_completion_links(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    app = create_app()
+    client = app.test_client()
+    out_dir = tmp_path / "out"
+    report_dir = out_dir / "report"
+    report_dir.mkdir(parents=True)
+    pdf_path = report_dir / "preview_contact_sheet.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n")
+    html_path = report_dir / "contact_sheet.html"
+    html_path.write_text("<html></html>", encoding="utf-8")
+    state = app.config["UI_STATE"]
+    state.task.command = "python3 -m r3dmatch.cli review-calibration /tmp/in --out /tmp/out"
+    state.task.output_path = str(out_dir)
+    state.task.status = "running"
+    state.task.returncode = 0
+    state.task.clip_count = 3
+    state.task.strategies_text = "median, brightest-valid"
+    state.task.preview_mode = "calibration"
+    status_response = client.get("/status")
+    assert status_response.status_code == 200
+    payload = status_response.get_json()
+    assert payload["stage"] == "Complete"
+    assert payload["report_ready"] is True
+    assert payload["preview_pdf_url"]
+    assert payload["preview_html_url"]
+    assert payload["output_folder"] == str(out_dir)
+    assert payload["progress_percent"] == 100
+
+
+def test_web_app_scan_page_shows_roi_mode_and_preview_placeholder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    app = create_app()
+    client = app.test_client()
+    response = client.post("/scan", data={"input_path": str(tmp_path), "output_path": str(tmp_path / "out")})
+    assert response.status_code == 200
+    assert b"ROI Mode" in response.data
+    assert b"Preview available after scan or first render" in response.data
+    assert b"draw" in response.data
+    assert b"center" in response.data
+    assert b"full" in response.data
+    assert b"manual" in response.data
+
+
+def test_ui_self_check_reports_visible_sections() -> None:
+    lines = run_ui_self_check("/Users/sfouasnon/Desktop/R3DMatch")
+    assert "header section created" in lines
+    assert "calibration folder section created" in lines
+    assert "output folder section created" in lines
+    assert "basic settings section created" in lines
+    assert "source summary section created" in lines
+    assert "actions section created" in lines
+    assert "log section created" in lines
+
+
+def test_ui_self_check_minimal_mode_reports_minimal_sections() -> None:
+    lines = run_ui_self_check("/Users/sfouasnon/Desktop/R3DMatch", minimal_mode=True)
+    assert "minimal_mode=True" in lines
 
 
 def test_measurement_uses_shared_roi_only() -> None:
@@ -1063,12 +1301,15 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
         sampling_strategy="uniform",
         calibration_roi={"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
     )
+    (tmp_path / "show.cube").write_text("LUT_3D_SIZE 2\n0 0 0\n0 0 1\n0 1 0\n0 1 1\n1 0 0\n1 0 1\n1 1 0\n1 1 1\n", encoding="utf-8")
     payload = build_contact_sheet_report(
         str(tmp_path / "analysis-out"),
         out_dir=str(tmp_path / "report"),
         target_type="gray_sphere",
         processing_mode="both",
         target_strategies=["median", "brightest-valid"],
+        preview_mode="monitoring",
+        preview_lut=str(tmp_path / "show.cube"),
     )
     assert Path(payload["report_json"]).exists()
     assert Path(payload["report_html"]).exists()
@@ -1079,18 +1320,166 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert report_json["target_type"] == "gray_sphere"
     assert report_json["preview_transform"]
     assert report_json["exposure_measurement_domain"] == "monitoring"
+    assert report_json["preview_mode"] == "monitoring"
+    assert report_json["preview_settings"]["lut_path"].endswith("show.cube")
+    assert report_json["measurement_preview_settings"]["preview_mode"] == "calibration"
+    assert report_json["redline_capabilities"]["supports_lut"] is True
     assert report_json["calibration_roi"] == {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4}
     assert report_json["target_strategies"] == ["median", "brightest_valid"]
     assert report_json["shared_originals"][0]["original_frame"].endswith("G007_D060_0324M6_001.original.review.analysis-out.jpg")
     assert report_json["strategies"][0]["clips"][0]["both_corrected"].endswith("G007_D060_0324M6_001.both.review.median.analysis-out.jpg")
+    assert report_json["strategies"][0]["clips"][0]["metrics"]["preview_transform"] == report_json["preview_transform"]
     assert "measured_log2_luminance_monitoring" in report_json["strategies"][0]["clips"][0]["metrics"]["exposure"]
     assert "measured_log2_luminance_raw" in report_json["strategies"][0]["clips"][0]["metrics"]["exposure"]
     assert Path(report_json["clips"][0]["original_frame"]).exists()
     assert not list((tmp_path / "analysis-out" / "previews").glob("*.000000.jpg"))
+    preview_commands = json.loads((tmp_path / "analysis-out" / "previews" / "preview_commands.json").read_text(encoding="utf-8"))
+    strategy_command = next(command for command in preview_commands["commands"] if command["variant"] == "both" and command["strategy"] == "median")
+    assert strategy_command["look_metadata_path"].endswith("/review_rmd/strategies/median/both/G007_D060_0324M6_001.RMD")
+    assert Path(strategy_command["look_metadata_path"]).exists()
+    assert strategy_command["mode"] == "corrected"
+    assert strategy_command["rmd_metadata_probe"]["returncode"] == 0
+    assert "--loadRMD" not in strategy_command["command"]
+    assert "--exposure" in strategy_command["command"]
+    assert "--useMeta" not in strategy_command["command"]
+    assert strategy_command["pixel_diff_from_baseline"] == pytest.approx(0.0)
+    assert strategy_command["pixel_output_changed"] is False
+    assert strategy_command["error"] is None
+    assert strategy_command["as_shot_metadata_used"] is False
+    assert strategy_command["explicit_transform_used"] is True
+    assert strategy_command["explicit_correction_flags_used"] is False
+    assert "--lut" in strategy_command["command"]
     html = Path(payload["report_html"]).read_text(encoding="utf-8")
     assert "G007_D060_0324M6_001" in html
     assert "../previews/G007_D060_0324M6_001.original.review.analysis-out.jpg" in html
     assert "both.review.median.analysis-out.jpg" in html
+    assert payload["preview_mode"] == "monitoring"
+    assert payload["preview_settings"]["lut_path"].endswith("show.cube")
+    assert payload["measurement_preview_settings"]["preview_mode"] == "calibration"
+    assert payload["redline_capabilities"]["supports_lut"] is True
+
+
+def test_report_preview_falls_back_to_cli_flags_when_rmd_probe_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(command, capture_output, text, check):  # type: ignore[no-untyped-def]
+        from PIL import Image
+
+        if "--help" in command:
+            help_text = "\n".join(
+                [
+                    "REDline Build 65.1.3   64bit Public Release",
+                    "--loadRMD <filename>",
+                    "--useRMD <int>",
+                    "--exposure <float>",
+                    "--redGain <float>",
+                    "--greenGain <float>",
+                    "--blueGain <float>",
+                    "--gammaCurve <int>",
+                    "--colorSpace <int>",
+                    "--outputToneMap <int>",
+                    "--rollOff <int>",
+                    "--shadow <float>",
+                    "--lut <filename>",
+                ]
+            )
+            return types.SimpleNamespace(returncode=0, stdout=help_text, stderr="")
+        if "--printMeta" in command and "--loadRMD" in command:
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="Error parsing RMD file")
+        if "--printMeta" in command:
+            return types.SimpleNamespace(returncode=0, stdout="CLI metadata loaded\n", stderr="")
+        output_path = Path(command[command.index("--o") + 1])
+        generated_path = output_path.with_name(f"{output_path.name}.000000.jpg")
+        generated_path.parent.mkdir(parents=True, exist_ok=True)
+        exposure = float(command[command.index("--exposure") + 1]) if "--exposure" in command else 0.0
+        red_gain = float(command[command.index("--redGain") + 1]) if "--redGain" in command else 1.0
+        green_gain = float(command[command.index("--greenGain") + 1]) if "--greenGain" in command else 1.0
+        blue_gain = float(command[command.index("--blueGain") + 1]) if "--blueGain" in command else 1.0
+        image = np.zeros((18, 32, 3), dtype=np.uint8)
+        image[..., 0] = np.clip(70.0 * (2.0**exposure) * red_gain, 0, 255)
+        image[..., 1] = np.clip(80.0 * (2.0**exposure) * green_gain, 0, 255)
+        image[..., 2] = np.clip(90.0 * (2.0**exposure) * blue_gain, 0, 255)
+        Image.fromarray(image, mode="RGB").save(generated_path, format="JPEG")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("r3dmatch.report.subprocess.run", fake_run)
+    clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
+    clip_path.write_bytes(b"")
+    analyze_path(
+        str(tmp_path),
+        out_dir=str(tmp_path / "analysis-out"),
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+    )
+    build_contact_sheet_report(
+        str(tmp_path / "analysis-out"),
+        out_dir=str(tmp_path / "report"),
+        target_type="gray_sphere",
+        processing_mode="both",
+        target_strategies=["median"],
+    )
+    preview_commands = json.loads((tmp_path / "analysis-out" / "previews" / "preview_commands.json").read_text(encoding="utf-8"))
+    strategy_command = next(command for command in preview_commands["commands"] if command["variant"] == "both" and command["strategy"] == "median")
+    assert strategy_command["mode"] == "corrected"
+    assert strategy_command["rmd_metadata_probe"]["returncode"] == 1
+    assert "--loadRMD" not in strategy_command["command"]
+    assert "--exposure" in strategy_command["command"]
+    assert "--useMeta" not in strategy_command["command"]
+    assert strategy_command["pixel_diff_from_baseline"] == pytest.approx(0.0)
+    assert strategy_command["error"] is None
+
+
+def test_render_preview_frame_corrected_image_differs_from_baseline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
+    clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
+    clip_path.write_bytes(b"")
+    settings = {
+        "preview_mode": "calibration",
+        "output_space": "REDWideGamutRGB",
+        "output_gamma": "Log3G10",
+        "highlight_rolloff": "medium",
+        "shadow_rolloff": "medium",
+        "output_tonemap": "medium",
+        "lut_path": None,
+    }
+    capabilities = {
+        "supports_color_space": True,
+        "supports_gamma_curve": True,
+        "supports_output_tonemap": True,
+        "supports_rolloff": True,
+        "supports_shadow_control": True,
+        "supports_lut": False,
+    }
+    baseline = render_preview_frame(
+        str(clip_path),
+        str(tmp_path / "baseline.jpg"),
+        frame_index=0,
+        redline_executable="REDLine",
+        redline_capabilities=capabilities,
+        preview_settings=settings,
+        use_as_shot_metadata=True,
+    )
+    corrected = render_preview_frame(
+        str(clip_path),
+        str(tmp_path / "corrected.jpg"),
+        frame_index=0,
+        redline_executable="REDLine",
+        redline_capabilities=capabilities,
+        preview_settings=settings,
+        use_as_shot_metadata=False,
+        exposure=1.0,
+        red_gain=1.2,
+        green_gain=1.0,
+        blue_gain=0.8,
+    )
+    metrics = _compute_image_difference_metrics(baseline["output_path"], corrected["output_path"])
+    assert metrics["mean_absolute_difference"] is not None
+    assert metrics["mean_absolute_difference"] > 0.0
+    assert metrics["pixel_output_changed"] is True
+    assert "--useMeta" in baseline["command"]
+    assert "--useMeta" not in corrected["command"]
 
 
 def test_multi_strategy_review_includes_manual_reference_and_shared_originals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

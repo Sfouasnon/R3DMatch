@@ -160,10 +160,10 @@ It expects:
 - `sidecars/*.sidecar.json`
 - optional generated previews under `previews/`
 
-Generate previews plus a real contact-sheet HTML from an analyze output folder with:
+Generate previews plus a real contact-sheet package from an analyze output folder with:
 
 ```bash
-r3dmatch report-contact-sheet ./out --out ./out/report
+r3dmatch report-contact-sheet ./out --out ./out/report --preview-mode calibration
 ```
 
 This writes:
@@ -177,12 +177,12 @@ This writes:
 - `./out/report/contact_sheet.html`
 - `./out/report/review_manifest.json`
 
-Preview rendering now uses `REDLine` to render stills with RED IPP2 output settings for review:
+Preview rendering now uses `REDLine` and exposes two review modes:
 
-- output color space: `Rec709`
-- gamma curve: `BT1886`
-- output tone map: `Medium`
-- highlight roll-off: `Medium`
+- `calibration` (default): calibration-safe preview using `REDWideGamutRGB / Log3G10 / Medium / Medium`
+- `monitoring`: optional operator-facing monitoring preview, with optional `--preview-lut /path/to/show.cube`
+
+The authoritative exposure solve still uses the calibration preview path, even if monitoring previews are requested for the visible review package.
 
 The four preview variants remain:
 
@@ -193,12 +193,14 @@ The four preview variants remain:
 
 `report-contact-sheet` writes those previews under `previews/` and then builds both `preview_contact_sheet.pdf` and `contact_sheet.html`. The preview PDF is now the preferred review artifact for operators because it does not depend on browser rendering. Set `R3DMATCH_REDLINE_EXECUTABLE` if `REDLine` is not on `PATH`.
 
+Each review package also records the detected REDLine capabilities and the exact preview settings used, including whether LUT support was available and whether the chosen preview-space arguments were applied.
+
 ## Operator Workflow
 
 1. Run review:
 
 ```bash
-r3dmatch review-calibration /path/to/calibration_r3ds --out ./review --target-type gray_sphere --processing-mode both --backend red --roi-x 0.25 --roi-y 0.25 --roi-w 0.5 --roi-h 0.5 --target-strategy median --target-strategy brightest-valid --target-strategy manual --reference-clip-id G007_D060_0324M6_001
+r3dmatch review-calibration /path/to/calibration_r3ds --out ./review --target-type gray_sphere --processing-mode both --backend red --roi-x 0.25 --roi-y 0.25 --roi-w 0.5 --roi-h 0.5 --target-strategy median --target-strategy brightest-valid --target-strategy manual --reference-clip-id G007_D060_0324M6_001 --preview-mode calibration --preview-output-space REDWideGamutRGB --preview-output-gamma Log3G10 --preview-highlight-rolloff medium --preview-shadow-rolloff medium
 ```
 
 This generates:
@@ -220,12 +222,13 @@ Original previews are rendered once as shared references, and each requested tar
 
 For gray-card and gray-sphere review, the preferred path is to provide a shared normalized ROI with `--roi-x/--roi-y/--roi-w/--roi-h`. When present, the calibration solve uses only that ROI for luminance, chromaticity, and confidence measurements. If no ROI is provided, the workflow falls back to the broader center-region measurement path.
 
-Exposure matching in the review workflow is now evaluated primarily in monitoring conditions rather than raw-domain luminance alone. The primary exposure metric is the ROI luminance after a shared monitoring-domain review transform aligned to the REDLine preview assumptions:
+Exposure matching in the review workflow is now evaluated primarily in monitoring conditions rather than raw-domain luminance alone. The primary exposure metric is the ROI luminance after a shared rendered-preview measurement pass aligned to the calibration preview assumptions:
 
-- Rec709 output
-- BT1886 gamma
+- REDWideGamutRGB output space
+- Log3G10 gamma
 - Medium tone map
 - Medium highlight roll-off
+- Medium shadow roll-off
 
 Raw-domain ROI luminance is still retained in the analysis and report outputs as diagnostics:
 
@@ -273,3 +276,44 @@ streamlit run src/r3dmatch/ui.py -- --output-folder /path/to/out
 ```
 
 If preview stills exist under `previews/` or `stills/` in that output folder, the app will show them automatically. If not, the UI still works without blocking.
+
+For the preferred internal operator UI, launch the local web app:
+
+```bash
+cd ~/Desktop/R3DMatch
+setenv PYTHONPATH "$PWD/src"
+python3 -m r3dmatch.web_app
+```
+
+This starts a local server at:
+
+```bash
+http://127.0.0.1:5000
+```
+
+The web UI is an internal-only Flask wrapper around the existing CLI/workflow. It uses text inputs for paths and server-side validation instead of OS file pickers. It lets an operator:
+
+- choose a calibration folder and scan it recursively for RED `.R3D` clips inside `.RDC` containers or plain folders
+- choose backend, target type, processing mode, ROI, strategies, and manual reference clip
+- choose `calibration` vs `monitoring` preview mode
+- optionally select a `.cube` monitoring LUT
+- run review calibration
+- inspect logs and the exact command being run
+- open the generated report/output folder
+- approve a selected strategy into `Master_RMD`
+- clear preview cache
+
+The intended source-selection flow is folder-first: operators paste a calibration folder path, the web UI discovers RED clips automatically after scan, and the source summary panel shows clip count plus sample clip IDs before review is run.
+
+Logo behavior:
+
+- the bundled project logo at `src/r3dmatch/static/r3dmatch_logo.png` is served in the header when available
+- if the image cannot be loaded, the UI falls back to a text-only header and continues normally
+
+For a quick import check without starting the server:
+
+```bash
+cd ~/Desktop/R3DMatch
+setenv PYTHONPATH "$PWD/src"
+python3 -m r3dmatch.web_app --check
+```
