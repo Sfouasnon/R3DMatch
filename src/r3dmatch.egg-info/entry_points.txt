@@ -1,2 +1,0 @@
-[console_scripts]
-r3dmatch = r3dmatch.cli:app

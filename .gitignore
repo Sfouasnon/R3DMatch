@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Build
+build/
+dist/
+
+# Native binaries
+*.so
+*.dylib
+
+# RED SDK (DO NOT COMMIT)
+src/RED_SDK/
+
+# Outputs
+out_*/
+*.json
+
+# macOS
+.DS_Store
+._*
