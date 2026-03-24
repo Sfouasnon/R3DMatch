@@ -29,6 +29,7 @@ def analyze_path(
     sample_count: int = 8,
     sampling_strategy: str = "uniform",
     clamp_stops: float = 3.0,
+    calibration_roi: Optional[Dict[str, float]] = None,
 ) -> Dict[str, object]:
     clips = discover_clips(input_path)
     if not clips:
@@ -48,6 +49,7 @@ def analyze_path(
             lut_override=lut_override,
             sample_count=sample_count,
             sampling_strategy=sampling_strategy,
+            calibration_roi=calibration_roi,
         )
         for clip in clips
     ]
@@ -260,6 +262,7 @@ def analyze_path(
             }
             for item in final_results
         ],
+        "calibration_roi": calibration_roi,
     }
     write_json(out_root / "summary.json", summary)
     return summary
@@ -273,6 +276,7 @@ def analyze_clip(
     lut_override: Optional[str],
     sample_count: int,
     sampling_strategy: str,
+    calibration_roi: Optional[Dict[str, float]] = None,
 ) -> ClipResult:
     backend_impl = resolve_backend(backend)
     clip = backend_impl.inspect_clip(source_path)
@@ -291,6 +295,7 @@ def analyze_clip(
     frame_stats: list[FrameStat] = []
     accepted_values: list[float] = []
     measured_log_values: list[float] = []
+    measured_log_values_raw: list[float] = []
     measured_rgb_means: list[list[float]] = []
     measured_rgb_chroma: list[list[float]] = []
     valid_pixel_counts: list[int] = []
@@ -304,8 +309,9 @@ def analyze_clip(
     ):
         stat = analyze_frame(frame_index, timestamp_seconds, image, mode=mode, lut=lut)
         frame_stats.append(stat)
-        measurement = measure_frame_color_and_exposure(image, mode=mode, lut=lut)
+        measurement = measure_frame_color_and_exposure(image, mode=mode, lut=lut, calibration_roi=calibration_roi)
         measured_log_values.append(measurement["measured_log2_luminance"])
+        measured_log_values_raw.append(measurement["measured_log2_luminance_raw"])
         measured_rgb_means.append(measurement["measured_rgb_mean"])
         measured_rgb_chroma.append(measurement["measured_rgb_chromaticity"])
         valid_pixel_counts.append(measurement["valid_pixel_count"])
@@ -340,11 +346,17 @@ def analyze_clip(
             "sampled_frames": len(frame_stats),
             "accepted_frames": sum(1 for item in frame_stats if item.accepted),
             "measured_log2_luminance": median(measured_log_values),
+            "measured_log2_luminance_monitoring": median(measured_log_values),
+            "measured_log2_luminance_raw": median(measured_log_values_raw),
             "measured_rgb_mean": np.median(np.asarray(measured_rgb_means, dtype=np.float32), axis=0).tolist() if measured_rgb_means else [0.0, 0.0, 0.0],
             "measured_rgb_chromaticity": np.median(np.asarray(measured_rgb_chroma, dtype=np.float32), axis=0).tolist() if measured_rgb_chroma else [1 / 3, 1 / 3, 1 / 3],
             "valid_pixel_count": int(np.median(valid_pixel_counts)) if valid_pixel_counts else 0,
             "saturation_fraction": float(np.median(saturation_fractions)) if saturation_fractions else 0.0,
             "black_fraction": float(np.median(black_fractions)) if black_fractions else 0.0,
+            "calibration_roi": calibration_roi,
+            "calibration_measurement_mode": "shared_roi" if calibration_roi is not None else "center_region_fallback",
+            "exposure_measurement_domain": "monitoring",
+            "monitoring_preview_transform": "REDLine / IPP2 / Rec709 / BT1886 / Medium / Medium",
         },
     )
 
@@ -373,16 +385,30 @@ def analyze_frame(frame_index: int, timestamp_seconds: float, image: np.ndarray,
     )
 
 
-def measure_frame_color_and_exposure(image: np.ndarray, *, mode: str, lut: Optional[CubeLut]) -> Dict[str, object]:
-    transformed = np.clip(image, 0.0, 1.0)
-    if mode == "view":
-        transformed = apply_lut(transformed, lut) if lut is not None else np.power(transformed, 1.0 / 2.4)
-    transformed = extract_center_region(transformed, fraction=0.4)
-    luminance = np.clip(transformed[0] * 0.2126 + transformed[1] * 0.7152 + transformed[2] * 0.0722, 1e-6, 1.0)
+def _extract_normalized_roi_region(image: np.ndarray, calibration_roi: Dict[str, float]) -> np.ndarray:
+    _, height, width = image.shape
+    x0 = max(0, min(width - 1, int(np.floor(float(calibration_roi["x"]) * width))))
+    y0 = max(0, min(height - 1, int(np.floor(float(calibration_roi["y"]) * height))))
+    x1 = max(x0 + 1, min(width, int(np.ceil((float(calibration_roi["x"]) + float(calibration_roi["w"])) * width))))
+    y1 = max(y0 + 1, min(height, int(np.ceil((float(calibration_roi["y"]) + float(calibration_roi["h"])) * height))))
+    return image[:, y0:y1, x0:x1]
+
+
+def _apply_monitoring_review_transform(image: np.ndarray) -> np.ndarray:
+    transformed = np.clip(image, 0.0, 1.0).astype(np.float32, copy=False)
+    # Shared monitoring-domain proxy for the REDLine IPP2 review path:
+    # soft shoulder + medium contrast + Rec709/BT1886 style display encoding.
+    shoulder = transformed / (transformed + 0.6)
+    contrast = np.clip((shoulder - 0.18) * 1.15 + 0.18, 0.0, 1.0)
+    return np.power(contrast, 1.0 / 2.4)
+
+
+def _measure_region_statistics(region: np.ndarray) -> Dict[str, object]:
+    luminance = np.clip(region[0] * 0.2126 + region[1] * 0.7152 + region[2] * 0.0722, 1e-6, 1.0)
     valid_mask = (luminance > 0.002) & (luminance < 0.998)
-    pixels = np.moveaxis(transformed, 0, -1)[valid_mask]
+    pixels = np.moveaxis(region, 0, -1)[valid_mask]
     if pixels.size == 0:
-        pixels = np.moveaxis(transformed, 0, -1).reshape(-1, 3)
+        pixels = np.moveaxis(region, 0, -1).reshape(-1, 3)
         luminance_values = luminance.reshape(-1)
     else:
         luminance_values = luminance[valid_mask]
@@ -392,6 +418,7 @@ def measure_frame_color_and_exposure(image: np.ndarray, *, mode: str, lut: Optio
     chroma = rgb_mean / max(float(np.sum(rgb_mean)), 1e-6)
     saturation_fraction = float(np.mean(np.max(pixels, axis=1) >= 0.998)) if pixels.size else 0.0
     black_fraction = float(np.mean(np.min(pixels, axis=1) <= 0.002)) if pixels.size else 0.0
+    roi_variance = float(np.var(trimmed_luma)) if trimmed_luma.size else 0.0
     return {
         "measured_log2_luminance": measured_log2,
         "measured_rgb_mean": [float(rgb_mean[0]), float(rgb_mean[1]), float(rgb_mean[2])],
@@ -399,6 +426,39 @@ def measure_frame_color_and_exposure(image: np.ndarray, *, mode: str, lut: Optio
         "valid_pixel_count": int(pixels.shape[0]),
         "saturation_fraction": saturation_fraction,
         "black_fraction": black_fraction,
+        "roi_variance": roi_variance,
+    }
+
+
+def measure_frame_color_and_exposure(
+    image: np.ndarray,
+    *,
+    mode: str,
+    lut: Optional[CubeLut],
+    calibration_roi: Optional[Dict[str, float]] = None,
+) -> Dict[str, object]:
+    raw_region = np.clip(image, 0.0, 1.0)
+    raw_region = _extract_normalized_roi_region(raw_region, calibration_roi) if calibration_roi is not None else extract_center_region(raw_region, fraction=0.4)
+    monitoring_region = np.clip(image, 0.0, 1.0)
+    if mode == "view":
+        monitoring_region = apply_lut(monitoring_region, lut) if lut is not None else np.power(monitoring_region, 1.0 / 2.4)
+    monitoring_region = _apply_monitoring_review_transform(monitoring_region)
+    monitoring_region = _extract_normalized_roi_region(monitoring_region, calibration_roi) if calibration_roi is not None else extract_center_region(monitoring_region, fraction=0.4)
+
+    raw_stats = _measure_region_statistics(raw_region)
+    monitoring_stats = _measure_region_statistics(monitoring_region)
+    return {
+        "measured_log2_luminance": monitoring_stats["measured_log2_luminance"],
+        "measured_log2_luminance_monitoring": monitoring_stats["measured_log2_luminance"],
+        "measured_log2_luminance_raw": raw_stats["measured_log2_luminance"],
+        "measured_rgb_mean": raw_stats["measured_rgb_mean"],
+        "measured_rgb_chromaticity": raw_stats["measured_rgb_chromaticity"],
+        "valid_pixel_count": monitoring_stats["valid_pixel_count"],
+        "saturation_fraction": monitoring_stats["saturation_fraction"],
+        "black_fraction": monitoring_stats["black_fraction"],
+        "roi_variance": monitoring_stats["roi_variance"],
+        "monitoring_roi_variance": monitoring_stats["roi_variance"],
+        "raw_roi_variance": raw_stats["roi_variance"],
     }
 
 

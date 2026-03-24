@@ -34,6 +34,9 @@ r3dmatch calibrate-exposure /path/to/folder --target-log2 -2.0 --sampling-mode c
 r3dmatch calibrate-color /path/to/folder --sampling-mode detected_roi --out ./cal/color
 r3dmatch validate-pipeline /path/to/folder --analysis-dir ./out --out ./validation
 r3dmatch report-contact-sheet ./out --out ./report
+r3dmatch review-calibration /path/to/folder --out ./review --target-type gray_sphere --processing-mode both --backend red --roi-x 0.25 --roi-y 0.25 --roi-w 0.5 --roi-h 0.5
+r3dmatch approve-master-rmd ./review
+r3dmatch clear-preview-cache ./review
 r3dmatch write-rmd /path/to/folder --analysis-dir ./out
 r3dmatch transcode /path/to/clip.R3D --analysis-dir ./out --use-generated-sidecar --out ./renders
 r3dmatch transcode /path/to/clip.R3D --analysis-dir ./out --use-generated-rmd --out ./renders
@@ -155,6 +158,113 @@ It expects:
 - `array_calibration.json`
 - `analysis/*.analysis.json`
 - `sidecars/*.sidecar.json`
+- optional generated previews under `previews/`
+
+Generate previews plus a real contact-sheet HTML from an analyze output folder with:
+
+```bash
+r3dmatch report-contact-sheet ./out --out ./out/report
+```
+
+This writes:
+
+- `./out/previews/<clip_id>.original.review.jpg`
+- `./out/previews/<clip_id>.exposure.review.jpg`
+- `./out/previews/<clip_id>.color.review.jpg`
+- `./out/previews/<clip_id>.both.review.jpg`
+- `./out/report/contact_sheet.json`
+- `./out/report/preview_contact_sheet.pdf`
+- `./out/report/contact_sheet.html`
+- `./out/report/review_manifest.json`
+
+Preview rendering now uses `REDLine` to render stills with RED IPP2 output settings for review:
+
+- output color space: `Rec709`
+- gamma curve: `BT1886`
+- output tone map: `Medium`
+- highlight roll-off: `Medium`
+
+The four preview variants remain:
+
+- `original`
+- `exposure`
+- `color`
+- `both`
+
+`report-contact-sheet` writes those previews under `previews/` and then builds both `preview_contact_sheet.pdf` and `contact_sheet.html`. The preview PDF is now the preferred review artifact for operators because it does not depend on browser rendering. Set `R3DMATCH_REDLINE_EXECUTABLE` if `REDLine` is not on `PATH`.
+
+## Operator Workflow
+
+1. Run review:
+
+```bash
+r3dmatch review-calibration /path/to/calibration_r3ds --out ./review --target-type gray_sphere --processing-mode both --backend red --roi-x 0.25 --roi-y 0.25 --roi-w 0.5 --roi-h 0.5 --target-strategy median --target-strategy brightest-valid --target-strategy manual --reference-clip-id G007_D060_0324M6_001
+```
+
+This generates:
+
+- analysis outputs
+- `array_calibration.json`
+- temporary review RMDs under `review_rmd/`
+- REDLine review previews under `previews/`
+- `report/contact_sheet.json`
+- `report/contact_sheet.html`
+- `report/preview_contact_sheet.pdf`
+
+Original previews are rendered once as shared references, and each requested target strategy gets its own corrected preview set:
+
+- `<clip_id>.original.review.<run_id>.jpg`
+- `<clip_id>.exposure.review.<strategy>.<run_id>.jpg`
+- `<clip_id>.color.review.<strategy>.<run_id>.jpg`
+- `<clip_id>.both.review.<strategy>.<run_id>.jpg`
+
+For gray-card and gray-sphere review, the preferred path is to provide a shared normalized ROI with `--roi-x/--roi-y/--roi-w/--roi-h`. When present, the calibration solve uses only that ROI for luminance, chromaticity, and confidence measurements. If no ROI is provided, the workflow falls back to the broader center-region measurement path.
+
+Exposure matching in the review workflow is now evaluated primarily in monitoring conditions rather than raw-domain luminance alone. The primary exposure metric is the ROI luminance after a shared monitoring-domain review transform aligned to the REDLine preview assumptions:
+
+- Rec709 output
+- BT1886 gamma
+- Medium tone map
+- Medium highlight roll-off
+
+Raw-domain ROI luminance is still retained in the analysis and report outputs as diagnostics:
+
+- `measured_log2_luminance_monitoring`: primary solve value
+- `measured_log2_luminance_raw`: diagnostic only
+
+This keeps the operator-facing exposure solve closer to the same conditions used to judge the preview PDF and review stills, while preserving raw-domain visibility for engineering/debug work.
+
+`--target-strategy` can be repeated to compare multiple array targets in one review package:
+
+- `median`
+- `brightest-valid`
+- `manual` (requires `--reference-clip-id`)
+
+2. Inspect `report/preview_contact_sheet.pdf` as the primary review artifact, then optionally use `report/contact_sheet.html` or the Streamlit UI for secondary inspection.
+
+3. If the result is not acceptable, rerun or clear disposable review renders safely:
+
+```bash
+r3dmatch clear-preview-cache ./review
+```
+
+This removes only preview/review artifacts such as review JPGs, preview command logs, and contact-sheet review files. It does not remove analysis JSON, calibration JSON, approved `Master_RMD`, or approval PDFs.
+
+4. Approve the reviewed calibration and generate authoritative master outputs:
+
+```bash
+r3dmatch approve-master-rmd ./review --target-strategy manual --reference-clip-id G007_D060_0324M6_001
+```
+
+This generates:
+
+- `approval/Master_RMD/<clip_id>.RMD`
+- `approval/approval_manifest.json`
+- `approval/calibration_report.pdf`
+
+Only the selected review strategy is promoted into `Master_RMD`.
+
+5. Archive `approval/calibration_report.pdf` and the approval manifest with the approved `Master_RMD` folder as the permanent record of the decision.
 
 Launch it from the project root with:
 

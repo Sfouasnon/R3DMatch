@@ -917,7 +917,7 @@ def build_array_calibration_from_analysis(
         raise ValueError("array calibration requires at least one clip result")
     resolved_group_key = group_key or derive_array_group_key(input_path)
     resolved_capture_id = capture_id or Path(input_path).expanduser().resolve().name or resolved_group_key
-    measured_log2 = np.array([float(item.diagnostics["measured_log2_luminance"]) for item in results], dtype=np.float32)
+    measured_log2 = np.array([float(item.diagnostics["measured_log2_luminance_monitoring"]) for item in results], dtype=np.float32)
     measured_chroma = np.array([item.diagnostics["measured_rgb_chromaticity"] for item in results], dtype=np.float32)
     target_log2 = float(np.median(percentile_clip(measured_log2)))
     target_chroma = percentile_clip(measured_chroma[:, 0]), percentile_clip(measured_chroma[:, 1]), percentile_clip(measured_chroma[:, 2])
@@ -927,7 +927,7 @@ def build_array_calibration_from_analysis(
         float(np.median(target_chroma[2])),
     ]
     print(f"[r3dmatch] array calibration clips={len(results)}")
-    print(f"[r3dmatch] shared target exposure log2={target_log2:.6f}")
+    print(f"[r3dmatch] shared target exposure monitoring log2={target_log2:.6f}")
     print(f"[r3dmatch] shared target chromaticity={target_rgb}")
 
     cameras: list[CameraCalibrationEntry] = []
@@ -941,7 +941,7 @@ def build_array_calibration_from_analysis(
         ]
         gain_norm = (raw_gains[0] * raw_gains[1] * raw_gains[2]) ** (1.0 / 3.0)
         normalized_gains = [float(value / max(gain_norm, 1e-6)) for value in raw_gains]
-        exposure_offset = float(target_log2 - item.diagnostics["measured_log2_luminance"])
+        exposure_offset = float(target_log2 - item.diagnostics["measured_log2_luminance_monitoring"])
         color_residual = float(np.linalg.norm(np.array(measured_chromaticity, dtype=np.float32) - np.array(target_rgb, dtype=np.float32)))
         quality_confidence = max(0.0, min(1.0, float(item.confidence) * (1.0 - min(color_residual, 1.0))))
         entry = CameraCalibrationEntry(
@@ -952,7 +952,7 @@ def build_array_calibration_from_analysis(
             measurement=CameraMeasurement(
                 gray_sample_count=int(item.diagnostics.get("sampled_frames", 0)),
                 valid_pixel_count=int(item.diagnostics.get("valid_pixel_count", 0)),
-                measured_log2_luminance=float(item.diagnostics["measured_log2_luminance"]),
+                measured_log2_luminance=float(item.diagnostics["measured_log2_luminance_monitoring"]),
                 measured_rgb_mean=[float(value) for value in measured_rgb],
                 measured_rgb_chromaticity=[float(value) for value in measured_chromaticity],
                 saturation_fraction=float(item.diagnostics.get("saturation_fraction", 0.0)),

@@ -9,17 +9,31 @@ from typer.testing import CliRunner
 from r3dmatch.calibration import build_array_calibration_from_analysis, calibrate_card_path, calibrate_color_path, calibrate_exposure_path, calibrate_sphere_path, center_crop_roi, derive_array_group_key, detect_gray_card_roi, load_calibration, load_card_roi_file, load_color_calibration, load_exposure_calibration, measure_card_from_roi, measure_color_region, measure_sphere_from_roi, solve_neutral_gains
 from r3dmatch.cli import app
 from r3dmatch.identity import group_key_from_clip_id, rmd_name_for_clip_id
-from r3dmatch.matching import analyze_path, camera_group_from_clip_id, discover_clips
+from r3dmatch.matching import analyze_path, camera_group_from_clip_id, discover_clips, measure_frame_color_and_exposure
 from r3dmatch.models import GrayCardROI, SamplingRegion, SphereROI
-from r3dmatch.report import build_contact_sheet_report
+from r3dmatch.report import _build_strategy_payloads, build_contact_sheet_report, preview_filename_for_clip_id
 from r3dmatch.rmd import render_rmd_xml, rmd_filename_for_clip_id, write_rmds_from_analysis
 from r3dmatch.ui import build_table_rows, load_review_bundle
 from r3dmatch.sdk import MockR3DBackend, RedSdkDecoder, resolve_backend
 from r3dmatch.sidecar import build_sidecar_payload, sidecar_filename_for_clip_id
 from r3dmatch.transcode import build_redline_command, build_redline_command_variants, write_transcode_plan
 from r3dmatch.validation import validate_pipeline
+from r3dmatch.workflow import approve_master_rmd, clear_preview_cache, review_calibration
 
 runner = CliRunner()
+
+
+def _install_fake_redline(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(command, capture_output, text, check):  # type: ignore[no-untyped-def]
+        from PIL import Image
+
+        output_path = Path(command[command.index("--o") + 1])
+        generated_path = output_path.with_name(f"{output_path.name}.000000.jpg")
+        generated_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (32, 18), (128, 128, 128)).save(generated_path, format="JPEG")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("r3dmatch.report.subprocess.run", fake_run)
 
 
 def test_backend_selection_defaults_to_mock() -> None:
@@ -119,6 +133,85 @@ def test_exact_sidecar_naming_from_clip_id() -> None:
 
 def test_exact_rmd_naming_from_clip_id() -> None:
     assert rmd_filename_for_clip_id("G007_D060_0324M6_001") == "G007_D060_0324M6_001.RMD"
+
+
+def test_preview_path_generation_from_clip_id() -> None:
+    assert preview_filename_for_clip_id("G007_D060_0324M6_001", "both") == "G007_D060_0324M6_001.both.review.jpg"
+    assert (
+        preview_filename_for_clip_id("G007_D060_0324M6_001", "both", strategy="median", run_id="batch01")
+        == "G007_D060_0324M6_001.both.review.median.batch01.jpg"
+    )
+
+
+def test_measurement_uses_shared_roi_only() -> None:
+    image = np.full((3, 20, 20), 0.8, dtype=np.float32)
+    image[:, 8:12, 8:12] = 0.18
+    full_measurement = measure_frame_color_and_exposure(image, mode="scene", lut=None, calibration_roi=None)
+    roi_measurement = measure_frame_color_and_exposure(
+        image,
+        mode="scene",
+        lut=None,
+        calibration_roi={"x": 0.4, "y": 0.4, "w": 0.2, "h": 0.2},
+    )
+    assert full_measurement["measured_log2_luminance"] != pytest.approx(roi_measurement["measured_log2_luminance"])
+    assert roi_measurement["measured_log2_luminance"] == roi_measurement["measured_log2_luminance_monitoring"]
+    assert roi_measurement["measured_log2_luminance_raw"] == pytest.approx(np.log2(0.18), abs=0.2)
+    assert roi_measurement["measured_log2_luminance_monitoring"] != pytest.approx(roi_measurement["measured_log2_luminance_raw"])
+
+
+def test_monitoring_domain_measurement_is_primary_and_raw_is_preserved() -> None:
+    image = np.full((3, 20, 20), 0.18, dtype=np.float32)
+    measurement = measure_frame_color_and_exposure(
+        image,
+        mode="scene",
+        lut=None,
+        calibration_roi={"x": 0.25, "y": 0.25, "w": 0.5, "h": 0.5},
+    )
+    assert measurement["measured_log2_luminance"] == measurement["measured_log2_luminance_monitoring"]
+    assert "measured_log2_luminance_raw" in measurement
+    assert measurement["measured_log2_luminance_raw"] != measurement["measured_log2_luminance_monitoring"]
+
+
+def test_target_strategies_use_monitoring_domain_values() -> None:
+    records = [
+        {
+            "clip_id": "G007_B057_0324YT_001",
+            "group_key": "array_batch",
+            "source_path": "/tmp/G007_B057_0324YT_001.R3D",
+            "confidence": 0.9,
+            "flags": [],
+            "diagnostics": {
+                "measured_log2_luminance": -1.0,
+                "measured_log2_luminance_monitoring": -3.0,
+                "measured_log2_luminance_raw": -1.0,
+                "measured_rgb_chromaticity": [0.34, 0.33, 0.33],
+                "calibration_roi": {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+                "calibration_measurement_mode": "shared_roi",
+                "exposure_measurement_domain": "monitoring",
+            },
+        },
+        {
+            "clip_id": "G007_C057_0324YT_001",
+            "group_key": "array_batch",
+            "source_path": "/tmp/G007_C057_0324YT_001.R3D",
+            "confidence": 0.9,
+            "flags": [],
+            "diagnostics": {
+                "measured_log2_luminance": -2.0,
+                "measured_log2_luminance_monitoring": -1.5,
+                "measured_log2_luminance_raw": -2.0,
+                "measured_rgb_chromaticity": [0.33, 0.33, 0.34],
+                "calibration_roi": {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+                "calibration_measurement_mode": "shared_roi",
+                "exposure_measurement_domain": "monitoring",
+            },
+        },
+    ]
+    strategies = _build_strategy_payloads(records, target_strategies=["brightest-valid", "manual"], reference_clip_id="G007_B057_0324YT_001")
+    assert strategies[0]["reference_clip_id"] == "G007_C057_0324YT_001"
+    assert strategies[0]["target_log2_luminance"] == pytest.approx(-1.5)
+    assert strategies[1]["reference_clip_id"] == "G007_B057_0324YT_001"
+    assert strategies[1]["target_log2_luminance"] == pytest.approx(-3.0)
 
 
 def test_analyze_path_writes_manifest_and_sidecar(tmp_path: Path) -> None:
@@ -750,7 +843,8 @@ def test_cli_write_rmd(tmp_path: Path) -> None:
     assert (analysis_dir / "rmd" / "G007_D060_0324M6_001.RMD").exists()
 
 
-def test_cli_validate_pipeline_and_report(tmp_path: Path) -> None:
+def test_cli_validate_pipeline_and_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
     clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
     clip_path.write_bytes(b"")
     analysis_dir = tmp_path / "analysis"
@@ -759,6 +853,54 @@ def test_cli_validate_pipeline_and_report(tmp_path: Path) -> None:
     report_result = runner.invoke(app, ["report-contact-sheet", str(analysis_dir), "--out", str(tmp_path / "report")])
     assert validate_result.exit_code == 0
     assert report_result.exit_code == 0
+
+
+def test_cli_review_and_approve_workflow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
+    clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
+    clip_path.write_bytes(b"")
+    review_dir = tmp_path / "review"
+    review_result = runner.invoke(
+        app,
+        [
+            "review-calibration",
+            str(clip_path),
+            "--out",
+            str(review_dir),
+            "--target-type",
+            "gray_sphere",
+            "--processing-mode",
+            "both",
+            "--backend",
+            "mock",
+            "--roi-x",
+            "0.25",
+            "--roi-y",
+            "0.25",
+            "--roi-w",
+            "0.5",
+            "--roi-h",
+            "0.5",
+            "--target-strategy",
+            "median",
+            "--target-strategy",
+            "brightest-valid",
+        ],
+    )
+    assert review_result.exit_code == 0
+    assert (review_dir / "report" / "contact_sheet.html").exists()
+    assert (review_dir / "report" / "preview_contact_sheet.pdf").exists()
+    assert (review_dir / "review_rmd" / "G007_D060_0324M6_001.RMD").exists()
+    review_manifest = json.loads((review_dir / "report" / "review_manifest.json").read_text(encoding="utf-8"))
+    assert review_manifest["calibration_roi"] == {"x": 0.25, "y": 0.25, "w": 0.5, "h": 0.5}
+    assert review_manifest["target_strategies"] == ["median", "brightest_valid"]
+    approve_result = runner.invoke(app, ["approve-master-rmd", str(review_dir), "--target-strategy", "brightest-valid"])
+    assert approve_result.exit_code == 0
+    assert (review_dir / "approval" / "Master_RMD" / "G007_D060_0324M6_001.RMD").exists()
+    assert (review_dir / "approval" / "approval_manifest.json").exists()
+    assert (review_dir / "approval" / "calibration_report.pdf").exists()
+    approval_manifest = json.loads((review_dir / "approval" / "approval_manifest.json").read_text(encoding="utf-8"))
+    assert approval_manifest["selected_target_strategy"] == "brightest_valid"
 
 
 def test_build_redline_command_includes_sidecar(tmp_path: Path) -> None:
@@ -819,6 +961,60 @@ def test_transcode_plan_with_generated_rmds(tmp_path: Path) -> None:
     assert any(variant["uses_rmd"] for variant in clip_payload["variants"] if variant["variant"] != "original")
 
 
+def test_transcode_execute_prints_progress_bar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
+    clip_path.write_bytes(b"")
+
+    def fake_run(command, capture_output, text, check):  # type: ignore[no-untyped-def]
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("r3dmatch.transcode.subprocess.run", fake_run)
+    monotonic_values = iter([100.0, 142.0])
+    monkeypatch.setattr("r3dmatch.transcode.time.monotonic", lambda: next(monotonic_values))
+    payload = write_transcode_plan(
+        str(clip_path),
+        out_dir=str(tmp_path / "transcode"),
+        analysis_dir=None,
+        use_generated_sidecar=False,
+        use_generated_rmd=False,
+        redline_executable="REDLine",
+        output_ext="mov",
+        execute=True,
+    )
+    captured = capsys.readouterr()
+    assert payload["clips"][0]["variants"][0]["executed"] is True
+    assert "[transcode]" in captured.err
+    assert "1/1" in captured.err
+    assert "00:42 elapsed" in captured.err
+    assert "ETA 00:00" in captured.err
+    assert "G007_D060_0324M6_001 [orig]" in captured.err
+
+
+def test_transcode_execute_prints_failure_message(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
+    clip_path.write_bytes(b"")
+
+    def fake_run(command, capture_output, text, check):  # type: ignore[no-untyped-def]
+        return types.SimpleNamespace(returncode=7, stdout="", stderr="boom")
+
+    monkeypatch.setattr("r3dmatch.transcode.subprocess.run", fake_run)
+    monotonic_values = iter([100.0, 112.0])
+    monkeypatch.setattr("r3dmatch.transcode.time.monotonic", lambda: next(monotonic_values))
+    payload = write_transcode_plan(
+        str(clip_path),
+        out_dir=str(tmp_path / "transcode"),
+        analysis_dir=None,
+        use_generated_sidecar=False,
+        use_generated_rmd=False,
+        redline_executable="REDLine",
+        output_ext="mov",
+        execute=True,
+    )
+    captured = capsys.readouterr()
+    assert payload["clips"][0]["variants"][0]["returncode"] == 7
+    assert "FAILED G007_D060_0324M6_001 [orig] (returncode=7)" in captured.err
+
+
 def test_transcode_requires_analysis_dir_for_generated_sidecars(tmp_path: Path) -> None:
     clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
     clip_path.write_bytes(b"")
@@ -852,21 +1048,160 @@ def test_validate_pipeline_behavior(tmp_path: Path) -> None:
     assert all(record["command_uses_exact_rmd"] for record in payload["clips"][0]["redline_variant_records"] if record["uses_rmd"])
 
 
-def test_report_contact_sheet_scaffold(tmp_path: Path) -> None:
+def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
+    clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
+    clip_path.write_bytes(b"")
+    analyze_path(
+        str(tmp_path),
+        out_dir=str(tmp_path / "analysis-out"),
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+        calibration_roi={"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+    )
+    payload = build_contact_sheet_report(
+        str(tmp_path / "analysis-out"),
+        out_dir=str(tmp_path / "report"),
+        target_type="gray_sphere",
+        processing_mode="both",
+        target_strategies=["median", "brightest-valid"],
+    )
+    assert Path(payload["report_json"]).exists()
+    assert Path(payload["report_html"]).exists()
+    assert Path(payload["preview_report_pdf"]).exists()
+    assert Path(payload["previews_dir"]).exists()
+    report_json = json.loads(Path(payload["report_json"]).read_text(encoding="utf-8"))
+    assert report_json["clips"][0]["clip_id"] == "G007_D060_0324M6_001"
+    assert report_json["target_type"] == "gray_sphere"
+    assert report_json["preview_transform"]
+    assert report_json["exposure_measurement_domain"] == "monitoring"
+    assert report_json["calibration_roi"] == {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4}
+    assert report_json["target_strategies"] == ["median", "brightest_valid"]
+    assert report_json["shared_originals"][0]["original_frame"].endswith("G007_D060_0324M6_001.original.review.analysis-out.jpg")
+    assert report_json["strategies"][0]["clips"][0]["both_corrected"].endswith("G007_D060_0324M6_001.both.review.median.analysis-out.jpg")
+    assert "measured_log2_luminance_monitoring" in report_json["strategies"][0]["clips"][0]["metrics"]["exposure"]
+    assert "measured_log2_luminance_raw" in report_json["strategies"][0]["clips"][0]["metrics"]["exposure"]
+    assert Path(report_json["clips"][0]["original_frame"]).exists()
+    assert not list((tmp_path / "analysis-out" / "previews").glob("*.000000.jpg"))
+    html = Path(payload["report_html"]).read_text(encoding="utf-8")
+    assert "G007_D060_0324M6_001" in html
+    assert "../previews/G007_D060_0324M6_001.original.review.analysis-out.jpg" in html
+    assert "both.review.median.analysis-out.jpg" in html
+
+
+def test_multi_strategy_review_includes_manual_reference_and_shared_originals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
+    clip_a = tmp_path / "G007_B057_0324YT_001.R3D"
+    clip_b = tmp_path / "G007_C057_0324YT_001.R3D"
+    clip_a.write_bytes(b"")
+    clip_b.write_bytes(b"")
+    analyze_path(
+        str(tmp_path),
+        out_dir=str(tmp_path / "analysis-out"),
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+        calibration_roi={"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+    )
+    payload = build_contact_sheet_report(
+        str(tmp_path / "analysis-out"),
+        out_dir=str(tmp_path / "report"),
+        target_type="gray_sphere",
+        processing_mode="both",
+        target_strategies=["median", "manual"],
+        reference_clip_id="G007_B057_0324YT_001",
+    )
+    report_json = json.loads(Path(payload["report_json"]).read_text(encoding="utf-8"))
+    assert len(report_json["shared_originals"]) == 2
+    assert [item["strategy_key"] for item in report_json["strategies"]] == ["median", "manual"]
+    manual_strategy = report_json["strategies"][1]
+    assert manual_strategy["reference_clip_id"] == "G007_B057_0324YT_001"
+    assert manual_strategy["clips"][0]["preview_variants"]["both"].endswith(".both.review.manual.analysis-out.jpg")
+    assert report_json["shared_originals"][0]["original_frame"].endswith(".original.review.analysis-out.jpg")
+
+
+def test_approve_master_rmd_uses_selected_manual_strategy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
+    clip_a = tmp_path / "G007_B057_0324YT_001.R3D"
+    clip_b = tmp_path / "G007_C057_0324YT_001.R3D"
+    clip_a.write_bytes(b"")
+    clip_b.write_bytes(b"")
+    review_dir = tmp_path / "review"
+    review_calibration(
+        str(tmp_path),
+        out_dir=str(review_dir),
+        target_type="gray_sphere",
+        processing_mode="both",
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        exposure_calibration_path=None,
+        color_calibration_path=None,
+        calibration_mode=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+        calibration_roi={"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+        target_strategies=["median", "manual"],
+        reference_clip_id="G007_B057_0324YT_001",
+    )
+    payload = approve_master_rmd(str(review_dir), target_strategy="manual", reference_clip_id="G007_B057_0324YT_001")
+    manifest = json.loads(Path(payload["approval_manifest"]).read_text(encoding="utf-8"))
+    assert manifest["selected_target_strategy"] == "manual"
+    assert manifest["selected_reference_clip_id"] == "G007_B057_0324YT_001"
+    assert (Path(payload["master_rmd_dir"]) / "G007_B057_0324YT_001.RMD").exists()
+
+
+def test_clear_preview_cache_only_removes_review_artifacts(tmp_path: Path) -> None:
+    analysis_root = tmp_path / "analysis-out"
+    previews = analysis_root / "previews"
+    report_dir = analysis_root / "report"
+    approval_dir = analysis_root / "approval"
+    previews.mkdir(parents=True)
+    report_dir.mkdir(parents=True)
+    approval_dir.mkdir(parents=True)
+    (analysis_root / "summary.json").write_text("{}", encoding="utf-8")
+    (analysis_root / "array_calibration.json").write_text("{}", encoding="utf-8")
+    (previews / "G007_D060_0324M6_001.original.review.jpg").write_text("x", encoding="utf-8")
+    (previews / "preview_commands.json").write_text("{}", encoding="utf-8")
+    (report_dir / "contact_sheet.json").write_text("{}", encoding="utf-8")
+    (report_dir / "contact_sheet.html").write_text("{}", encoding="utf-8")
+    (approval_dir / "calibration_report.pdf").write_text("pdf", encoding="utf-8")
+    (approval_dir / "Master_RMD").mkdir()
+    payload = clear_preview_cache(str(analysis_root))
+    assert payload["removed_count"] >= 3
+    assert not (previews / "G007_D060_0324M6_001.original.review.jpg").exists()
+    assert not (report_dir / "contact_sheet.html").exists()
+    assert (analysis_root / "summary.json").exists()
+    assert (analysis_root / "array_calibration.json").exists()
+    assert (approval_dir / "calibration_report.pdf").exists()
+    assert (approval_dir / "Master_RMD").exists()
+
+
+def test_approve_master_rmd_creates_manifest_pdf_and_exact_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
     clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
     clip_path.write_bytes(b"")
     analyze_path(str(tmp_path), out_dir=str(tmp_path / "analysis-out"), mode="scene", backend="mock", lut_override=None, calibration_path=None, sample_count=4, sampling_strategy="uniform")
-    payload = build_contact_sheet_report(str(tmp_path / "analysis-out"), out_dir=str(tmp_path / "report"))
-    assert Path(payload["report_json"]).exists()
-    assert Path(payload["report_html"]).exists()
-    report_json = json.loads(Path(payload["report_json"]).read_text(encoding="utf-8"))
-    assert report_json["clips"][0]["clip_id"] == "G007_D060_0324M6_001"
+    build_contact_sheet_report(str(tmp_path / "analysis-out"), out_dir=str(tmp_path / "analysis-out" / "report"), target_type="gray_card", processing_mode="both")
+    payload = approve_master_rmd(str(tmp_path / "analysis-out"))
+    assert Path(payload["approval_manifest"]).exists()
+    assert Path(payload["calibration_report_pdf"]).exists()
+    assert (Path(payload["master_rmd_dir"]) / "G007_D060_0324M6_001.RMD").exists()
 
 
 def test_load_review_bundle_for_ui(tmp_path: Path) -> None:
     out_dir = tmp_path / "out"
     (out_dir / "analysis").mkdir(parents=True)
     (out_dir / "sidecars").mkdir(parents=True)
+    (out_dir / "previews").mkdir(parents=True)
     (out_dir / "summary.json").write_text(json.dumps({"clip_count": 1}), encoding="utf-8")
     (out_dir / "array_calibration.json").write_text(
         json.dumps(
@@ -906,7 +1241,11 @@ def test_load_review_bundle_for_ui(tmp_path: Path) -> None:
         json.dumps({"clip_id": "G007_D060_0324M6_001"}),
         encoding="utf-8",
     )
+    (out_dir / "previews" / "G007_D060_0324M6_001.original.review.jpg").write_bytes(b"jpg")
+    (out_dir / "previews" / "G007_D060_0324M6_001.both.review.jpg").write_bytes(b"jpg")
     bundle = load_review_bundle(str(out_dir))
     rows = build_table_rows(bundle["rows"])
     assert bundle["summary_text"]["clip_count"] == 1
     assert rows[0]["clip_id"] == "G007_D060_0324M6_001"
+    assert bundle["rows"][0]["preview_variants"]["original"].endswith("G007_D060_0324M6_001.original.review.jpg")
+    assert bundle["rows"][0]["preview_path"].endswith("G007_D060_0324M6_001.both.review.jpg")

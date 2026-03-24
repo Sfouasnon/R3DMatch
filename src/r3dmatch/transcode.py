@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import shlex
 import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -10,6 +12,59 @@ from .identity import clip_id_from_path, rmd_name_for_clip_id
 from .matching import discover_clips
 from .rmd import rmd_filename_for_clip_id, write_rmds_from_analysis
 from .sidecar import sidecar_filename_for_clip_id
+
+
+def _format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(seconds)))
+    minutes, remaining = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{remaining:02d}"
+    return f"{minutes:02d}:{remaining:02d}"
+
+
+def _short_variant_label(variant: str) -> str:
+    return {
+        "exposure": "exp",
+        "color": "col",
+        "both": "both",
+        "original": "orig",
+    }.get(variant, variant)
+
+
+def _print_transcode_progress(
+    current: int,
+    total: int,
+    *,
+    clip_id: str,
+    variant: str,
+    start_time: float,
+) -> None:
+    if total <= 0:
+        return
+    width = 24
+    filled = int(width * current / total)
+    bar = "#" * filled + "-" * (width - filled)
+    elapsed = max(0.0, time.monotonic() - start_time)
+    average = elapsed / current if current else 0.0
+    remaining = average * max(total - current, 0)
+    sys.stderr.write(
+        "\r"
+        f"[transcode] [{bar}] {current}/{total} | {_format_duration(elapsed)} elapsed | "
+        f"ETA {_format_duration(remaining)} | {clip_id} [{_short_variant_label(variant)}]"
+    )
+    if current >= total:
+        sys.stderr.write("\n")
+    sys.stderr.flush()
+
+
+def _print_transcode_failure(*, clip_id: str, variant: str, returncode: Optional[int]) -> None:
+    sys.stderr.write(
+        "\r"
+        f"[transcode] FAILED {clip_id} [{_short_variant_label(variant)}] "
+        f"(returncode={returncode})\n"
+    )
+    sys.stderr.flush()
 
 
 def load_sidecar(path: str) -> Dict[str, object]:
@@ -160,6 +215,32 @@ def write_transcode_plan(
     rmd_manifest = write_rmds_from_analysis(str(resolved_analysis_dir)) if use_generated_rmd and resolved_analysis_dir else None
     manifests = []
     shell_lines = ["#!/bin/sh", "set -eu", ""]
+    start_time = time.monotonic()
+    total_variants = 0
+    if execute:
+        for clip in clips:
+            clip_id = clip_id_from_path(str(clip))
+            sidecar_payload = None
+            if use_generated_sidecar or use_generated_rmd:
+                if resolved_analysis_dir is None:
+                    flag = "--use-generated-rmd" if use_generated_rmd else "--use-generated-sidecar"
+                    raise ValueError(f"{flag} requires --analysis-dir")
+                candidate = resolved_analysis_dir / "sidecars" / sidecar_filename_for_clip_id(clip_id)
+                if not candidate.exists():
+                    raise FileNotFoundError(f"Missing generated sidecar: {candidate}")
+                sidecar_payload = load_sidecar(str(candidate))
+            total_variants += len(
+                build_redline_command_variants(
+                    str(clip),
+                    render_dir=str(renders_dir),
+                    sidecar_path="placeholder.sidecar.json" if use_generated_sidecar and not use_generated_rmd else None,
+                    rmd_path="placeholder.RMD" if use_generated_rmd else None,
+                    redline_executable=redline_executable,
+                    output_ext=output_ext,
+                    sidecar_payload=sidecar_payload,
+                )
+            )
+    executed_variants = 0
     for clip in clips:
         clip_id = clip_id_from_path(str(clip))
         sidecar_path = None
@@ -218,10 +299,24 @@ def write_transcode_plan(
             }
             if execute:
                 completed = subprocess.run(variant["command"], capture_output=True, text=True, check=False)
+                executed_variants += 1
                 variant_record["executed"] = True
                 variant_record["returncode"] = completed.returncode
                 variant_record["stdout"] = completed.stdout
                 variant_record["stderr"] = completed.stderr
+                _print_transcode_progress(
+                    executed_variants,
+                    total_variants,
+                    clip_id=clip_id,
+                    variant=str(variant["variant"]),
+                    start_time=start_time,
+                )
+                if completed.returncode not in (0, None):
+                    _print_transcode_failure(
+                        clip_id=clip_id,
+                        variant=str(variant["variant"]),
+                        returncode=completed.returncode,
+                    )
             record["variants"].append(variant_record)
             shell_lines.append(shlex.join(variant["command"]))
             (commands_dir / f"{clip_id}.{variant['variant']}.command.sh").write_text(shlex.join(variant["command"]) + "\n", encoding="utf-8")

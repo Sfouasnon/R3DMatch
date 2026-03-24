@@ -53,7 +53,8 @@ def load_review_bundle(output_dir: str) -> Dict[str, object]:
                     "exposure_residual_stops": quality.get("exposure_residual_stops"),
                     "source_path": camera.get("source_path"),
                     "sidecar_path": str(root / "sidecars" / f"{clip_id}.sidecar.json") if clip_id in sidecars else None,
-                    "preview_path": _find_preview_path(root, clip_id),
+                    "preview_path": _find_preview_path(root, clip_id, "both") or _find_preview_path(root, clip_id, "original"),
+                    "preview_variants": _find_preview_variants(root, clip_id),
                     "sidecar_loaded": bool(sidecar),
                 }
             )
@@ -74,7 +75,8 @@ def load_review_bundle(output_dir: str) -> Dict[str, object]:
                     "exposure_residual_stops": None,
                     "source_path": record.get("source_path"),
                     "sidecar_path": str(root / "sidecars" / f"{clip_id}.sidecar.json") if clip_id in sidecars else None,
-                    "preview_path": _find_preview_path(root, clip_id),
+                    "preview_path": _find_preview_path(root, clip_id, "both") or _find_preview_path(root, clip_id, "original"),
+                    "preview_variants": _find_preview_variants(root, clip_id),
                     "sidecar_loaded": clip_id in sidecars,
                 }
             )
@@ -99,16 +101,34 @@ def load_review_bundle(output_dir: str) -> Dict[str, object]:
     }
 
 
-def _find_preview_path(root: Path, clip_id: str) -> Optional[str]:
-    for candidate in (
+def _find_preview_path(root: Path, clip_id: str, variant: str) -> Optional[str]:
+    candidates = [
+        *sorted((root / "previews").glob(f"{clip_id}.{variant}.review*.jpg")),
+        *sorted((root / "previews").glob(f"{clip_id}.{variant}.review*.png")),
+        *sorted((root / "stills").glob(f"{clip_id}.{variant}.review*.jpg")),
+        *sorted((root / "stills").glob(f"{clip_id}.{variant}.review*.png")),
+        root / "previews" / f"{clip_id}.{variant}.jpg",
+        root / "previews" / f"{clip_id}.{variant}.png",
+        root / "stills" / f"{clip_id}.{variant}.jpg",
+        root / "stills" / f"{clip_id}.{variant}.png",
         root / "previews" / f"{clip_id}.jpg",
         root / "previews" / f"{clip_id}.png",
         root / "stills" / f"{clip_id}.jpg",
         root / "stills" / f"{clip_id}.png",
-    ):
+    ]
+    for candidate in candidates:
         if candidate.exists():
             return str(candidate)
     return None
+
+
+def _find_preview_variants(root: Path, clip_id: str) -> Dict[str, str]:
+    variants: Dict[str, str] = {}
+    for variant in ("original", "exposure", "color", "both"):
+        path = _find_preview_path(root, clip_id, variant)
+        if path:
+            variants[variant] = path
+    return variants
 
 
 def _exposure_outlier_threshold(rows: List[Dict[str, object]]) -> float:
@@ -216,7 +236,14 @@ def render_review_app(output_dir: str) -> None:
         st.subheader("Preview Stills")
         for row in preview_rows:
             st.markdown(f"**{row['clip_id']}**")
-            st.image(row["preview_path"], caption=row["clip_id"])
+            variants = row.get("preview_variants", {})
+            columns = st.columns(2)
+            if variants.get("original"):
+                columns[0].image(variants["original"], caption=f"{row['clip_id']} original")
+            if variants.get("both"):
+                columns[1].image(variants["both"], caption=f"{row['clip_id']} both")
+            elif row["preview_path"]:
+                st.image(row["preview_path"], caption=row["clip_id"])
 
 
 def _parse_args() -> argparse.Namespace:

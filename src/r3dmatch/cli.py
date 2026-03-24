@@ -10,6 +10,7 @@ from .report import build_contact_sheet_report
 from .rmd import write_rmds_from_analysis
 from .transcode import write_transcode_plan
 from .validation import validate_pipeline
+from .workflow import approve_master_rmd, clear_preview_cache, review_calibration
 
 app = typer.Typer(no_args_is_help=True, help="R3DMatch CLI")
 
@@ -198,13 +199,90 @@ def report_contact_sheet_command(
     out: str = typer.Option(..., "--out", help="Report output directory"),
     exposure_calibration: Optional[str] = typer.Option(None, "--exposure-calibration", help="Optional exposure calibration JSON"),
     color_calibration: Optional[str] = typer.Option(None, "--color-calibration", help="Optional color calibration JSON"),
+    target_type: Optional[str] = typer.Option(None, "--target-type", help="Optional target type: gray_card, gray_sphere, or color_chart"),
+    processing_mode: Optional[str] = typer.Option(None, "--processing-mode", help="Optional processing mode: exposure, color, or both"),
 ) -> None:
     payload = build_contact_sheet_report(
         input_path,
         out_dir=out,
         exposure_calibration_path=exposure_calibration,
         color_calibration_path=color_calibration,
+        target_type=target_type,
+        processing_mode=processing_mode,
     )
+    typer.echo(str(payload))
+
+
+@app.command("review-calibration")
+def review_calibration_command(
+    input_path: str,
+    out: str = typer.Option(..., "--out", help="Review output directory"),
+    target_type: str = typer.Option(..., "--target-type", help="Target type: gray_card, gray_sphere, or color_chart"),
+    processing_mode: str = typer.Option("both", "--processing-mode", help="Processing mode: exposure, color, or both"),
+    mode: str = typer.Option("scene", "--mode", help="Matching mode: scene or view"),
+    lut: Optional[str] = typer.Option(None, "--lut", help="Optional LUT override (.cube)"),
+    calibration: Optional[str] = typer.Option(None, "--calibration", help="Optional legacy/single exposure calibration JSON"),
+    exposure_calibration: Optional[str] = typer.Option(None, "--exposure-calibration", help="Optional exposure calibration JSON"),
+    color_calibration: Optional[str] = typer.Option(None, "--color-calibration", help="Optional color calibration JSON"),
+    calibration_mode: Optional[str] = typer.Option(None, "--calibration-mode", help="Optional calibration mode, e.g. array-gray-sphere"),
+    backend: str = typer.Option("mock", "--backend", help="Backend: mock or red"),
+    sample_count: int = typer.Option(8, "--sample-count", help="Number of sampled frames per clip"),
+    sampling_strategy: str = typer.Option("uniform", "--sampling-strategy", help="Sampling strategy: uniform or head"),
+    roi_x: Optional[float] = typer.Option(None, "--roi-x", help="Shared normalized ROI X origin"),
+    roi_y: Optional[float] = typer.Option(None, "--roi-y", help="Shared normalized ROI Y origin"),
+    roi_w: Optional[float] = typer.Option(None, "--roi-w", help="Shared normalized ROI width"),
+    roi_h: Optional[float] = typer.Option(None, "--roi-h", help="Shared normalized ROI height"),
+    target_strategy: list[str] = typer.Option(["median"], "--target-strategy", help="Target strategy: median, brightest-valid, or manual; repeat to compare multiple"),
+    reference_clip_id: Optional[str] = typer.Option(None, "--reference-clip-id", help="Reference clip ID for manual target strategy"),
+) -> None:
+    calibration_roi = None
+    roi_values = [roi_x, roi_y, roi_w, roi_h]
+    if any(value is not None for value in roi_values):
+        if not all(value is not None for value in roi_values):
+            raise typer.BadParameter("roi-x, roi-y, roi-w, and roi-h must be provided together")
+        if not all(0.0 <= float(value) <= 1.0 for value in roi_values):
+            raise typer.BadParameter("ROI values must be normalized between 0.0 and 1.0")
+        if float(roi_x) + float(roi_w) > 1.0 or float(roi_y) + float(roi_h) > 1.0:
+            raise typer.BadParameter("Normalized ROI must remain inside the image bounds")
+        calibration_roi = {"x": float(roi_x), "y": float(roi_y), "w": float(roi_w), "h": float(roi_h)}
+    payload = review_calibration(
+        input_path,
+        out_dir=out,
+        target_type=target_type,
+        processing_mode=processing_mode,
+        mode=mode,
+        backend=backend,
+        lut_override=lut,
+        calibration_path=calibration,
+        exposure_calibration_path=exposure_calibration,
+        color_calibration_path=color_calibration,
+        calibration_mode=calibration_mode,
+        sample_count=sample_count,
+        sampling_strategy=sampling_strategy,
+        calibration_roi=calibration_roi,
+        target_strategies=target_strategy,
+        reference_clip_id=reference_clip_id,
+    )
+    typer.echo(str(payload))
+
+
+@app.command("approve-master-rmd")
+def approve_master_rmd_command(
+    analysis_dir: str,
+    out: Optional[str] = typer.Option(None, "--out", help="Approval output directory; defaults to <analysis_dir>/approval"),
+    target_strategy: str = typer.Option("median", "--target-strategy", help="Chosen target strategy: median, brightest-valid, or manual"),
+    reference_clip_id: Optional[str] = typer.Option(None, "--reference-clip-id", help="Reference clip ID for manual target strategy"),
+) -> None:
+    payload = approve_master_rmd(analysis_dir, out_dir=out, target_strategy=target_strategy, reference_clip_id=reference_clip_id)
+    typer.echo(str(payload))
+
+
+@app.command("clear-preview-cache")
+def clear_preview_cache_command(
+    input_path: str,
+    report_dir: Optional[str] = typer.Option(None, "--report-dir", help="Optional report directory; defaults to <input_path>/report"),
+) -> None:
+    payload = clear_preview_cache(input_path, report_dir=report_dir)
     typer.echo(str(payload))
 
 
