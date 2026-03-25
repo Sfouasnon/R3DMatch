@@ -350,6 +350,90 @@ py::array_t<float> decode_frame(
 #endif
 }
 
+py::dict create_rmd_from_settings(
+    const std::string &path,
+    float exposure_adjust,
+    const std::vector<float> &cdl_slope,
+    const std::vector<float> &cdl_offset,
+    const std::vector<float> &cdl_power,
+    float cdl_saturation,
+    bool cdl_enabled,
+    int output_tonemap,
+    int highlight_rolloff,
+    int color_space,
+    int gamma_curve,
+    int image_pipeline_mode
+) {
+#ifndef R3DMATCH_RED_SDK_ENABLED
+    throw std::runtime_error(unavailable_message());
+#else
+    auto require_triplet = [](const std::vector<float> &values, const char *label) {
+        if (values.size() != 3U) {
+            throw std::runtime_error(std::string(label) + " must contain exactly 3 values.");
+        }
+    };
+    require_triplet(cdl_slope, "cdl_slope");
+    require_triplet(cdl_offset, "cdl_offset");
+    require_triplet(cdl_power, "cdl_power");
+
+    ScopedSdkSession sdk_session;
+    Clip clip(path.c_str());
+    require_clip_loaded(clip, path);
+
+    ImageProcessingSettings settings;
+    clip.GetClipImageProcessingSettings(settings);
+    settings.Version = ColorVersion3;
+    settings.ImagePipelineMode = static_cast<ImagePipeline>(image_pipeline_mode);
+    settings.ExposureAdjust = exposure_adjust;
+    settings.CdlEnabled = cdl_enabled;
+    settings.CdlSaturation = cdl_saturation;
+    settings.CdlRed.Slope = cdl_slope[0];
+    settings.CdlRed.Offset = cdl_offset[0];
+    settings.CdlRed.Power = cdl_power[0];
+    settings.CdlGreen.Slope = cdl_slope[1];
+    settings.CdlGreen.Offset = cdl_offset[1];
+    settings.CdlGreen.Power = cdl_power[1];
+    settings.CdlBlue.Slope = cdl_slope[2];
+    settings.CdlBlue.Offset = cdl_offset[2];
+    settings.CdlBlue.Power = cdl_power[2];
+    settings.OutputToneMap = static_cast<ToneMap>(output_tonemap);
+    settings.HighlightRollOff = static_cast<RollOff>(highlight_rolloff);
+    settings.ColorSpace = static_cast<ImageColorSpace>(color_space);
+    settings.GammaCurve = static_cast<ImageGammaCurve>(gamma_curve);
+    settings.CheckBounds();
+
+    const bool success = clip.CreateOrUpdateRmd(settings);
+    if (!success) {
+        throw std::runtime_error("CreateOrUpdateRmd(settings) returned false for clip: " + path);
+    }
+    std::string xmp;
+    const bool has_xmp = clip.GetRmdXmp(xmp);
+
+    py::dict payload;
+    payload["success"] = py::bool_(success);
+    payload["clip_path"] = py::str(path);
+    payload["rmd_path"] = py::str(clip.GetRmdPath() ? clip.GetRmdPath() : "");
+    payload["has_xmp"] = py::bool_(has_xmp);
+    if (has_xmp) {
+        payload["rmd_xmp"] = py::str(xmp);
+    } else {
+        payload["rmd_xmp"] = py::none();
+    }
+    payload["exposure_adjust"] = py::float_(settings.ExposureAdjust);
+    payload["cdl_enabled"] = py::bool_(settings.CdlEnabled);
+    payload["cdl_slope"] = py::make_tuple(settings.CdlRed.Slope, settings.CdlGreen.Slope, settings.CdlBlue.Slope);
+    payload["cdl_offset"] = py::make_tuple(settings.CdlRed.Offset, settings.CdlGreen.Offset, settings.CdlBlue.Offset);
+    payload["cdl_power"] = py::make_tuple(settings.CdlRed.Power, settings.CdlGreen.Power, settings.CdlBlue.Power);
+    payload["cdl_saturation"] = py::float_(settings.CdlSaturation);
+    payload["output_tonemap"] = py::int_(static_cast<int>(settings.OutputToneMap));
+    payload["highlight_rolloff"] = py::int_(static_cast<int>(settings.HighlightRollOff));
+    payload["color_space"] = py::int_(static_cast<int>(settings.ColorSpace));
+    payload["gamma_curve"] = py::int_(static_cast<int>(settings.GammaCurve));
+    payload["image_pipeline_mode"] = py::int_(static_cast<int>(settings.ImagePipelineMode));
+    return payload;
+#endif
+}
+
 PYBIND11_MODULE(_red_sdk_bridge, m) {
     m.doc() = "R3DMatch RED SDK bridge";
     m.def("sdk_available", &sdk_available);
@@ -363,5 +447,21 @@ PYBIND11_MODULE(_red_sdk_bridge, m) {
         py::arg("half_res") = true,
         py::arg("colorspace") = "REDWideGamutRGB",
         py::arg("gamma") = "Log3G10"
+    );
+    m.def(
+        "create_rmd_from_settings",
+        &create_rmd_from_settings,
+        py::arg("path"),
+        py::arg("exposure_adjust"),
+        py::arg("cdl_slope"),
+        py::arg("cdl_offset"),
+        py::arg("cdl_power"),
+        py::arg("cdl_saturation") = 1.0f,
+        py::arg("cdl_enabled") = true,
+        py::arg("output_tonemap") = 1,
+        py::arg("highlight_rolloff") = 3,
+        py::arg("color_space") = 1,
+        py::arg("gamma_curve") = 15,
+        py::arg("image_pipeline_mode") = 1
     );
 }

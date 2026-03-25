@@ -14,7 +14,7 @@ from PIL import Image
 
 from .calibration import extract_center_region, load_color_calibration, load_exposure_calibration, percentile_clip
 from .color import rgb_gains_to_cdl
-from .rmd import write_rmd_for_clip, write_rmds_from_analysis
+from .rmd import write_rmd_for_clip_with_metadata, write_rmds_from_analysis
 
 
 PREVIEW_VARIANTS = ("original", "exposure", "color", "both")
@@ -49,6 +49,7 @@ GAMMA_CODES = {"BT.1886": 32, "Log3G10": 34}
 ROLLOFF_CODES = {"none": 0, "hard": 1, "default": 2, "medium": 3, "soft": 4}
 TONEMAP_CODES = {"low": 0, "medium": 1, "high": 2, "none": 3}
 SHADOW_ROLLOFF_VALUES = {"hard": -0.25, "medium": 0.0, "soft": 0.25}
+LOGO_PATH = Path(__file__).resolve().parent / "static" / "r3dmatch_logo.png"
 
 
 def _load_analysis_records(input_path: str) -> List[Dict[str, object]]:
@@ -236,6 +237,24 @@ def _preview_transform_label(settings: Dict[str, object]) -> str:
     return " / ".join(parts)
 
 
+def _report_grid_columns(clip_count: int) -> int:
+    if clip_count <= 6:
+        return 3
+    if clip_count <= 16:
+        return 4
+    if clip_count <= 36:
+        return 6
+    return 8
+
+
+def _report_tiles_per_page(columns: int) -> int:
+    return max(12, min(18, columns * 2))
+
+
+def _chunk_tiles(items: List[Dict[str, object]], chunk_size: int) -> List[List[Dict[str, object]]]:
+    return [items[index:index + chunk_size] for index in range(0, len(items), chunk_size)] or [[]]
+
+
 def _extract_preview_corrections(sidecar_payload: Dict[str, object]) -> Dict[str, object]:
     exposure_mapping = dict(sidecar_payload.get("rmd_mapping", {}).get("exposure", {}))
     color_mapping = dict(sidecar_payload.get("rmd_mapping", {}).get("color", {}))
@@ -413,6 +432,7 @@ def _build_redline_preview_command(
     redline_capabilities: Dict[str, object],
     use_as_shot_metadata: bool,
     rmd_path: Optional[str] = None,
+    use_rmd_mode: int = 1,
 ) -> List[str]:
     command = [
         redline_executable,
@@ -445,7 +465,7 @@ def _build_redline_preview_command(
     if preview_settings.get("lut_path") and redline_capabilities.get("supports_lut"):
         command.extend(["--lut", str(preview_settings["lut_path"])])
     if rmd_path and redline_capabilities.get("supports_load_rmd"):
-        command.extend(["--loadRMD", str(Path(rmd_path).expanduser().resolve()), "--useRMD", "2"])
+        command.extend(["--loadRMD", str(Path(rmd_path).expanduser().resolve()), "--useRMD", str(use_rmd_mode)])
     else:
         if exposure_stops is not None:
             command.extend(["--exposure", f"{float(exposure_stops):.6f}"])
@@ -503,18 +523,18 @@ def _build_redline_metadata_probe_command(
     color_cdl: Optional[Dict[str, object]],
     color_method: Optional[str],
     redline_capabilities: Dict[str, object],
+    use_rmd_mode: int,
 ) -> List[str]:
     command = [
         redline_executable,
         "--i",
         str(Path(source_path).expanduser().resolve()),
-        "--useMeta",
         "--printMeta",
         "1",
         "--noRender",
     ]
     if rmd_path and redline_capabilities.get("supports_load_rmd"):
-        command.extend(["--loadRMD", str(Path(rmd_path).expanduser().resolve()), "--useRMD", "2"])
+        command.extend(["--loadRMD", str(Path(rmd_path).expanduser().resolve()), "--useRMD", str(use_rmd_mode)])
     else:
         if exposure_stops is not None:
             command.extend(["--exposure", f"{float(exposure_stops):.6f}"])
@@ -554,6 +574,7 @@ def _probe_redline_application(
     color_cdl: Optional[Dict[str, object]],
     color_method: Optional[str],
     redline_capabilities: Dict[str, object],
+    use_rmd_mode: int = 1,
 ) -> Dict[str, object]:
     command = _build_redline_metadata_probe_command(
         source_path,
@@ -563,6 +584,7 @@ def _probe_redline_application(
         color_cdl=color_cdl,
         color_method=color_method,
         redline_capabilities=redline_capabilities,
+        use_rmd_mode=use_rmd_mode,
     )
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
     output = (completed.stdout or "") + (completed.stderr or "")
@@ -611,6 +633,27 @@ def _compute_image_difference_metrics(reference_path: str | Path, candidate_path
     }
 
 
+def _is_identity_rgb_gains(rgb_gains: Optional[List[float]]) -> bool:
+    if rgb_gains is None:
+        return True
+    return all(abs(float(value) - 1.0) <= 1e-9 for value in rgb_gains)
+
+
+def _is_identity_cdl_payload(color_cdl: Optional[Dict[str, object]]) -> bool:
+    if color_cdl is None:
+        return True
+    slope = [float(value) for value in color_cdl.get("slope", [1.0, 1.0, 1.0])]
+    offset = [float(value) for value in color_cdl.get("offset", [0.0, 0.0, 0.0])]
+    power = [float(value) for value in color_cdl.get("power", [1.0, 1.0, 1.0])]
+    saturation = float(color_cdl.get("saturation", 1.0))
+    return (
+        all(abs(value - 1.0) <= 1e-9 for value in slope)
+        and all(abs(value) <= 1e-9 for value in offset)
+        and all(abs(value - 1.0) <= 1e-9 for value in power)
+        and abs(saturation - 1.0) <= 1e-9
+    )
+
+
 def render_preview_frame(
     input_r3d: str,
     output_path: str,
@@ -624,9 +667,12 @@ def render_preview_frame(
     red_gain: Optional[float] = None,
     green_gain: Optional[float] = None,
     blue_gain: Optional[float] = None,
+    rmd_path: Optional[str] = None,
+    use_rmd_mode: int = 1,
+    color_method: Optional[str] = None,
 ) -> Dict[str, object]:
     color_cdl = None
-    color_method = None
+    resolved_color_method = color_method
     if red_gain is not None or green_gain is not None or blue_gain is not None:
         color_cdl = {
             "slope": [
@@ -638,19 +684,21 @@ def render_preview_frame(
             "power": [1.0, 1.0, 1.0],
             "saturation": 1.0,
         }
-        color_method = "rgb_gain"
+        if resolved_color_method is None:
+            resolved_color_method = "rgb_gain"
     command = _build_redline_preview_command(
         input_r3d,
         output_path=output_path,
         frame_index=frame_index,
         exposure_stops=exposure,
         color_cdl=color_cdl,
-        color_method=color_method,
+        color_method=resolved_color_method,
         redline_executable=redline_executable,
         preview_settings=preview_settings,
         redline_capabilities=redline_capabilities,
         use_as_shot_metadata=use_as_shot_metadata,
-        rmd_path=None,
+        rmd_path=rmd_path,
+        use_rmd_mode=use_rmd_mode,
     )
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
     actual_output = _resolve_rendered_output_path(output_path)
@@ -660,6 +708,98 @@ def render_preview_frame(
         "stdout": completed.stdout,
         "stderr": completed.stderr,
         "output_path": str(actual_output),
+    }
+
+
+def _validate_rmd_render(
+    *,
+    clip_id: str,
+    variant: str,
+    strategy_key: str,
+    source_path: str,
+    frame_index: int,
+    baseline_path: Path,
+    preview_root: Path,
+    redline_executable: str,
+    redline_capabilities: Dict[str, object],
+    preview_settings: Dict[str, object],
+    exposure_stops: float,
+    rgb_gains: Optional[List[float]],
+    rmd_path: str,
+    use_rmd_mode: int,
+) -> Dict[str, object]:
+    validation_root = preview_root / "_rmd_validation"
+    validation_root.mkdir(parents=True, exist_ok=True)
+    run_id = preview_root.parent.name
+    direct_output = validation_root / f"{clip_id}.{variant}.validation.flags.{strategy_key}.{run_id}.jpg"
+    direct_render = render_preview_frame(
+        source_path,
+        str(direct_output),
+        frame_index=frame_index,
+        redline_executable=redline_executable,
+        redline_capabilities=redline_capabilities,
+        preview_settings=preview_settings,
+        use_as_shot_metadata=False,
+        exposure=exposure_stops,
+        red_gain=float(rgb_gains[0]) if rgb_gains is not None else None,
+        green_gain=float(rgb_gains[1]) if rgb_gains is not None else None,
+        blue_gain=float(rgb_gains[2]) if rgb_gains is not None else None,
+        color_method="cdl" if rgb_gains is not None else None,
+    )
+    if int(direct_render["returncode"]) != 0:
+        raise RuntimeError(
+            f"REDLine direct-flag validation render failed for {clip_id} ({variant}). "
+            f"Command: {shlex.join(direct_render['command'])}. STDERR: {str(direct_render['stderr']).strip()}"
+        )
+    direct_path = Path(str(direct_render["output_path"]))
+    if not direct_path.exists():
+        raise RuntimeError(f"REDLine direct-flag validation render did not create expected file: {direct_path}")
+
+    rmd_output = validation_root / f"{clip_id}.{variant}.validation.rmd.{strategy_key}.{run_id}.jpg"
+    rmd_render = render_preview_frame(
+        source_path,
+        str(rmd_output),
+        frame_index=frame_index,
+        redline_executable=redline_executable,
+        redline_capabilities=redline_capabilities,
+        preview_settings=preview_settings,
+        use_as_shot_metadata=False,
+        rmd_path=rmd_path,
+        use_rmd_mode=use_rmd_mode,
+    )
+    if int(rmd_render["returncode"]) != 0:
+        raise RuntimeError(
+            f"REDLine RMD validation render failed for {clip_id} ({variant}). "
+            f"Command: {shlex.join(rmd_render['command'])}. STDERR: {str(rmd_render['stderr']).strip()}"
+        )
+    rmd_path_resolved = Path(str(rmd_render["output_path"]))
+    if not rmd_path_resolved.exists():
+        raise RuntimeError(f"REDLine RMD validation render did not create expected file: {rmd_path_resolved}")
+
+    diff_baseline_vs_flags = _compute_image_difference_metrics(baseline_path, direct_path)
+    diff_baseline_vs_rmd = _compute_image_difference_metrics(baseline_path, rmd_path_resolved)
+    diff_flag_vs_rmd = _compute_image_difference_metrics(direct_path, rmd_path_resolved)
+    return {
+        "clip_id": clip_id,
+        "strategy": strategy_key,
+        "variant": variant,
+        "exposure_offset": float(exposure_stops),
+        "rgb_gains": rgb_gains,
+        "rmd_path": rmd_path,
+        "direct_flag_command": direct_render["command"],
+        "rmd_command": rmd_render["command"],
+        "direct_flag_output": str(direct_path),
+        "rmd_output": str(rmd_path_resolved),
+        "pixel_diff_baseline_vs_flags": diff_baseline_vs_flags["mean_absolute_difference"],
+        "pixel_diff_baseline_vs_rmd": diff_baseline_vs_rmd["mean_absolute_difference"],
+        "pixel_diff_flag_vs_rmd": diff_flag_vs_rmd["mean_absolute_difference"],
+        "max_diff_flag_vs_rmd": diff_flag_vs_rmd["max_absolute_difference"],
+        "rmd_pipeline_valid": bool(
+            diff_flag_vs_rmd["mean_absolute_difference"] is not None
+            and float(diff_flag_vs_rmd["mean_absolute_difference"]) < 1e-3
+        ),
+        "direct_flag_returncode": int(direct_render["returncode"]),
+        "rmd_returncode": int(rmd_render["returncode"]),
     }
 
 
@@ -681,6 +821,8 @@ def generate_preview_stills(
     redline_executable = _resolve_redline_executable()
     preview_paths: Dict[str, Dict[str, object]] = {}
     command_records: List[Dict[str, object]] = []
+    rmd_validation_records: List[Dict[str, object]] = []
+    selected_rmd_use_mode = 1
     render_settings = _normalize_preview_settings(
         preview_mode=str(DEFAULT_DISPLAY_REVIEW_PREVIEW["preview_mode"]),
         preview_output_space=str(DEFAULT_DISPLAY_REVIEW_PREVIEW["output_space"]),
@@ -784,7 +926,7 @@ def generate_preview_stills(
             for variant, variant_settings in variants.items():
                 preview_path = preview_root / preview_filename_for_clip_id(clip_id, variant, strategy=strategy_key, run_id=run_id)
                 look_metadata_path = None
-                probe_result = None
+                rmd_metadata = None
                 if strategy_rmd_root is not None:
                     review_sidecar = {
                         "clip_id": clip_id,
@@ -816,16 +958,17 @@ def generate_preview_stills(
                         },
                     }
                     review_rmd_dir = Path(strategy_rmd_root).expanduser().resolve() / strategy_key / variant
-                    look_metadata_path = str(write_rmd_for_clip(clip_id, review_sidecar, review_rmd_dir))
-                    probe_result = _probe_redline_application(
-                        source_path,
-                        redline_executable=redline_executable,
-                        rmd_path=look_metadata_path,
-                        exposure_stops=float(variant_settings["exposure"]),
-                        color_cdl=clip_entry.get("color_cdl"),
-                        color_method="rgb_gain" if variant_settings["gains"] is not None else None,
-                        redline_capabilities=redline_capabilities,
-                    )
+                    rmd_path_obj, rmd_metadata = write_rmd_for_clip_with_metadata(clip_id, review_sidecar, review_rmd_dir)
+                    look_metadata_path = str(rmd_path_obj)
+                    if str(rmd_metadata.get("rmd_kind")) != "red_sdk":
+                        raise RuntimeError(
+                            f"RMD pipeline not valid for {clip_id} ({variant}): generated fallback XML instead of RED SDK RMD. "
+                            f"Error: {rmd_metadata.get('error')}"
+                        )
+                    if not redline_capabilities.get("supports_load_rmd"):
+                        raise RuntimeError(
+                            f"RMD pipeline not valid for {clip_id} ({variant}): this REDLine build does not support --loadRMD/--useRMD."
+                        )
 
                 red_gain = green_gain = blue_gain = None
                 if variant_settings["gains"] is not None:
@@ -840,10 +983,12 @@ def generate_preview_stills(
                     redline_capabilities=redline_capabilities,
                     preview_settings=render_settings,
                     use_as_shot_metadata=False,
-                    exposure=float(variant_settings["exposure"]),
-                    red_gain=red_gain,
-                    green_gain=green_gain,
-                    blue_gain=blue_gain,
+                    exposure=None,
+                    red_gain=None,
+                    green_gain=None,
+                    blue_gain=None,
+                    rmd_path=look_metadata_path,
+                    use_rmd_mode=selected_rmd_use_mode,
                 )
                 if int(corrected_render["returncode"]) != 0:
                     raise RuntimeError(
@@ -858,21 +1003,55 @@ def generate_preview_stills(
 
                 diff_metrics = _compute_image_difference_metrics(original_path, preview_path)
                 mean_diff = diff_metrics["mean_absolute_difference"]
-                requires_change = abs(float(variant_settings["exposure"])) > 0.05 or (
+                color_cdl = clip_entry.get("color_cdl") if variant in {"color", "both"} else None
+                cdl_enabled = bool(
+                    (isinstance(rmd_metadata, dict) and rmd_metadata.get("cdl_enabled"))
+                    or (
+                        isinstance(rmd_metadata, dict)
+                        and isinstance(rmd_metadata.get("settings"), dict)
+                        and rmd_metadata["settings"].get("cdl_enabled")
+                    )
+                )
+                correction_payload_identity = bool(
+                    abs(float(variant_settings["exposure"])) <= 1e-9
+                    and _is_identity_rgb_gains(variant_settings["gains"])
+                    and _is_identity_cdl_payload(color_cdl)
+                )
+                requires_change = abs(float(variant_settings["exposure"])) > 1e-9 or (
                     variant_settings["gains"] is not None
                     and any(abs(float(value) - 1.0) > 1e-6 for value in variant_settings["gains"])
                 )
                 error_message = None
                 if requires_change and (mean_diff is None or float(mean_diff) < 1e-3):
-                    error_message = "REDLine correction not applied"
+                    error_message = "RMD correction did not change rendered pixels"
                     print(
                         f"[r3dmatch] ERROR: {error_message} clip={clip_id} strategy={strategy_key} "
                         f"variant={variant} command={shlex.join(corrected_render['command'])}"
                     )
+                validation_record = {
+                    "clip_id": clip_id,
+                    "strategy": strategy_key,
+                    "variant": variant,
+                    "application_method": "rmd",
+                    "rmd_path": look_metadata_path,
+                    "use_rmd_mode": selected_rmd_use_mode,
+                    "exposure_offset": float(variant_settings["exposure"]),
+                    "rgb_gains": [red_gain, green_gain, blue_gain] if red_gain is not None else None,
+                    "color_cdl": color_cdl,
+                    "cdl_enabled": cdl_enabled,
+                    "correction_payload_identity": correction_payload_identity,
+                    "pixel_diff_from_baseline": mean_diff,
+                    "max_pixel_diff_from_baseline": diff_metrics["max_absolute_difference"],
+                    "pixel_output_changed": diff_metrics["pixel_output_changed"],
+                    "validation_method": "pixel_diff_from_baseline",
+                    "error": error_message,
+                }
+                rmd_validation_records.append(validation_record)
                 print(
                     f"[r3dmatch] preview render clip={clip_id} mode=corrected strategy={strategy_key} "
                     f"variant={variant} exposure={float(variant_settings['exposure']):.6f} "
-                    f"redGain={red_gain} greenGain={green_gain} blueGain={blue_gain} pixel_diff={mean_diff}"
+                    f"redGain={red_gain} greenGain={green_gain} blueGain={blue_gain} pixel_diff={mean_diff} "
+                    f"application_method=rmd"
                 )
                 command_records.append(
                     {
@@ -887,25 +1066,46 @@ def generate_preview_stills(
                         "command": corrected_render["command"],
                         "output": str(preview_path),
                         "look_metadata_path": look_metadata_path,
-                        "rmd_metadata_probe": probe_result,
+                        "rmd_path": look_metadata_path,
+                        "rmd_metadata": rmd_metadata,
                         "returncode": corrected_render["returncode"],
                         "stdout": corrected_render["stdout"],
                         "stderr": corrected_render["stderr"],
+                        "application_method": "rmd",
                         "pixel_diff_from_baseline": mean_diff,
+                        "max_pixel_diff_from_baseline": diff_metrics["max_absolute_difference"],
                         "pixel_output_changed": diff_metrics["pixel_output_changed"],
+                        "correction_payload_identity": correction_payload_identity,
+                        "cdl_enabled": cdl_enabled,
+                        "color_payload_summary": color_cdl,
                         "error": error_message,
                         "as_shot_metadata_used": False,
                         "explicit_transform_used": True,
-                        "explicit_correction_flags_used": bool(
-                            abs(float(variant_settings["exposure"])) > 1e-9
-                            or (red_gain is not None and abs(float(red_gain) - 1.0) > 1e-9)
-                            or (green_gain is not None and abs(float(green_gain) - 1.0) > 1e-9)
-                            or (blue_gain is not None and abs(float(blue_gain) - 1.0) > 1e-9)
-                        ),
+                        "explicit_correction_flags_used": False,
+                        "correction_application_method": "rmd",
+                        "use_rmd_mode": selected_rmd_use_mode,
+                        "validation_method": "pixel_diff_from_baseline",
                     }
                 )
                 preview_paths[clip_id]["strategies"][strategy_key][variant] = str(preview_path)
     (preview_root / "preview_commands.json").write_text(json.dumps({"commands": command_records}, indent=2), encoding="utf-8")
+    (preview_root / "rmd_validation.json").write_text(
+        json.dumps(
+            {
+                "selected_use_rmd_mode": selected_rmd_use_mode,
+                "pipeline_valid": all(
+                    bool(item["correction_payload_identity"]) or bool(item["pixel_output_changed"])
+                    for item in rmd_validation_records
+                )
+                if rmd_validation_records
+                else None,
+                "validation_method": "pixel_diff_from_baseline",
+                "validations": rmd_validation_records,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     return preview_paths
 
 
@@ -1235,43 +1435,58 @@ def render_contact_sheet_pdf(
         except OSError:
             return ImageFont.load_default()
 
-    title_font = load_font(14, bold=True)
-    section_font = load_font(14, bold=True)
-    body_font = load_font(12, bold=False)
+    title_font = load_font(30, bold=True)
+    section_font = load_font(20, bold=True)
+    clip_font = load_font(15, bold=True)
+    body_font = load_font(13, bold=False)
     caption_font = load_font(12, bold=False)
     pages = []
     page_width = 1700
     page_height = 2200
     margin_x = 60
     margin_y = 60
-    tile_width = 320
-    tile_height = 220
-    tile_gap_x = 24
-    tile_gap_y = 110
+    logo_max_width = 150
+    logo_max_height = 84
+    tile_gap_x = 20
+    tile_gap_y = 36
     metadata_line_height = 18
-    section_gap = 28
+    section_gap = 30
+
+    logo_image = None
+    if LOGO_PATH.exists():
+        try:
+            loaded_logo = Image.open(LOGO_PATH).convert("RGBA")
+            loaded_logo.thumbnail((logo_max_width, logo_max_height))
+            logo_image = loaded_logo
+        except OSError:
+            logo_image = None
 
     def new_page() -> tuple[Image.Image, ImageDraw.ImageDraw, int]:
         page = Image.new("RGB", (page_width, page_height), "white")
         draw = ImageDraw.Draw(page)
         y = margin_y
-        draw.text((margin_x, y), title, fill="black", font=title_font)
-        y += 40
-        if timestamp_label:
-            draw.text((margin_x, y), timestamp_label, fill="black", font=body_font)
-            y += 30
+        text_x = margin_x
+        if logo_image is not None:
+            page.paste(logo_image, (margin_x, y), logo_image)
+            text_x += logo_image.width + 28
+        draw.text((text_x, y), title, fill="black", font=title_font)
+        draw.text((text_x, y + 42), "Internal Review", fill="black", font=section_font)
         summary_lines = [
             f"Target type: {payload.get('target_type')}",
             f"Processing mode: {payload.get('processing_mode')}",
             f"Preview transform: {payload.get('preview_transform')}",
-            f"Exposure measurement domain: {payload.get('exposure_measurement_domain')}",
             f"Calibration ROI: {payload.get('calibration_roi')}",
-            f"Selected target strategies: {payload.get('target_strategies')}",
+            f"Target strategies: {', '.join(strategy_display_name(item) for item in payload.get('target_strategies', []))}",
         ]
+        summary_y = y + 74
         for line in summary_lines:
-            draw.text((margin_x, y), line, fill="black", font=body_font)
-            y += 24
-        return page, draw, y + section_gap
+            draw.text((text_x, summary_y), line, fill="black", font=body_font)
+            summary_y += 20
+        if timestamp_label:
+            draw.text((page_width - margin_x - 420, y + 8), timestamp_label, fill="black", font=body_font)
+        header_bottom = max(summary_y, y + (logo_image.height if logo_image is not None else 96))
+        draw.line((margin_x, header_bottom + 16, page_width - margin_x, header_bottom + 16), fill="#d7d7d7", width=2)
+        return page, draw, header_bottom + 34
 
     def ensure_room(current_y: int, needed_height: int) -> tuple[Image.Image, ImageDraw.ImageDraw, int]:
         nonlocal page, draw
@@ -1281,7 +1496,7 @@ def render_contact_sheet_pdf(
         page, draw, new_y = new_page()
         return page, draw, new_y
 
-    def fit_image(path: str) -> Image.Image:
+    def fit_image(path: str, tile_width: int, tile_height: int) -> Image.Image:
         preview = Image.open(path).convert("RGB")
         preview.thumbnail((tile_width, tile_height))
         canvas = Image.new("RGB", (tile_width, tile_height), "#f0ece3")
@@ -1297,50 +1512,53 @@ def render_contact_sheet_pdf(
         section_meta: Optional[List[str]] = None,
     ) -> int:
         nonlocal page, draw, y
-        _, _, y = ensure_room(y, 120)
-        draw.text((margin_x, y), section_title, fill="black", font=section_font)
-        y += 28
-        for meta_line in section_meta or []:
-            draw.text((margin_x, y), meta_line, fill="black", font=body_font)
-            y += 20
-        if section_meta:
-            y += 8
+        columns = _report_grid_columns(len(tiles))
+        tile_width = int((page_width - (2 * margin_x) - (tile_gap_x * (columns - 1))) / max(columns, 1))
+        tile_width = max(180, tile_width)
+        image_height = max(120, int(tile_width * 0.62))
+        metadata_block_height = 88
+        tile_block_height = image_height + metadata_block_height
+        tiles_per_page = _report_tiles_per_page(columns)
+        paged_tiles = _chunk_tiles(tiles, tiles_per_page)
 
-        columns = max(1, (page_width - (2 * margin_x) + tile_gap_x) // (tile_width + tile_gap_x))
-        for index, tile in enumerate(tiles):
-            row = index // columns
-            col = index % columns
-            tile_x = margin_x + col * (tile_width + tile_gap_x)
-            tile_y = y + row * (tile_height + tile_gap_y)
-            if tile_y + tile_height + tile_gap_y > page_height - margin_y:
+        for page_index, page_tiles in enumerate(paged_tiles):
+            _, _, y = ensure_room(y, 140)
+            heading = section_title if len(paged_tiles) == 1 else f"{section_title} ({page_index + 1}/{len(paged_tiles)})"
+            draw.text((margin_x, y), heading, fill="black", font=section_font)
+            y += 34
+            local_meta = list(section_meta or [])
+            if len(paged_tiles) > 1:
+                local_meta.append(f"Page {page_index + 1} of {len(paged_tiles)}")
+            for meta_line in local_meta:
+                draw.text((margin_x, y), meta_line, fill="black", font=body_font)
+                y += 20
+            if local_meta:
+                y += 8
+
+            rows = (len(page_tiles) + columns - 1) // columns
+            needed_height = max(1, rows) * (tile_block_height + tile_gap_y)
+            _, _, y = ensure_room(y, needed_height + 20)
+
+            for index, tile in enumerate(page_tiles):
+                row = index // columns
+                col = index % columns
+                tile_x = margin_x + col * (tile_width + tile_gap_x)
+                tile_y = y + row * (tile_block_height + tile_gap_y)
+                image_path = tile.get("image_path")
+                if image_path and Path(str(image_path)).exists():
+                    page.paste(fit_image(str(image_path), tile_width, image_height), (tile_x, tile_y))
+                else:
+                    draw.rounded_rectangle((tile_x, tile_y, tile_x + tile_width, tile_y + image_height), radius=14, fill="#f0ece3", outline="#d7d7d7")
+                    draw.text((tile_x + 12, tile_y + 12), "No preview", fill="#666666", font=body_font)
+                meta_y = tile_y + image_height + 8
+                draw.text((tile_x, meta_y), str(tile.get("clip_id", "")), fill="black", font=clip_font)
+                draw.text((tile_x, meta_y + metadata_line_height), f"Exposure: {tile.get('exposure_offset_stops', 'n/a')}", fill="black", font=body_font)
+                draw.text((tile_x, meta_y + metadata_line_height * 2), f"RGB gains: {tile.get('rgb_gains_text', 'n/a')}", fill="black", font=body_font)
+                draw.text((tile_x, meta_y + metadata_line_height * 3), f"Confidence: {tile.get('confidence', 'n/a')} | log2: {tile.get('raw_log2', 'n/a')}", fill="black", font=caption_font)
+            y += needed_height + section_gap
+            if page_index < len(paged_tiles) - 1:
                 pages.append(page)
                 page, draw, y = new_page()
-                return draw_tiles(section_title=section_title, tiles=tiles[index:], section_meta=section_meta)
-
-            image_path = tile.get("image_path")
-            if image_path and Path(str(image_path)).exists():
-                page.paste(fit_image(str(image_path)), (tile_x, tile_y))
-            draw.text((tile_x, tile_y + tile_height + 8), str(tile.get("clip_id", "")), fill="black", font=caption_font)
-            draw.text(
-                (tile_x, tile_y + tile_height + 8 + metadata_line_height),
-                f"Exposure: {tile.get('exposure_offset_stops', 'n/a')}",
-                fill="black",
-                font=body_font,
-            )
-            draw.text(
-                (tile_x, tile_y + tile_height + 8 + metadata_line_height * 2),
-                f"RGB gains: {tile.get('rgb_gains_text', 'n/a')}",
-                fill="black",
-                font=body_font,
-            )
-            draw.text(
-                (tile_x, tile_y + tile_height + 8 + metadata_line_height * 3),
-                f"Confidence: {tile.get('confidence', 'n/a')} | Raw log2: {tile.get('raw_log2', 'n/a')}",
-                fill="black",
-                font=body_font,
-            )
-        rows = (len(tiles) + columns - 1) // columns
-        y += rows * (tile_height + tile_gap_y) + section_gap
         return y
 
     page, draw, y = new_page()
@@ -1415,6 +1633,13 @@ def build_ui_calibration_table(input_path: str, *, out_dir: str) -> Dict[str, ob
 
 
 def render_contact_sheet_html(payload: Dict[str, object]) -> str:
+    logo_markup = (
+        f"<img class='brand-logo' src='{LOGO_PATH.as_posix()}' alt='R3DMatch logo' />"
+        if LOGO_PATH.exists()
+        else "<div class='brand-logo-text'>R3DMatch</div>"
+    )
+    total_originals = len(payload.get("shared_originals", []))
+    original_columns = _report_grid_columns(total_originals)
     original_cards = []
     for clip in payload.get("shared_originals", []):
         path = clip.get("original_frame")
@@ -1431,68 +1656,72 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
         )
     strategy_sections = []
     for strategy in payload.get("strategies", []):
+        columns = _report_grid_columns(len(strategy.get("clips", [])))
         cards = []
         for clip in strategy["clips"]:
             metrics = clip["metrics"]
-            images = []
-            for label, path_key in (("Exposure", "exposure_corrected"), ("Color", "color_corrected"), ("Both", "both_corrected")):
-                path = clip.get(path_key)
-                if path:
-                    images.append(
-                        f"<figure><img src='../previews/{Path(path).name}' alt='{clip['clip_id']} {label}' /><figcaption>{label}</figcaption></figure>"
-                    )
             gains = metrics["color"]["rgb_gains"]
             gains_text = ", ".join(f"{float(value):.3f}" for value in gains) if gains else "n/a"
             flags = ", ".join(metrics.get("flags", [])) if metrics.get("flags") else "none"
-            thumbs_html = "".join(images) if images else "<p class='subtle'>No previews generated.</p>"
+            image_path = clip.get("both_corrected")
+            thumbs_html = (
+                f"<figure><img src='../previews/{Path(image_path).name}' alt='{clip['clip_id']} Both' /><figcaption>Both Corrected</figcaption></figure>"
+                if image_path
+                else "<p class='subtle'>No previews generated.</p>"
+            )
             cards.append(
                 "<article class='clip-card'>"
-                f"<h2>{clip['clip_id']}</h2>"
-                f"<p class='subtle'>Group: {clip['group_key']}</p>"
-                f"<div class='thumb-grid'>{thumbs_html}</div>"
-                "<dl>"
-                f"<dt>Target type</dt><dd>{payload.get('target_type')}</dd>"
-                f"<dt>Preview transform</dt><dd>{payload.get('preview_transform')}</dd>"
-                f"<dt>Calibration ROI</dt><dd>{clip.get('calibration_roi') or payload.get('calibration_roi')}</dd>"
-                f"<dt>Monitoring log2 luminance</dt><dd>{metrics['exposure']['measured_log2_luminance_monitoring']}</dd>"
-                f"<dt>Raw log2 luminance</dt><dd>{metrics['exposure']['measured_log2_luminance_raw']}</dd>"
-                f"<dt>Exposure solve domain</dt><dd>{metrics['exposure']['measurement_domain']}</dd>"
-                f"<dt>Exposure offset</dt><dd>{metrics['exposure']['final_offset_stops']}</dd>"
-                f"<dt>RGB gains</dt><dd>{gains_text}</dd>"
-                f"<dt>Confidence</dt><dd>{metrics['confidence']}</dd>"
-                f"<dt>Flags</dt><dd>{flags}</dd>"
-                f"<dt>Measurement mode</dt><dd>{metrics.get('measurement_mode')}</dd>"
-                f"<dt>Source path</dt><dd>{clip['source_path']}</dd>"
-                "</dl>"
+                f"<div class='thumb-single'>{thumbs_html}</div>"
+                f"<div class='clip-label'>{clip['clip_id']}</div>"
+                f"<div class='clip-meta'>Exposure: {metrics['exposure']['final_offset_stops']}</div>"
+                f"<div class='clip-meta'>RGB gains: {gains_text}</div>"
+                f"<div class='clip-meta'>Confidence: {metrics['confidence']} | log2: {metrics['exposure']['measured_log2_luminance_monitoring']}</div>"
+                f"<div class='clip-meta subtle'>Group: {clip['group_key']} | Flags: {flags}</div>"
                 "</article>"
             )
         strategy_sections.append(
-            f"<section><h2>Target Strategy: {strategy['strategy_label']}</h2>"
-            f"<p class='subtle'>Reference clip: {strategy.get('reference_clip_id')} | Target log2: {strategy.get('target_log2_luminance')} | Target chromaticity: {strategy.get('target_rgb_chromaticity')}</p>"
-            f"<div class='grid'>{''.join(cards)}</div></section>"
+            f"<section class='report-section'>"
+            f"<h2>{strategy['strategy_label']}</h2>"
+            f"<p class='section-meta subtle'>Reference clip: {strategy.get('reference_clip_id')} | Target log2: {strategy.get('target_log2_luminance')} | ROI: {strategy.get('calibration_roi')}</p>"
+            f"<div class='grid cols-{columns}'>{''.join(cards)}</div></section>"
         )
     return (
         "<!doctype html><html><head><meta charset='utf-8'><title>R3DMatch Contact Sheet</title>"
         "<style>"
-        "body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f5f1e8;color:#181513;margin:0;padding:24px;}"
-        "header{margin-bottom:24px;padding:20px;background:white;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.06);}"
-        ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:18px;}"
-        ".clip-card{background:white;border-radius:16px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.06);}"
-        ".thumb-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:12px 0 16px;}"
-        "figure{margin:0;}img{width:100%;display:block;border-radius:10px;background:#d7d2c7;}figcaption{font-size:12px;color:#5b554e;margin-top:4px;}"
-        "dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 12px;margin:0;}dt{font-weight:600;}dd{margin:0;}"
+        "body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f7f7f4;color:#171717;margin:0;padding:28px;}"
+        "header{display:flex;align-items:flex-start;gap:24px;margin-bottom:28px;padding:24px;background:white;border-radius:18px;box-shadow:0 8px 24px rgba(0,0,0,.06);}"
+        ".brand-logo{width:150px;height:auto;display:block;object-fit:contain;}"
+        ".brand-logo-text{font-size:30px;font-weight:800;line-height:1.1;}"
+        ".header-copy h1{font-size:30px;line-height:1.1;margin:0 0 10px;font-weight:800;}"
+        ".header-copy p{margin:4px 0;font-size:13px;}"
+        ".report-section{margin:0 0 34px;break-after:page;}"
+        ".report-section:last-of-type{break-after:auto;}"
+        ".report-section h2{font-size:20px;line-height:1.2;margin:0 0 10px;font-weight:800;}"
+        ".section-meta{margin:0 0 16px;font-size:13px;}"
+        ".grid{display:grid;gap:16px;align-items:start;}"
+        ".grid.cols-3{grid-template-columns:repeat(3,minmax(0,1fr));}"
+        ".grid.cols-4{grid-template-columns:repeat(4,minmax(0,1fr));}"
+        ".grid.cols-6{grid-template-columns:repeat(6,minmax(0,1fr));}"
+        ".grid.cols-8{grid-template-columns:repeat(8,minmax(0,1fr));}"
+        ".clip-card{background:white;border-radius:14px;padding:12px;box-shadow:0 6px 18px rgba(0,0,0,.05);}"
+        ".thumb-single figure{margin:0;}"
+        ".thumb-single img{width:100%;display:block;border-radius:10px;background:#d7d2c7;aspect-ratio:16/10;object-fit:cover;}"
+        "figcaption{font-size:12px;color:#5b554e;margin-top:5px;}"
+        ".clip-label{font-size:15px;font-weight:700;margin-top:10px;}"
+        ".clip-meta{font-size:12px;line-height:1.35;margin-top:4px;}"
         ".subtle{color:#5b554e;}"
+        "@media print{body{padding:12px;background:white;}header,.clip-card{box-shadow:none;border:1px solid #dddddd;}}"
         "</style></head>"
-        "<body><header><h1>R3DMatch Contact Sheet</h1>"
-        f"<p>Clip count: {payload['clip_count']}</p>"
+        "<body><header>"
+        f"{logo_markup}"
+        "<div class='header-copy'>"
+        "<h1>R3DMatch Review Contact Sheet</h1>"
         f"<p>Target type: {payload.get('target_type')}</p>"
         f"<p>Processing mode: {payload.get('processing_mode')}</p>"
         f"<p>Preview transform: {payload.get('preview_transform')}</p>"
-        f"<p>Exposure measurement domain: {payload.get('exposure_measurement_domain')}</p>"
-        f"<p>Calibration ROI: {payload.get('calibration_roi')}</p>"
-        f"<p>Target strategies: {payload.get('target_strategies')}</p>"
-        "</header>"
-        f"<section><h2>Shared Originals</h2><div class='grid'>{''.join(original_cards)}</div></section>"
+        f"<p>Clip count: {payload['clip_count']} | ROI: {payload.get('calibration_roi')}</p>"
+        "</div></header>"
+        f"<section class='report-section'><h2>Original</h2><p class='section-meta subtle'>Shared baseline renders for visual reference.</p><div class='grid cols-{original_columns}'>{''.join(original_cards)}</div></section>"
         f"<main>{''.join(strategy_sections)}</main>"
         "</body></html>"
     )

@@ -12,8 +12,8 @@ from r3dmatch.desktop_app import build_review_command, run_ui_self_check, scan_c
 from r3dmatch.identity import group_key_from_clip_id, rmd_name_for_clip_id
 from r3dmatch.matching import analyze_path, camera_group_from_clip_id, discover_clips, measure_frame_color_and_exposure
 from r3dmatch.models import GrayCardROI, SamplingRegion, SphereROI
-from r3dmatch.report import _build_strategy_payloads, _compute_image_difference_metrics, build_contact_sheet_report, preview_filename_for_clip_id, render_preview_frame
-from r3dmatch.rmd import render_rmd_xml, rmd_filename_for_clip_id, write_rmds_from_analysis
+from r3dmatch.report import _build_strategy_payloads, _compute_image_difference_metrics, _report_grid_columns, _report_tiles_per_page, build_contact_sheet_report, preview_filename_for_clip_id, render_contact_sheet_html, render_contact_sheet_pdf, render_preview_frame
+from r3dmatch.rmd import render_rmd_xml, rmd_filename_for_clip_id, write_rmd_for_clip_with_metadata, write_rmds_from_analysis
 from r3dmatch.ui import build_table_rows, load_review_bundle
 from r3dmatch.sdk import MockR3DBackend, RedSdkDecoder, resolve_backend
 from r3dmatch.sidecar import build_sidecar_payload, sidecar_filename_for_clip_id
@@ -25,7 +25,32 @@ from r3dmatch.workflow import approve_master_rmd, clear_preview_cache, review_ca
 runner = CliRunner()
 
 
+def _write_test_preview(path: Path, color: tuple[int, int, int] = (128, 128, 128)) -> None:
+    from PIL import Image
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (320, 200), color).save(path, format="JPEG")
+
+
 def _install_fake_redline(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_write_rmd_for_clip_with_metadata(clip_id: str, payload: dict, out_dir):  # type: ignore[no-untyped-def]
+        out_path = Path(out_dir) / f"{clip_id}.RMD"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        rmd_payload = {
+            "clip_id": clip_id,
+            "exposure": float(payload.get("rmd_mapping", {}).get("exposure", {}).get("final_offset_stops", 0.0) or 0.0),
+            "rgb_gains": payload.get("rmd_mapping", {}).get("color", {}).get("rgb_neutral_gains"),
+        }
+        out_path.write_text(json.dumps(rmd_payload), encoding="utf-8")
+        return out_path, {
+            "rmd_kind": "red_sdk",
+            "path": str(out_path),
+            "settings": {
+                "cdl_enabled": bool(rmd_payload["rgb_gains"]) and any(abs(float(value) - 1.0) > 1e-9 for value in rmd_payload["rgb_gains"]),
+                "exposure_adjust": rmd_payload["exposure"],
+            },
+        }
+
     def fake_run(command, capture_output, text, check):  # type: ignore[no-untyped-def]
         from PIL import Image
 
@@ -50,17 +75,39 @@ def _install_fake_redline(monkeypatch: pytest.MonkeyPatch) -> None:
             return types.SimpleNamespace(returncode=0, stdout=help_text, stderr="")
         if "--printMeta" in command:
             if "--loadRMD" in command:
-                return types.SimpleNamespace(returncode=0, stdout="RMD metadata loaded\n", stderr="")
+                rmd_path = Path(command[command.index("--loadRMD") + 1])
+                rmd_payload = json.loads(rmd_path.read_text(encoding="utf-8"))
+                return types.SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        "RMD metadata loaded\n"
+                        f"Exposure={rmd_payload.get('exposure', 0.0)}\n"
+                        f"RGBGains={rmd_payload.get('rgb_gains')}\n"
+                    ),
+                    stderr="",
+                )
             return types.SimpleNamespace(returncode=0, stdout="CLI metadata loaded\n", stderr="")
         output_path = Path(command[command.index("--o") + 1])
         generated_path = output_path.with_name(f"{output_path.name}.000000.jpg")
         generated_path.parent.mkdir(parents=True, exist_ok=True)
         exposure = 0.0
-        if "--exposure" in command:
+        red_gain = 1.0
+        green_gain = 1.0
+        blue_gain = 1.0
+        if "--loadRMD" in command:
+            rmd_path = Path(command[command.index("--loadRMD") + 1])
+            rmd_payload = json.loads(rmd_path.read_text(encoding="utf-8"))
+            exposure = float(rmd_payload.get("exposure", 0.0) or 0.0)
+            gains = rmd_payload.get("rgb_gains")
+            if gains:
+                red_gain = float(gains[0])
+                green_gain = float(gains[1])
+                blue_gain = float(gains[2])
+        elif "--exposure" in command:
             exposure = float(command[command.index("--exposure") + 1])
-        red_gain = float(command[command.index("--redGain") + 1]) if "--redGain" in command else 1.0
-        green_gain = float(command[command.index("--greenGain") + 1]) if "--greenGain" in command else 1.0
-        blue_gain = float(command[command.index("--blueGain") + 1]) if "--blueGain" in command else 1.0
+            red_gain = float(command[command.index("--redGain") + 1]) if "--redGain" in command else 1.0
+            green_gain = float(command[command.index("--greenGain") + 1]) if "--greenGain" in command else 1.0
+            blue_gain = float(command[command.index("--blueGain") + 1]) if "--blueGain" in command else 1.0
         base = np.zeros((18, 32, 3), dtype=np.uint8)
         base[..., 0] = np.clip(80.0 * (2.0**exposure) * red_gain, 0, 255)
         base[..., 1] = np.clip(90.0 * (2.0**exposure) * green_gain, 0, 255)
@@ -68,6 +115,7 @@ def _install_fake_redline(monkeypatch: pytest.MonkeyPatch) -> None:
         Image.fromarray(base, mode="RGB").save(generated_path, format="JPEG")
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
+    monkeypatch.setattr("r3dmatch.report.write_rmd_for_clip_with_metadata", fake_write_rmd_for_clip_with_metadata)
     monkeypatch.setattr("r3dmatch.report.subprocess.run", fake_run)
 
 
@@ -1338,16 +1386,19 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert strategy_command["look_metadata_path"].endswith("/review_rmd/strategies/median/both/G007_D060_0324M6_001.RMD")
     assert Path(strategy_command["look_metadata_path"]).exists()
     assert strategy_command["mode"] == "corrected"
-    assert strategy_command["rmd_metadata_probe"]["returncode"] == 0
-    assert "--loadRMD" not in strategy_command["command"]
-    assert "--exposure" in strategy_command["command"]
+    assert "--loadRMD" in strategy_command["command"]
+    assert "--exposure" not in strategy_command["command"]
     assert "--useMeta" not in strategy_command["command"]
     assert strategy_command["pixel_diff_from_baseline"] == pytest.approx(0.0)
     assert strategy_command["pixel_output_changed"] is False
     assert strategy_command["error"] is None
+    assert strategy_command["application_method"] == "rmd"
+    assert strategy_command["rmd_path"] == strategy_command["look_metadata_path"]
+    assert strategy_command["validation_method"] == "pixel_diff_from_baseline"
     assert strategy_command["as_shot_metadata_used"] is False
     assert strategy_command["explicit_transform_used"] is True
     assert strategy_command["explicit_correction_flags_used"] is False
+    assert strategy_command["correction_application_method"] == "rmd"
     assert "--lut" in strategy_command["command"]
     html = Path(payload["report_html"]).read_text(encoding="utf-8")
     assert "G007_D060_0324M6_001" in html
@@ -1359,7 +1410,164 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert payload["redline_capabilities"]["supports_lut"] is True
 
 
-def test_report_preview_falls_back_to_cli_flags_when_rmd_probe_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_report_layout_helpers_scale_columns_and_tiles() -> None:
+    assert _report_grid_columns(3) == 3
+    assert _report_grid_columns(12) == 4
+    assert _report_grid_columns(24) == 6
+    assert _report_grid_columns(41) == 8
+    assert _report_tiles_per_page(3) == 12
+    assert _report_tiles_per_page(4) == 12
+    assert _report_tiles_per_page(6) == 12
+    assert _report_tiles_per_page(8) == 16
+
+
+def test_write_rmd_for_clip_rejects_non_identity_cdl_when_disabled(tmp_path: Path) -> None:
+    clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
+    clip_path.write_bytes(b"")
+    sidecar_payload = {
+        "clip_id": "G007_D060_0324M6_001",
+        "source_path": str(clip_path),
+        "rmd_mapping": {
+            "exposure": {"final_offset_stops": 0.0},
+            "color": {
+                "cdl": {
+                    "slope": [1.2, 0.8, 1.0],
+                    "offset": [0.0, 0.0, 0.0],
+                    "power": [1.0, 1.0, 1.0],
+                    "saturation": 1.0,
+                },
+                "cdl_enabled": False,
+            },
+        },
+    }
+    with pytest.raises(ValueError, match="CDL payload is non-identity but cdl_enabled is false"):
+        write_rmd_for_clip_with_metadata("G007_D060_0324M6_001", sidecar_payload, tmp_path / "rmd-out")
+
+
+def test_render_contact_sheet_html_uses_logo_and_dynamic_grid(tmp_path: Path) -> None:
+    preview_dir = tmp_path / "previews"
+    original_path = preview_dir / "CAM001.original.review.run01.jpg"
+    corrected_path = preview_dir / "CAM001.both.review.median.run01.jpg"
+    _write_test_preview(original_path, (90, 90, 90))
+    _write_test_preview(corrected_path, (140, 120, 100))
+    payload = {
+        "target_type": "gray_sphere",
+        "processing_mode": "both",
+        "preview_transform": "REDLine IPP2 / BT.709 / BT.1886 / Medium / Medium",
+        "clip_count": 3,
+        "calibration_roi": {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+        "shared_originals": [
+            {
+                "clip_id": f"CAM{i:03d}",
+                "group_key": f"CAM{i:03d}",
+                "original_frame": str(original_path),
+            }
+            for i in range(1, 4)
+        ],
+        "strategies": [
+            {
+                "strategy_key": "median",
+                "strategy_label": "Median",
+                "reference_clip_id": None,
+                "target_log2_luminance": -2.8,
+                "calibration_roi": {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+                "clips": [
+                    {
+                        "clip_id": f"CAM{i:03d}",
+                        "group_key": f"CAM{i:03d}",
+                        "both_corrected": str(corrected_path),
+                        "metrics": {
+                            "exposure": {
+                                "final_offset_stops": 0.1 * i,
+                                "measured_log2_luminance_monitoring": -2.5,
+                            },
+                            "color": {"rgb_gains": [1.0, 1.0, 1.0]},
+                            "confidence": 0.95,
+                            "flags": [],
+                        },
+                    }
+                    for i in range(1, 4)
+                ],
+            }
+        ],
+    }
+    html = render_contact_sheet_html(payload)
+    assert "R3DMatch Review Contact Sheet" in html
+    assert "brand-logo" in html
+    assert "grid cols-3" in html
+    assert "../previews/CAM001.original.review.run01.jpg" in html
+    assert "../previews/CAM001.both.review.median.run01.jpg" in html
+    assert "font-size:30px" in html
+    assert "font-size:20px" in html
+
+
+def test_render_contact_sheet_pdf_paginates_large_camera_counts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    preview_dir = tmp_path / "previews"
+    shared_originals = []
+    strategy_clips = []
+    for index in range(40):
+        clip_id = f"CAM{index + 1:03d}"
+        original_path = preview_dir / f"{clip_id}.original.review.large.jpg"
+        corrected_path = preview_dir / f"{clip_id}.both.review.median.large.jpg"
+        _write_test_preview(original_path, (80 + (index % 10), 90, 100))
+        _write_test_preview(corrected_path, (110 + (index % 10), 120, 130))
+        shared_originals.append(
+            {
+                "clip_id": clip_id,
+                "group_key": clip_id,
+                "original_frame": str(original_path),
+                "confidence": 0.9,
+                "measured_log2_luminance_monitoring": -2.5,
+                "measured_log2_luminance_raw": -2.9,
+            }
+        )
+        strategy_clips.append(
+            {
+                "clip_id": clip_id,
+                "group_key": clip_id,
+                "both_corrected": str(corrected_path),
+                "metrics": {
+                    "exposure": {"final_offset_stops": 0.25, "measured_log2_luminance_raw": -2.9},
+                    "color": {"rgb_gains": [1.01, 0.99, 1.0]},
+                    "confidence": 0.91,
+                },
+            }
+        )
+    payload = {
+        "target_type": "gray_sphere",
+        "processing_mode": "both",
+        "preview_transform": "REDLine IPP2 / BT.709 / BT.1886 / Medium / Medium",
+        "calibration_roi": {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+        "target_strategies": ["median"],
+        "shared_originals": shared_originals,
+        "strategies": [
+            {
+                "strategy_key": "median",
+                "strategy_label": "Median",
+                "reference_clip_id": None,
+                "target_log2_luminance": -2.7,
+                "calibration_roi": {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+                "clips": strategy_clips,
+            }
+        ],
+    }
+    captured: dict[str, object] = {}
+    real_save = __import__("PIL.Image").Image.Image.save
+
+    def save_spy(self, fp, format=None, **kwargs):  # type: ignore[no-untyped-def]
+        captured["page_count"] = 1 + len(kwargs.get("append_images", []))
+        return real_save(self, fp, format=format, **kwargs)
+
+    monkeypatch.setattr("PIL.Image.Image.save", save_spy)
+    output_path = tmp_path / "report.pdf"
+    result = render_contact_sheet_pdf(payload, output_path=str(output_path), title="R3DMatch Review Contact Sheet")
+    assert result == str(output_path.resolve())
+    assert output_path.exists()
+    assert output_path.stat().st_size > 0
+    assert captured["page_count"] >= 4
+
+
+def test_report_preview_keeps_rmd_as_canonical_path_without_printmeta_validation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(command, capture_output, text, check):  # type: ignore[no-untyped-def]
         from PIL import Image
 
@@ -1382,17 +1590,29 @@ def test_report_preview_falls_back_to_cli_flags_when_rmd_probe_fails(tmp_path: P
                 ]
             )
             return types.SimpleNamespace(returncode=0, stdout=help_text, stderr="")
-        if "--printMeta" in command and "--loadRMD" in command:
-            return types.SimpleNamespace(returncode=1, stdout="", stderr="Error parsing RMD file")
         if "--printMeta" in command:
-            return types.SimpleNamespace(returncode=0, stdout="CLI metadata loaded\n", stderr="")
+            return types.SimpleNamespace(returncode=1, stdout="Baseline-looking metadata only\n", stderr="")
         output_path = Path(command[command.index("--o") + 1])
         generated_path = output_path.with_name(f"{output_path.name}.000000.jpg")
         generated_path.parent.mkdir(parents=True, exist_ok=True)
-        exposure = float(command[command.index("--exposure") + 1]) if "--exposure" in command else 0.0
-        red_gain = float(command[command.index("--redGain") + 1]) if "--redGain" in command else 1.0
-        green_gain = float(command[command.index("--greenGain") + 1]) if "--greenGain" in command else 1.0
-        blue_gain = float(command[command.index("--blueGain") + 1]) if "--blueGain" in command else 1.0
+        exposure = 0.0
+        red_gain = 1.0
+        green_gain = 1.0
+        blue_gain = 1.0
+        if "--loadRMD" in command:
+            rmd_path = Path(command[command.index("--loadRMD") + 1])
+            rmd_payload = json.loads(rmd_path.read_text(encoding="utf-8"))
+            exposure = float(rmd_payload.get("exposure", 0.0) or 0.0)
+            gains = rmd_payload.get("rgb_gains")
+            if gains:
+                red_gain = float(gains[0])
+                green_gain = float(gains[1])
+                blue_gain = float(gains[2])
+        elif "--exposure" in command:
+            exposure = float(command[command.index("--exposure") + 1])
+            red_gain = float(command[command.index("--redGain") + 1]) if "--redGain" in command else 1.0
+            green_gain = float(command[command.index("--greenGain") + 1]) if "--greenGain" in command else 1.0
+            blue_gain = float(command[command.index("--blueGain") + 1]) if "--blueGain" in command else 1.0
         image = np.zeros((18, 32, 3), dtype=np.uint8)
         image[..., 0] = np.clip(70.0 * (2.0**exposure) * red_gain, 0, 255)
         image[..., 1] = np.clip(80.0 * (2.0**exposure) * green_gain, 0, 255)
@@ -1401,6 +1621,22 @@ def test_report_preview_falls_back_to_cli_flags_when_rmd_probe_fails(tmp_path: P
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("r3dmatch.report.subprocess.run", fake_run)
+    def fake_write_rmd_for_clip_with_metadata(clip_id: str, payload: dict, out_dir):  # type: ignore[no-untyped-def]
+        out_path = Path(out_dir) / f"{clip_id}.RMD"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        gains = payload.get("rmd_mapping", {}).get("color", {}).get("rgb_neutral_gains")
+        out_path.write_text(
+            json.dumps(
+                {
+                    "exposure": float(payload.get("rmd_mapping", {}).get("exposure", {}).get("final_offset_stops", 0.0) or 0.0),
+                    "rgb_gains": gains,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return out_path, {"rmd_kind": "red_sdk", "settings": {"cdl_enabled": bool(gains)}}
+
+    monkeypatch.setattr("r3dmatch.report.write_rmd_for_clip_with_metadata", fake_write_rmd_for_clip_with_metadata)
     clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
     clip_path.write_bytes(b"")
     analyze_path(
@@ -1423,12 +1659,14 @@ def test_report_preview_falls_back_to_cli_flags_when_rmd_probe_fails(tmp_path: P
     preview_commands = json.loads((tmp_path / "analysis-out" / "previews" / "preview_commands.json").read_text(encoding="utf-8"))
     strategy_command = next(command for command in preview_commands["commands"] if command["variant"] == "both" and command["strategy"] == "median")
     assert strategy_command["mode"] == "corrected"
-    assert strategy_command["rmd_metadata_probe"]["returncode"] == 1
-    assert "--loadRMD" not in strategy_command["command"]
-    assert "--exposure" in strategy_command["command"]
+    assert "--loadRMD" in strategy_command["command"]
+    assert "--useRMD" in strategy_command["command"]
+    assert "--exposure" not in strategy_command["command"]
     assert "--useMeta" not in strategy_command["command"]
     assert strategy_command["pixel_diff_from_baseline"] == pytest.approx(0.0)
     assert strategy_command["error"] is None
+    assert strategy_command["application_method"] == "rmd"
+    assert strategy_command["validation_method"] == "pixel_diff_from_baseline"
 
 
 def test_render_preview_frame_corrected_image_differs_from_baseline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
