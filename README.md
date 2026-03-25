@@ -4,8 +4,6 @@ Mac-first internal prototype for automatic exposure matching of RED R3D clips pr
 
 ## Prototype status
 
-This standalone project is intentionally separate from `R3DSplat`.
-
 Current prototype capabilities:
 
 - defines a dedicated `r3dmatch` CLI
