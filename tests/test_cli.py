@@ -1,6 +1,9 @@
 import json
+import os
+import subprocess
 import types
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pytest
@@ -9,7 +12,8 @@ from typer.testing import CliRunner
 from r3dmatch.calibration import build_array_calibration_from_analysis, calibrate_card_path, calibrate_color_path, calibrate_exposure_path, calibrate_sphere_path, center_crop_roi, derive_array_group_key, detect_gray_card_roi, load_calibration, load_card_roi_file, load_color_calibration, load_exposure_calibration, measure_card_from_roi, measure_color_region, measure_sphere_from_roi, solve_neutral_gains
 from r3dmatch.cli import app
 from r3dmatch.desktop_app import build_review_command, run_ui_self_check, scan_calibration_sources
-from r3dmatch.identity import group_key_from_clip_id, rmd_name_for_clip_id
+from r3dmatch.execution import CANCEL_FILE_ENV, CancellationError, run_cancellable_subprocess
+from r3dmatch.identity import group_key_from_clip_id, rmd_name_for_clip_id, subset_key_from_clip_id
 from r3dmatch.matching import analyze_path, camera_group_from_clip_id, discover_clips, measure_frame_color_and_exposure
 from r3dmatch.models import GrayCardROI, SamplingRegion, SphereROI
 from r3dmatch.report import _build_strategy_payloads, _compute_image_difference_metrics, _report_grid_columns, _report_tiles_per_page, build_contact_sheet_report, preview_filename_for_clip_id, render_contact_sheet_html, render_contact_sheet_pdf, render_preview_frame
@@ -19,8 +23,8 @@ from r3dmatch.sdk import MockR3DBackend, RedSdkDecoder, resolve_backend
 from r3dmatch.sidecar import build_sidecar_payload, sidecar_filename_for_clip_id
 from r3dmatch.transcode import build_redline_command, build_redline_command_variants, write_transcode_plan
 from r3dmatch.validation import validate_pipeline
-from r3dmatch.web_app import build_review_web_command, create_app, scan_sources
-from r3dmatch.workflow import approve_master_rmd, clear_preview_cache, review_calibration
+from r3dmatch.web_app import _normalize_subset_form, _resolve_selected_clip_ids, _subset_selection_ui, build_review_web_command, create_app, scan_sources
+from r3dmatch.workflow import approve_master_rmd, clear_preview_cache, resolve_review_output_dir, review_calibration, validate_review_run_contract
 
 runner = CliRunner()
 
@@ -32,26 +36,43 @@ def _write_test_preview(path: Path, color: tuple[int, int, int] = (128, 128, 128
     Image.new("RGB", (320, 200), color).save(path, format="JPEG")
 
 
+def _apply_fake_cdl(image: np.ndarray, cdl: Optional[dict], *, enabled: bool) -> np.ndarray:
+    if not enabled or not isinstance(cdl, dict):
+        return image
+    slope = np.asarray(cdl.get("slope", [1.0, 1.0, 1.0]), dtype=np.float32)
+    offset = np.asarray(cdl.get("offset", [0.0, 0.0, 0.0]), dtype=np.float32)
+    power = np.asarray(cdl.get("power", [1.0, 1.0, 1.0]), dtype=np.float32)
+    saturation = float(cdl.get("saturation", 1.0))
+    corrected = np.clip(image * slope.reshape((1, 1, 3)) + offset.reshape((1, 1, 3)), 0.0, 1.0)
+    corrected = np.power(np.clip(corrected, 0.0, 1.0), power.reshape((1, 1, 3)))
+    luma = corrected[..., 0] * 0.2126 + corrected[..., 1] * 0.7152 + corrected[..., 2] * 0.0722
+    return np.clip(luma[..., None] + (corrected - luma[..., None]) * saturation, 0.0, 1.0)
+
+
 def _install_fake_redline(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_write_rmd_for_clip_with_metadata(clip_id: str, payload: dict, out_dir):  # type: ignore[no-untyped-def]
         out_path = Path(out_dir) / f"{clip_id}.RMD"
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        cdl_payload = payload.get("rmd_mapping", {}).get("color", {}).get("cdl")
+        cdl_enabled = bool(payload.get("rmd_mapping", {}).get("color", {}).get("cdl_enabled"))
         rmd_payload = {
             "clip_id": clip_id,
             "exposure": float(payload.get("rmd_mapping", {}).get("exposure", {}).get("final_offset_stops", 0.0) or 0.0),
             "rgb_gains": payload.get("rmd_mapping", {}).get("color", {}).get("rgb_neutral_gains"),
+            "cdl": cdl_payload,
+            "cdl_enabled": cdl_enabled,
         }
         out_path.write_text(json.dumps(rmd_payload), encoding="utf-8")
         return out_path, {
             "rmd_kind": "red_sdk",
             "path": str(out_path),
             "settings": {
-                "cdl_enabled": bool(rmd_payload["rgb_gains"]) and any(abs(float(value) - 1.0) > 1e-9 for value in rmd_payload["rgb_gains"]),
+                "cdl_enabled": cdl_enabled,
                 "exposure_adjust": rmd_payload["exposure"],
             },
         }
 
-    def fake_run(command, capture_output, text, check):  # type: ignore[no-untyped-def]
+    def fake_run(command, cwd=None, env=None, text=True):  # type: ignore[no-untyped-def]
         from PIL import Image
 
         if "--help" in command:
@@ -108,15 +129,17 @@ def _install_fake_redline(monkeypatch: pytest.MonkeyPatch) -> None:
             red_gain = float(command[command.index("--redGain") + 1]) if "--redGain" in command else 1.0
             green_gain = float(command[command.index("--greenGain") + 1]) if "--greenGain" in command else 1.0
             blue_gain = float(command[command.index("--blueGain") + 1]) if "--blueGain" in command else 1.0
-        base = np.zeros((18, 32, 3), dtype=np.uint8)
-        base[..., 0] = np.clip(80.0 * (2.0**exposure) * red_gain, 0, 255)
-        base[..., 1] = np.clip(90.0 * (2.0**exposure) * green_gain, 0, 255)
-        base[..., 2] = np.clip(100.0 * (2.0**exposure) * blue_gain, 0, 255)
-        Image.fromarray(base, mode="RGB").save(generated_path, format="JPEG")
+        base = np.zeros((18, 32, 3), dtype=np.float32)
+        base[..., 0] = np.clip((80.0 / 255.0) * (2.0**exposure) * red_gain, 0, 1)
+        base[..., 1] = np.clip((90.0 / 255.0) * (2.0**exposure) * green_gain, 0, 1)
+        base[..., 2] = np.clip((100.0 / 255.0) * (2.0**exposure) * blue_gain, 0, 1)
+        if "--loadRMD" in command:
+            base = _apply_fake_cdl(base, rmd_payload.get("cdl"), enabled=bool(rmd_payload.get("cdl_enabled")))
+        Image.fromarray(np.clip(base * 255.0, 0, 255).astype(np.uint8), mode="RGB").save(generated_path, format="JPEG")
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("r3dmatch.report.write_rmd_for_clip_with_metadata", fake_write_rmd_for_clip_with_metadata)
-    monkeypatch.setattr("r3dmatch.report.subprocess.run", fake_run)
+    monkeypatch.setattr("r3dmatch.report.run_cancellable_subprocess", fake_run)
 
 
 def test_backend_selection_defaults_to_mock() -> None:
@@ -283,21 +306,75 @@ def test_web_scan_sources_discovers_rdc_media(tmp_path: Path) -> None:
     assert summary["warning"] is None
 
 
+def test_web_scan_sources_discovers_subset_groups(tmp_path: Path) -> None:
+    for name in [
+        "G007_A063_0325EV_001.R3D",
+        "G007_B063_0325EV_001.R3D",
+        "G007_A064_0325EV_001.R3D",
+    ]:
+        (tmp_path / name).write_bytes(b"")
+    summary = scan_sources(str(tmp_path))
+    assert summary["clip_count"] == 3
+    assert [group["group_id"] for group in summary["clip_groups"]] == ["063", "064"]
+    assert summary["clip_groups"][0]["clip_count"] == 2
+    assert subset_key_from_clip_id("G007_B063_0325EV_001") == "063"
+    assert summary["clip_records"][0]["camera_label"] == "A"
+
+
+def test_web_subset_selection_ui_switches_between_group_and_manual_modes(tmp_path: Path) -> None:
+    for name in [
+        "G007_A063_0325EV_001.R3D",
+        "G007_B063_0325EV_001.R3D",
+        "G007_A064_0325EV_001.R3D",
+    ]:
+        (tmp_path / name).write_bytes(b"")
+    scan = scan_sources(str(tmp_path))
+
+    group_form = {
+        "selected_clip_ids": ["G007_A064_0325EV_001"],
+        "selected_clip_groups": ["063"],
+        "advanced_clip_selection": False,
+    }
+    _normalize_subset_form(group_form, scan)
+    assert group_form["selected_clip_ids"] == []
+    assert _resolve_selected_clip_ids(group_form, scan) == ["G007_A063_0325EV_001", "G007_B063_0325EV_001"]
+    group_ui = _subset_selection_ui(group_form, scan)
+    assert group_ui["summary_text"] == "2 clips selected from group 063"
+    assert group_ui["mode_label"] == "Group Mode"
+
+    manual_form = {
+        "selected_clip_ids": ["G007_A064_0325EV_001"],
+        "selected_clip_groups": ["063"],
+        "advanced_clip_selection": True,
+    }
+    _normalize_subset_form(manual_form, scan)
+    assert manual_form["selected_clip_groups"] == []
+    assert _resolve_selected_clip_ids(manual_form, scan) == ["G007_A064_0325EV_001"]
+    manual_ui = _subset_selection_ui(manual_form, scan)
+    assert manual_ui["summary_text"] == "Manual selection: 1 clip"
+    assert manual_ui["group_panel_note"] == "Clip groups are disabled while manual clip selection is active."
+
+
 def test_build_review_web_command_uses_tcsh_and_preview_options() -> None:
     command = build_review_web_command(
         "/Users/sfouasnon/Desktop/R3DMatch",
         {
             "input_path": "/tmp/in",
             "output_path": "/tmp/out",
+            "run_label": "",
             "backend": "red",
             "target_type": "gray_sphere",
             "processing_mode": "both",
+            "matching_domain": "scene",
             "roi_x": "0.1",
             "roi_y": "0.2",
             "roi_w": "0.3",
             "roi_h": "0.4",
+            "selected_clip_ids": [],
+            "selected_clip_groups": [],
             "target_strategies": ["median", "manual"],
             "reference_clip_id": "G007_D060_0324M6_001",
+            "hero_clip_id": "",
             "preview_mode": "monitoring",
             "preview_lut": "/tmp/show.cube",
         },
@@ -369,6 +446,85 @@ def test_web_app_routes_and_validation(tmp_path: Path, monkeypatch: pytest.Monke
     assert started["kwargs"]["preview_mode"] == "calibration"
 
 
+def test_web_app_subset_panel_defaults_to_group_control_and_read_only_clips(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    app = create_app()
+    client = app.test_client()
+    for name in [
+        "G007_A063_0325EV_001.R3D",
+        "G007_B063_0325EV_001.R3D",
+        "G007_A064_0325EV_001.R3D",
+    ]:
+        (tmp_path / name).write_bytes(b"")
+
+    response = client.post(
+        "/scan",
+        data={
+            "input_path": str(tmp_path),
+            "output_path": str(tmp_path / "out"),
+            "selected_clip_groups": ["063"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert b"Clip Groups" in response.data
+    assert b"Selected Clips" in response.data
+    assert b"Enable advanced clip selection" in response.data
+    assert b"2 clips selected from group 063" in response.data
+    assert b"Read-only preview of the current group-driven subset" in response.data
+    assert b"class=\"clip-selector clip-checkbox\"" not in response.data
+
+
+def test_web_app_advanced_clip_mode_disables_group_submission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    started: dict[str, object] = {}
+
+    def fake_start(state, command, output_path, **kwargs):  # type: ignore[no-untyped-def]
+        started["command"] = command
+        started["output_path"] = output_path
+        started["kwargs"] = kwargs
+        state.task.command = " ".join(command)
+        state.task.output_path = output_path
+        state.task.status = "running"
+        state.task.logs = ["started\n"]
+
+    monkeypatch.setattr("r3dmatch.web_app._start_command_task", fake_start)
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    app = create_app()
+    client = app.test_client()
+    for name in [
+        "G007_A063_0325EV_001.R3D",
+        "G007_B063_0325EV_001.R3D",
+        "G007_A064_0325EV_001.R3D",
+    ]:
+        (tmp_path / name).write_bytes(b"")
+
+    response = client.post(
+        "/run-review",
+        data={
+            "input_path": str(tmp_path),
+            "output_path": str(tmp_path / "out"),
+            "backend": "mock",
+            "target_type": "gray_sphere",
+            "processing_mode": "both",
+            "target_strategies": ["median"],
+            "preview_mode": "calibration",
+            "roi_mode": "center",
+            "advanced_clip_selection": "1",
+            "selected_clip_groups": ["063"],
+            "selected_clip_ids": ["G007_A064_0325EV_001"],
+        },
+    )
+
+    assert response.status_code == 200
+    joined = " ".join(started["command"])
+    assert "--clip-group" not in joined
+    assert "--clip-id G007_A064_0325EV_001" in joined
+    assert started["kwargs"]["clip_count"] == 1
+    assert b"Manual selection: 1 clip" in response.data
+    assert b"Manual clip selection active" in response.data
+    assert b"class=\"clip-selector clip-checkbox\"" in response.data
+
+
 def test_web_app_status_progress_and_completion_links(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
     app = create_app()
@@ -380,6 +536,10 @@ def test_web_app_status_progress_and_completion_links(tmp_path: Path, monkeypatc
     pdf_path.write_bytes(b"%PDF-1.4\n")
     html_path = report_dir / "contact_sheet.html"
     html_path.write_text("<html></html>", encoding="utf-8")
+    (report_dir / "review_validation.json").write_text(
+        json.dumps({"status": "success", "errors": [], "warnings": [], "preview_reference_count": 0, "preview_existing_count": 0}),
+        encoding="utf-8",
+    )
     state = app.config["UI_STATE"]
     state.task.command = "python3 -m r3dmatch.cli review-calibration /tmp/in --out /tmp/out"
     state.task.output_path = str(out_dir)
@@ -397,6 +557,446 @@ def test_web_app_status_progress_and_completion_links(tmp_path: Path, monkeypatc
     assert payload["preview_html_url"]
     assert payload["output_folder"] == str(out_dir)
     assert payload["progress_percent"] == 100
+    assert payload["can_cancel"] is False
+
+
+def test_web_app_status_prefers_live_process_over_stale_completed_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    app = create_app()
+    client = app.test_client()
+    out_dir = tmp_path / "out"
+    (out_dir / "analysis").mkdir(parents=True)
+    state = app.config["UI_STATE"]
+
+    class FakeProcess:
+        def poll(self):  # type: ignore[no-untyped-def]
+            return None
+
+    state.task.command = "python3 -m r3dmatch.cli review-calibration /tmp/in --out /tmp/out"
+    state.task.output_path = str(out_dir)
+    state.task.status = "completed"
+    state.task.returncode = 0
+    state.task.stage = "Scanning sources"
+    state.task.stage_index = 0
+    state.task.items_completed = 0
+    state.task.items_total = 12
+    state.task.clip_count = 12
+    state.task.process = FakeProcess()  # type: ignore[assignment]
+    response = client.get("/status")
+    payload = response.get_json()
+    assert payload["status"] == "running"
+    assert payload["stage"] == "Scanning sources"
+    assert payload["can_cancel"] is True
+    assert payload["process_alive"] is True
+
+
+def test_web_app_status_marks_finishing_and_stalled_with_live_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    app = create_app()
+    client = app.test_client()
+    out_dir = tmp_path / "out"
+    report_dir = out_dir / "report"
+    previews_dir = out_dir / "previews"
+    analysis_dir = out_dir / "analysis"
+    report_dir.mkdir(parents=True)
+    previews_dir.mkdir(parents=True)
+    analysis_dir.mkdir(parents=True)
+    for index in range(12):
+        (analysis_dir / f"G007_A{index:03d}_0325EV_001.analysis.json").write_text("{}", encoding="utf-8")
+    for index in range(48):
+        (previews_dir / f"preview_{index:03d}.jpg").write_bytes(b"jpg")
+    state = app.config["UI_STATE"]
+
+    class FakeProcess:
+        def poll(self):  # type: ignore[no-untyped-def]
+            return None
+
+    state.task.command = "python3 -m r3dmatch.cli review-calibration /tmp/in --out /tmp/out"
+    state.task.output_path = str(out_dir)
+    state.task.status = "running"
+    state.task.clip_count = 12
+    state.task.items_total = 48
+    state.task.strategies_text = "median"
+    state.task.process = FakeProcess()  # type: ignore[assignment]
+    state.task.started_at = 100.0
+    state.task.last_output_at = 100.0
+    state.task.last_progress_at = 100.0
+
+    monkeypatch.setattr("r3dmatch.web_app.time.time", lambda: 105.0)
+    finishing_payload = client.get("/status").get_json()
+    assert finishing_payload["status"] == "finishing"
+    assert finishing_payload["stage"] == "Building report"
+    assert finishing_payload["can_cancel"] is True
+
+    monkeypatch.setattr("r3dmatch.web_app.time.time", lambda: 130.0)
+    stalled_payload = client.get("/status").get_json()
+    assert stalled_payload["status"] == "stalled"
+    assert stalled_payload["stage"] == "Building report"
+    assert stalled_payload["can_cancel"] is True
+
+
+def test_validate_review_run_contract_success(tmp_path: Path) -> None:
+    report_dir = tmp_path / "report"
+    previews_dir = tmp_path / "previews"
+    report_dir.mkdir(parents=True)
+    previews_dir.mkdir(parents=True)
+    baseline = previews_dir / "G007_B057_0324YT_001.original.review.jpg"
+    corrected = previews_dir / "G007_B057_0324YT_001.exposure.review.median.jpg"
+    _write_test_preview(baseline)
+    _write_test_preview(corrected, color=(140, 140, 140))
+    (tmp_path / "summary.json").write_text("{}", encoding="utf-8")
+    (previews_dir / "preview_commands.json").write_text("{}", encoding="utf-8")
+    payload = {
+        "clip_count": 1,
+        "shared_originals": [{"clip_id": "G007_B057_0324YT_001", "original_frame": str(baseline)}],
+        "strategies": [
+            {
+                "strategy": "median",
+                "clips": [
+                    {
+                        "clip_id": "G007_B057_0324YT_001",
+                        "original_frame": str(baseline),
+                        "exposure_corrected": str(corrected),
+                        "color_corrected": str(baseline),
+                        "both_corrected": str(corrected),
+                        "preview_variants": {
+                            "original": str(baseline),
+                            "exposure": str(corrected),
+                            "color": str(baseline),
+                            "both": str(corrected),
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+    (report_dir / "contact_sheet.json").write_text(json.dumps(payload), encoding="utf-8")
+    (report_dir / "review_manifest.json").write_text("{}", encoding="utf-8")
+    (report_dir / "review_package.json").write_text("{}", encoding="utf-8")
+    (report_dir / "contact_sheet.html").write_text("<html></html>", encoding="utf-8")
+
+    validation = validate_review_run_contract(str(tmp_path))
+
+    assert validation["status"] == "success"
+    assert validation["preview_reference_count"] == 2
+    assert validation["preview_existing_count"] == 2
+    assert Path(validation["validation_path"]).exists()
+
+
+def test_validate_review_run_contract_fails_when_required_preview_missing(tmp_path: Path) -> None:
+    report_dir = tmp_path / "report"
+    previews_dir = tmp_path / "previews"
+    report_dir.mkdir(parents=True)
+    previews_dir.mkdir(parents=True)
+    existing = previews_dir / "G007_B057_0324YT_001.original.review.jpg"
+    missing = previews_dir / "G007_B057_0324YT_001.exposure.review.median.jpg"
+    _write_test_preview(existing)
+    (tmp_path / "summary.json").write_text("{}", encoding="utf-8")
+    (previews_dir / "preview_commands.json").write_text("{}", encoding="utf-8")
+    payload = {
+        "clip_count": 1,
+        "shared_originals": [{"clip_id": "G007_B057_0324YT_001", "original_frame": str(existing)}],
+        "strategies": [
+            {
+                "strategy": "median",
+                "clips": [
+                    {
+                        "clip_id": "G007_B057_0324YT_001",
+                        "original_frame": str(existing),
+                        "exposure_corrected": str(missing),
+                        "preview_variants": {"original": str(existing), "exposure": str(missing)},
+                    }
+                ],
+            }
+        ],
+    }
+    (report_dir / "contact_sheet.json").write_text(json.dumps(payload), encoding="utf-8")
+    (report_dir / "review_manifest.json").write_text("{}", encoding="utf-8")
+    (report_dir / "review_package.json").write_text("{}", encoding="utf-8")
+
+    validation = validate_review_run_contract(str(tmp_path))
+
+    assert validation["status"] == "failed"
+    assert validation["preview_reference_count"] == 2
+    assert validation["preview_existing_count"] == 1
+    assert validation["missing_preview_paths"] == [str(missing)]
+    assert any("Missing 1 preview image" in error for error in validation["errors"])
+    assert any("No human-readable report artifact was produced" in error for error in validation["errors"])
+
+
+def test_validate_review_run_contract_fails_when_preview_is_unreadable(tmp_path: Path) -> None:
+    report_dir = tmp_path / "report"
+    previews_dir = tmp_path / "previews"
+    report_dir.mkdir(parents=True)
+    previews_dir.mkdir(parents=True)
+    unreadable = previews_dir / "G007_B057_0324YT_001.original.review.jpg"
+    unreadable.write_bytes(b"not-a-real-jpeg")
+    (tmp_path / "summary.json").write_text("{}", encoding="utf-8")
+    (previews_dir / "preview_commands.json").write_text("{}", encoding="utf-8")
+    payload = {
+        "clip_count": 1,
+        "shared_originals": [{"clip_id": "G007_B057_0324YT_001", "original_frame": str(unreadable)}],
+        "strategies": [],
+    }
+    (report_dir / "contact_sheet.json").write_text(json.dumps(payload), encoding="utf-8")
+    (report_dir / "review_manifest.json").write_text("{}", encoding="utf-8")
+    (report_dir / "review_package.json").write_text("{}", encoding="utf-8")
+    (report_dir / "contact_sheet.html").write_text("<html></html>", encoding="utf-8")
+
+    validation = validate_review_run_contract(str(tmp_path))
+
+    assert validation["status"] == "failed"
+    assert validation["unreadable_preview_paths"] == [str(unreadable)]
+    assert any("unreadable preview image" in error for error in validation["errors"])
+
+
+def test_web_app_status_reports_review_validation_failure_detail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    app = create_app()
+    client = app.test_client()
+    out_dir = tmp_path / "out"
+    report_dir = out_dir / "report"
+    report_dir.mkdir(parents=True)
+    (report_dir / "review_validation.json").write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "errors": ["Missing required artifact: review_manifest_json"],
+                "warnings": [],
+                "preview_reference_count": 48,
+                "preview_existing_count": 48,
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = app.config["UI_STATE"]
+    state.task.command = "python3 -m r3dmatch.cli review-calibration /tmp/in --out /tmp/out"
+    state.task.output_path = str(out_dir)
+    state.task.status = "running"
+    state.task.returncode = 0
+    state.task.stage = "Building report"
+    state.task.stage_index = 4
+    state.task.items_completed = 48
+    state.task.items_total = 48
+
+    payload = client.get("/status").get_json()
+
+    assert payload["status"] == "failed"
+    assert payload["stage"] == "Finalization failed"
+    assert payload["status_detail"] == "Missing required artifact: review_manifest_json"
+    assert payload["validation_status"] == "failed"
+    assert payload["can_cancel"] is False
+
+
+def test_web_app_status_fails_when_review_validation_exists_only_in_wrong_location(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    app = create_app()
+    client = app.test_client()
+    out_dir = tmp_path / "out"
+    report_dir = out_dir / "report"
+    report_dir.mkdir(parents=True)
+    (out_dir / "review_validation.json").write_text(
+        json.dumps({"status": "success", "errors": [], "warnings": []}),
+        encoding="utf-8",
+    )
+    state = app.config["UI_STATE"]
+    state.task.command = "python3 -m r3dmatch.cli review-calibration /tmp/in --out /tmp/out"
+    state.task.output_path = str(out_dir)
+    state.task.status = "running"
+    state.task.returncode = 0
+    state.task.stage = "Building report"
+    state.task.stage_index = 4
+
+    payload = client.get("/status").get_json()
+
+    assert payload["status"] == "failed"
+    assert payload["stage"] == "Finalization failed"
+    assert payload["status_detail"] == "Fresh review_validation.json was not produced for this run."
+    assert payload["validation_status"] is None
+
+
+def test_web_app_status_ignores_stale_review_artifacts_from_previous_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    app = create_app()
+    client = app.test_client()
+    out_dir = tmp_path / "out"
+    report_dir = out_dir / "report"
+    previews_dir = out_dir / "previews"
+    analysis_dir = out_dir / "analysis"
+    report_dir.mkdir(parents=True)
+    previews_dir.mkdir(parents=True)
+    analysis_dir.mkdir(parents=True)
+    old_time = 100.0
+    for path in [
+        report_dir / "contact_sheet.html",
+        report_dir / "preview_contact_sheet.pdf",
+        report_dir / "review_validation.json",
+        analysis_dir / "G007_A063_032563_001.analysis.json",
+        previews_dir / "G007_A063_032563_001.original.review.jpg",
+    ]:
+        path.write_text("{}" if path.suffix == ".json" else "stale", encoding="utf-8")
+        os.utime(path, (old_time, old_time))
+    (report_dir / "review_validation.json").write_text(json.dumps({"status": "success", "errors": [], "warnings": []}), encoding="utf-8")
+    os.utime(report_dir / "review_validation.json", (old_time, old_time))
+
+    state = app.config["UI_STATE"]
+
+    class FakeProcess:
+        def poll(self):  # type: ignore[no-untyped-def]
+            return None
+
+    state.task.command = "python3 -m r3dmatch.cli review-calibration /tmp/in --out /tmp/out"
+    state.task.output_path = str(out_dir)
+    state.task.status = "running"
+    state.task.returncode = None
+    state.task.stage = "Scanning sources"
+    state.task.stage_index = 0
+    state.task.items_completed = 0
+    state.task.items_total = 12
+    state.task.clip_count = 12
+    state.task.process = FakeProcess()  # type: ignore[assignment]
+    state.task.started_at = 200.0
+    state.task.last_output_at = 200.0
+    state.task.last_progress_at = 200.0
+
+    monkeypatch.setattr("r3dmatch.web_app.time.time", lambda: 205.0)
+    payload = client.get("/status").get_json()
+
+    assert payload["status"] == "running"
+    assert payload["stage"] == "Scanning sources"
+    assert payload["report_ready"] is False
+    assert payload["preview_html_path"] is None
+    assert payload["preview_pdf_path"] is None
+    assert payload["validation_status"] is None
+    assert payload["items_completed"] == 0
+
+
+def test_web_app_cancel_run_marks_task_and_requests_termination(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    terminated: list[object] = []
+
+    def fake_terminate(process, *, grace_period=2.0):  # type: ignore[no-untyped-def]
+        terminated.append(process)
+
+    monkeypatch.setattr("r3dmatch.web_app.terminate_process_group", fake_terminate)
+    app = create_app()
+    client = app.test_client()
+    state = app.config["UI_STATE"]
+    cancel_file = tmp_path / "cancel.flag"
+    class FakeProcess:
+        def poll(self):  # type: ignore[no-untyped-def]
+            return None
+
+    fake_process = FakeProcess()
+    state.task.status = "running"
+    state.task.command = "python3 -m r3dmatch.cli review-calibration /tmp/in --out /tmp/out"
+    state.task.cancel_file_path = str(cancel_file)
+    state.task.process = fake_process  # type: ignore[assignment]
+
+    response = client.post("/cancel-run")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["ok"] is True
+    assert cancel_file.exists()
+    assert state.task.cancellation_requested is True
+    assert state.task.status == "cancelling"
+    assert terminated == [fake_process]
+
+
+def test_run_cancellable_subprocess_raises_and_terminates_when_cancelled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cancel_file = tmp_path / "cancel.flag"
+    monkeypatch.setenv(CANCEL_FILE_ENV, str(cancel_file))
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.returncode = None
+            self.terminated = False
+            self.communicate_calls = 0
+
+        def communicate(self, timeout=None):  # type: ignore[no-untyped-def]
+            self.communicate_calls += 1
+            if self.communicate_calls == 1:
+                cancel_file.write_text("cancel\n", encoding="utf-8")
+                raise subprocess.TimeoutExpired(cmd=["fake"], timeout=timeout)
+            self.returncode = -15
+            return ("", "")
+
+        def poll(self):  # type: ignore[no-untyped-def]
+            return self.returncode
+
+        def terminate(self):  # type: ignore[no-untyped-def]
+            self.terminated = True
+            self.returncode = -15
+
+        def kill(self):  # type: ignore[no-untyped-def]
+            self.returncode = -9
+
+    fake_process = FakeProcess()
+    monkeypatch.setattr("r3dmatch.execution.subprocess.Popen", lambda *args, **kwargs: fake_process)
+
+    with pytest.raises(CancellationError):
+        run_cancellable_subprocess(["/bin/sleep", "5"])
+
+    assert fake_process.terminated is True
+
+
+def test_web_review_command_includes_hero_clip() -> None:
+    command = build_review_web_command(
+        "/Users/sfouasnon/Desktop/R3DMatch",
+        {
+            "input_path": "/tmp/in",
+            "output_path": "/tmp/out",
+            "run_label": "",
+            "backend": "red",
+            "target_type": "gray_sphere",
+            "processing_mode": "both",
+            "matching_domain": "scene",
+            "roi_x": "0.2",
+            "roi_y": "0.2",
+            "roi_w": "0.4",
+            "roi_h": "0.4",
+            "selected_clip_ids": [],
+            "selected_clip_groups": [],
+            "target_strategies": ["hero-camera"],
+            "reference_clip_id": "",
+            "hero_clip_id": "G007_D060_0324M6_001",
+            "preview_mode": "calibration",
+            "preview_lut": "",
+        },
+    )
+    joined = " ".join(command)
+    assert "--target-strategy hero-camera" in joined
+    assert "--hero-clip-id G007_D060_0324M6_001" in joined
+
+
+def test_web_review_command_includes_subset_and_matching_domain() -> None:
+    command = build_review_web_command(
+        "/Users/sfouasnon/Desktop/R3DMatch",
+        {
+            "input_path": "/tmp/in",
+            "output_path": "/tmp/out",
+            "run_label": "clip63_even",
+            "backend": "red",
+            "target_type": "gray_sphere",
+            "processing_mode": "both",
+            "matching_domain": "perceptual",
+            "roi_x": "0.2",
+            "roi_y": "0.2",
+            "roi_w": "0.4",
+            "roi_h": "0.4",
+            "selected_clip_ids": ["G007_B057_0324YT_063", "G007_C057_0324YT_063"],
+            "selected_clip_groups": ["063"],
+            "target_strategies": ["median"],
+            "reference_clip_id": "",
+            "hero_clip_id": "",
+            "preview_mode": "calibration",
+            "preview_lut": "",
+        },
+    )
+    joined = " ".join(command)
+    assert "--run-label clip63_even" in joined
+    assert "--matching-domain perceptual" in joined
+    assert "--clip-group 063" in joined
+    assert "--clip-id G007_B057_0324YT_063" in joined
 
 
 def test_web_app_scan_page_shows_roi_mode_and_preview_placeholder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -411,6 +1011,7 @@ def test_web_app_scan_page_shows_roi_mode_and_preview_placeholder(tmp_path: Path
     assert b"center" in response.data
     assert b"full" in response.data
     assert b"manual" in response.data
+    assert b"Hero Camera" in response.data
 
 
 def test_ui_self_check_reports_visible_sections() -> None:
@@ -498,6 +1099,56 @@ def test_target_strategies_use_monitoring_domain_values() -> None:
     assert strategies[0]["target_log2_luminance"] == pytest.approx(-1.5)
     assert strategies[1]["reference_clip_id"] == "G007_B057_0324YT_001"
     assert strategies[1]["target_log2_luminance"] == pytest.approx(-3.0)
+
+
+def test_hero_camera_strategy_matches_to_selected_hero() -> None:
+    records = [
+        {
+            "clip_id": "G007_B057_0324YT_001",
+            "group_key": "array_batch",
+            "source_path": "/tmp/G007_B057_0324YT_001.R3D",
+            "confidence": 0.9,
+            "flags": [],
+            "diagnostics": {
+                "measured_log2_luminance_monitoring": -2.8,
+                "measured_log2_luminance_raw": -2.2,
+                "measured_rgb_chromaticity": [0.35, 0.33, 0.32],
+                "saturation_fraction": 0.08,
+                "calibration_roi": {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+                "calibration_measurement_mode": "shared_roi",
+                "exposure_measurement_domain": "monitoring",
+            },
+        },
+        {
+            "clip_id": "G007_C057_0324YT_001",
+            "group_key": "array_batch",
+            "source_path": "/tmp/G007_C057_0324YT_001.R3D",
+            "confidence": 0.9,
+            "flags": [],
+            "diagnostics": {
+                "measured_log2_luminance_monitoring": -1.4,
+                "measured_log2_luminance_raw": -1.1,
+                "measured_rgb_chromaticity": [0.31, 0.33, 0.36],
+                "saturation_fraction": 0.16,
+                "calibration_roi": {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+                "calibration_measurement_mode": "shared_roi",
+                "exposure_measurement_domain": "monitoring",
+            },
+        },
+    ]
+    strategies = _build_strategy_payloads(records, target_strategies=["hero-camera"], reference_clip_id=None, hero_clip_id="G007_C057_0324YT_001")
+    hero_strategy = strategies[0]
+    assert hero_strategy["hero_clip_id"] == "G007_C057_0324YT_001"
+    assert "hero camera" in hero_strategy["strategy_summary"].lower()
+    hero_clip = next(item for item in hero_strategy["clips"] if item["clip_id"] == "G007_C057_0324YT_001")
+    other_clip = next(item for item in hero_strategy["clips"] if item["clip_id"] == "G007_B057_0324YT_001")
+    assert hero_clip["is_hero_camera"] is True
+    assert hero_clip["exposure_offset_stops"] == pytest.approx(0.0)
+    assert hero_clip["rgb_gains"] == pytest.approx([1.0, 1.0, 1.0])
+    assert hero_clip["color_lggs"]["gain"] == pytest.approx([1.0, 1.0, 1.0])
+    assert hero_clip["color_cdl"]["saturation"] == pytest.approx(1.0)
+    assert other_clip["exposure_offset_stops"] == pytest.approx(1.4)
+    assert other_clip["color_cdl"]["saturation"] != pytest.approx(1.0)
 
 
 def test_analyze_path_writes_manifest_and_sidecar(tmp_path: Path) -> None:
@@ -1119,6 +1770,46 @@ def test_cli_analyze_and_transcode(tmp_path: Path) -> None:
     assert transcode_result.exit_code == 0
 
 
+def test_analyze_path_filters_selected_clip_ids_and_groups(tmp_path: Path) -> None:
+    for name in [
+        "G007_A063_0325EV_001.R3D",
+        "G007_B063_0325EV_001.R3D",
+        "G007_A064_0325EV_001.R3D",
+    ]:
+        (tmp_path / name).write_bytes(b"")
+    by_clip_id = analyze_path(
+        str(tmp_path),
+        out_dir=str(tmp_path / "analysis-clip"),
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+        selected_clip_ids=["G007_A063_0325EV_001"],
+    )
+    assert by_clip_id["clip_count"] == 1
+    assert by_clip_id["selected_clip_ids"] == ["G007_A063_0325EV_001"]
+    by_group = analyze_path(
+        str(tmp_path),
+        out_dir=str(tmp_path / "analysis-group"),
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+        selected_clip_groups=["063"],
+    )
+    assert by_group["clip_count"] == 2
+    assert by_group["selected_clip_groups"] == ["063"]
+    analysis_files = sorted((tmp_path / "analysis-group" / "analysis").glob("*.analysis.json"))
+    assert [path.stem.replace(".analysis", "") for path in analysis_files] == [
+        "G007_A063_0325EV_001",
+        "G007_B063_0325EV_001",
+    ]
+
+
 def test_cli_write_rmd(tmp_path: Path) -> None:
     clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
     clip_path.write_bytes(b"")
@@ -1182,11 +1873,67 @@ def test_cli_review_and_approve_workflow(tmp_path: Path, monkeypatch: pytest.Mon
     assert review_manifest["target_strategies"] == ["median", "brightest_valid"]
     approve_result = runner.invoke(app, ["approve-master-rmd", str(review_dir), "--target-strategy", "brightest-valid"])
     assert approve_result.exit_code == 0
-    assert (review_dir / "approval" / "Master_RMD" / "G007_D060_0324M6_001.RMD").exists()
+    assert (review_dir / "approval" / "MasterRMD" / "G007_D060.RMD").exists()
+    assert (review_dir / "approval" / "batch" / "manifest.json").exists()
     assert (review_dir / "approval" / "approval_manifest.json").exists()
     assert (review_dir / "approval" / "calibration_report.pdf").exists()
     approval_manifest = json.loads((review_dir / "approval" / "approval_manifest.json").read_text(encoding="utf-8"))
     assert approval_manifest["selected_target_strategy"] == "brightest_valid"
+    assert approval_manifest["master_rmd_folder_name"] == "MasterRMD"
+
+
+def test_review_calibration_subset_run_label_and_matching_domain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
+    for name in [
+        "G007_A063_0325EV_001.R3D",
+        "G007_B063_0325EV_001.R3D",
+        "G007_A064_0325EV_001.R3D",
+        "G007_B064_0325EV_001.R3D",
+    ]:
+        (tmp_path / name).write_bytes(b"")
+    parent_out = tmp_path / "runs"
+    payload = review_calibration(
+        str(tmp_path),
+        out_dir=str(parent_out),
+        run_label="clip63_even",
+        target_type="gray_sphere",
+        processing_mode="both",
+        mode="scene",
+        matching_domain="perceptual",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        exposure_calibration_path=None,
+        color_calibration_path=None,
+        calibration_mode=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+        calibration_roi={"x": 0.25, "y": 0.25, "w": 0.5, "h": 0.5},
+        selected_clip_ids=None,
+        selected_clip_groups=["063"],
+        clip_subset_file=None,
+        target_strategies=["median", "hero-camera"],
+        reference_clip_id=None,
+        hero_clip_id="G007_A063_0325EV_001",
+    )
+    run_root = parent_out / "clip63_even"
+    assert payload["analysis_dir"] == str(run_root)
+    assert payload["run_label"] == "clip63_even"
+    assert payload["matching_domain"] == "perceptual"
+    report_json = json.loads((run_root / "report" / "contact_sheet.json").read_text(encoding="utf-8"))
+    assert report_json["run_label"] == "clip63_even"
+    assert report_json["matching_domain"] == "perceptual"
+    assert report_json["matching_domain_label"] == "Perceptual (IPP2 / BT.709 / BT.1886)"
+    assert report_json["measurement_preview_transform"] == "REDLine IPP2 / BT.709 / BT.1886 / Medium / Medium"
+    assert report_json["selected_clip_groups"] == ["063"]
+    assert report_json["clip_count"] == 2
+    assert {clip["clip_id"] for clip in report_json["shared_originals"]} == {
+        "G007_A063_0325EV_001",
+        "G007_B063_0325EV_001",
+    }
+    hero_strategy = next(item for item in report_json["strategies"] if item["strategy_key"] == "hero_camera")
+    hero_clip = next(item for item in hero_strategy["clips"] if item["clip_id"] == "G007_A063_0325EV_001")
+    assert hero_clip["metrics"]["exposure"]["final_offset_stops"] == pytest.approx(0.0)
 
 
 def test_build_redline_command_includes_sidecar(tmp_path: Path) -> None:
@@ -1367,7 +2114,7 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert report_json["clips"][0]["clip_id"] == "G007_D060_0324M6_001"
     assert report_json["target_type"] == "gray_sphere"
     assert report_json["preview_transform"]
-    assert report_json["exposure_measurement_domain"] == "monitoring"
+    assert report_json["exposure_measurement_domain"] == "scene"
     assert report_json["preview_mode"] == "monitoring"
     assert report_json["preview_settings"]["lut_path"].endswith("show.cube")
     assert report_json["measurement_preview_settings"]["preview_mode"] == "calibration"
@@ -1382,25 +2129,27 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert Path(report_json["clips"][0]["original_frame"]).exists()
     assert not list((tmp_path / "analysis-out" / "previews").glob("*.000000.jpg"))
     preview_commands = json.loads((tmp_path / "analysis-out" / "previews" / "preview_commands.json").read_text(encoding="utf-8"))
+    exposure_command = next(command for command in preview_commands["commands"] if command["variant"] == "exposure" and command["strategy"] == "median")
+    assert exposure_command["application_method"] == "rmd"
+    assert exposure_command["look_metadata_path"].endswith("/review_rmd/strategies/median/exposure/G007_D060_0324M6_001.RMD")
+    assert Path(exposure_command["look_metadata_path"]).exists()
+    assert "--loadRMD" in exposure_command["command"]
+    assert "--exposure" not in exposure_command["command"]
+    assert "--useMeta" not in exposure_command["command"]
+    assert "--lut" in exposure_command["command"]
     strategy_command = next(command for command in preview_commands["commands"] if command["variant"] == "both" and command["strategy"] == "median")
-    assert strategy_command["look_metadata_path"].endswith("/review_rmd/strategies/median/both/G007_D060_0324M6_001.RMD")
-    assert Path(strategy_command["look_metadata_path"]).exists()
-    assert strategy_command["mode"] == "corrected"
-    assert "--loadRMD" in strategy_command["command"]
-    assert "--exposure" not in strategy_command["command"]
-    assert "--useMeta" not in strategy_command["command"]
-    assert strategy_command["pixel_diff_from_baseline"] == pytest.approx(0.0)
-    assert strategy_command["pixel_output_changed"] is False
-    assert strategy_command["error"] is None
-    assert strategy_command["application_method"] == "rmd"
-    assert strategy_command["rmd_path"] == strategy_command["look_metadata_path"]
-    assert strategy_command["validation_method"] == "pixel_diff_from_baseline"
-    assert strategy_command["as_shot_metadata_used"] is False
-    assert strategy_command["explicit_transform_used"] is True
-    assert strategy_command["explicit_correction_flags_used"] is False
+    assert strategy_command["application_method"] == "preview_color_disabled"
+    assert strategy_command["preview_color_applied"] is False
+    assert strategy_command["output_reused_from_variant"] == "exposure"
+    assert strategy_command["validation_method"] == "preview_fallback_copy"
     assert strategy_command["correction_application_method"] == "rmd"
-    assert "--lut" in strategy_command["command"]
+    assert strategy_command["command"] is None
+    assert strategy_command["rmd_path"].endswith("/review_rmd/strategies/median/both/G007_D060_0324M6_001.RMD")
+    assert Path(strategy_command["rmd_path"]).exists()
+    assert report_json["color_preview_enabled"] is False
+    assert report_json["color_preview_status"] == "disabled_unverified"
     html = Path(payload["report_html"]).read_text(encoding="utf-8")
+    assert "Color preview" in html
     assert "G007_D060_0324M6_001" in html
     assert "../previews/G007_D060_0324M6_001.original.review.analysis-out.jpg" in html
     assert "both.review.median.analysis-out.jpg" in html
@@ -1408,6 +2157,43 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert payload["preview_settings"]["lut_path"].endswith("show.cube")
     assert payload["measurement_preview_settings"]["preview_mode"] == "calibration"
     assert payload["redline_capabilities"]["supports_lut"] is True
+
+
+def test_build_contact_sheet_report_cancellation_removes_partial_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
+    clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
+    clip_path.write_bytes(b"")
+    analyze_path(
+        str(tmp_path),
+        out_dir=str(tmp_path / "analysis-out"),
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+    )
+
+    def fake_render_contact_sheet_pdf(payload, *, output_path, title, timestamp_label=None):  # type: ignore[no-untyped-def]
+        output = Path(output_path)
+        output.write_bytes(b"%PDF-1.4 partial\n")
+        raise CancellationError("Run cancelled during report build.")
+
+    monkeypatch.setattr("r3dmatch.report.render_contact_sheet_pdf", fake_render_contact_sheet_pdf)
+
+    with pytest.raises(CancellationError):
+        build_contact_sheet_report(
+            str(tmp_path / "analysis-out"),
+            out_dir=str(tmp_path / "report"),
+            target_type="gray_sphere",
+            processing_mode="both",
+            target_strategies=["median"],
+        )
+
+    assert not (tmp_path / "report" / "contact_sheet.json").exists()
+    assert not (tmp_path / "report" / "contact_sheet.html").exists()
+    assert not (tmp_path / "report" / "preview_contact_sheet.pdf").exists()
+    assert not (tmp_path / "report" / "review_manifest.json").exists()
 
 
 def test_report_layout_helpers_scale_columns_and_tiles() -> None:
@@ -1568,7 +2354,7 @@ def test_render_contact_sheet_pdf_paginates_large_camera_counts(tmp_path: Path, 
 
 
 def test_report_preview_keeps_rmd_as_canonical_path_without_printmeta_validation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_run(command, capture_output, text, check):  # type: ignore[no-untyped-def]
+    def fake_run(command, cwd=None, env=None, text=True):  # type: ignore[no-untyped-def]
         from PIL import Image
 
         if "--help" in command:
@@ -1620,7 +2406,7 @@ def test_report_preview_keeps_rmd_as_canonical_path_without_printmeta_validation
         Image.fromarray(image, mode="RGB").save(generated_path, format="JPEG")
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr("r3dmatch.report.subprocess.run", fake_run)
+    monkeypatch.setattr("r3dmatch.report.run_cancellable_subprocess", fake_run)
     def fake_write_rmd_for_clip_with_metadata(clip_id: str, payload: dict, out_dir):  # type: ignore[no-untyped-def]
         out_path = Path(out_dir) / f"{clip_id}.RMD"
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1657,16 +2443,16 @@ def test_report_preview_keeps_rmd_as_canonical_path_without_printmeta_validation
         target_strategies=["median"],
     )
     preview_commands = json.loads((tmp_path / "analysis-out" / "previews" / "preview_commands.json").read_text(encoding="utf-8"))
+    exposure_command = next(command for command in preview_commands["commands"] if command["variant"] == "exposure" and command["strategy"] == "median")
+    assert "--loadRMD" in exposure_command["command"]
+    assert "--useRMD" in exposure_command["command"]
     strategy_command = next(command for command in preview_commands["commands"] if command["variant"] == "both" and command["strategy"] == "median")
     assert strategy_command["mode"] == "corrected"
-    assert "--loadRMD" in strategy_command["command"]
-    assert "--useRMD" in strategy_command["command"]
-    assert "--exposure" not in strategy_command["command"]
-    assert "--useMeta" not in strategy_command["command"]
+    assert strategy_command["command"] is None
     assert strategy_command["pixel_diff_from_baseline"] == pytest.approx(0.0)
     assert strategy_command["error"] is None
-    assert strategy_command["application_method"] == "rmd"
-    assert strategy_command["validation_method"] == "pixel_diff_from_baseline"
+    assert strategy_command["application_method"] == "preview_color_disabled"
+    assert strategy_command["validation_method"] == "preview_fallback_copy"
 
 
 def test_render_preview_frame_corrected_image_differs_from_baseline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1754,6 +2540,52 @@ def test_multi_strategy_review_includes_manual_reference_and_shared_originals(tm
     assert report_json["shared_originals"][0]["original_frame"].endswith(".original.review.analysis-out.jpg")
 
 
+def test_hero_camera_review_marks_identity_correction_and_cdl_payload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
+    clip_a = tmp_path / "G007_B057_0324YT_001.R3D"
+    clip_b = tmp_path / "G007_C057_0324YT_001.R3D"
+    clip_a.write_bytes(b"")
+    clip_b.write_bytes(b"")
+    analyze_path(
+        str(tmp_path),
+        out_dir=str(tmp_path / "analysis-out"),
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+        calibration_roi={"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+    )
+    payload = build_contact_sheet_report(
+        str(tmp_path / "analysis-out"),
+        out_dir=str(tmp_path / "report"),
+        target_type="gray_sphere",
+        processing_mode="both",
+        target_strategies=["hero-camera"],
+        hero_clip_id="G007_B057_0324YT_001",
+    )
+    report_json = json.loads(Path(payload["report_json"]).read_text(encoding="utf-8"))
+    hero_strategy = report_json["strategies"][0]
+    assert hero_strategy["strategy_key"] == "hero_camera"
+    assert hero_strategy["hero_clip_id"] == "G007_B057_0324YT_001"
+    hero_clip = next(item for item in hero_strategy["clips"] if item["clip_id"] == "G007_B057_0324YT_001")
+    assert hero_clip["is_hero_camera"] is True
+    assert hero_clip["metrics"]["exposure"]["final_offset_stops"] == pytest.approx(0.0)
+    assert hero_clip["metrics"]["color"]["cdl"] is not None
+    assert hero_clip["metrics"]["color"]["lift_gamma_gain_saturation"]["gain"] == pytest.approx([1.0, 1.0, 1.0])
+    preview_commands = json.loads((tmp_path / "analysis-out" / "previews" / "preview_commands.json").read_text(encoding="utf-8"))
+    hero_both = next(command for command in preview_commands["commands"] if command["variant"] == "both" and command["strategy"] == "hero_camera" and command["clip_id"] == "G007_B057_0324YT_001")
+    assert hero_both["application_method"] == "preview_color_disabled"
+    assert hero_both["preview_color_applied"] is False
+    assert hero_both["cdl_enabled"] is False
+    assert Path(hero_both["rmd_path"]).exists()
+    html = Path(payload["report_html"]).read_text(encoding="utf-8")
+    assert "Hero Camera" in html
+    assert "Hero clip: G007_B057_0324YT_001" in html
+    assert "hero-badge" in html
+
+
 def test_approve_master_rmd_uses_selected_manual_strategy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_redline(monkeypatch)
     clip_a = tmp_path / "G007_B057_0324YT_001.R3D"
@@ -1783,7 +2615,92 @@ def test_approve_master_rmd_uses_selected_manual_strategy(tmp_path: Path, monkey
     manifest = json.loads(Path(payload["approval_manifest"]).read_text(encoding="utf-8"))
     assert manifest["selected_target_strategy"] == "manual"
     assert manifest["selected_reference_clip_id"] == "G007_B057_0324YT_001"
-    assert (Path(payload["master_rmd_dir"]) / "G007_B057_0324YT_001.RMD").exists()
+    assert (Path(payload["master_rmd_dir"]) / "G007_B057.RMD").exists()
+    assert Path(manifest["batch_manifest"]).exists()
+
+
+def test_approve_master_rmd_uses_selected_hero_strategy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
+    clip_a = tmp_path / "G007_B057_0324YT_001.R3D"
+    clip_b = tmp_path / "G007_C057_0324YT_001.R3D"
+    clip_a.write_bytes(b"")
+    clip_b.write_bytes(b"")
+    review_dir = tmp_path / "review-hero"
+    review_calibration(
+        str(tmp_path),
+        out_dir=str(review_dir),
+        target_type="gray_sphere",
+        processing_mode="both",
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        exposure_calibration_path=None,
+        color_calibration_path=None,
+        calibration_mode=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+        calibration_roi={"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+        target_strategies=["hero-camera"],
+        reference_clip_id=None,
+        hero_clip_id="G007_B057_0324YT_001",
+    )
+    payload = approve_master_rmd(str(review_dir), target_strategy="hero-camera", hero_clip_id="G007_B057_0324YT_001")
+    manifest = json.loads(Path(payload["approval_manifest"]).read_text(encoding="utf-8"))
+    assert manifest["selected_target_strategy"] == "hero_camera"
+    assert manifest["selected_hero_clip_id"] == "G007_B057_0324YT_001"
+    hero_mapping = next(item for item in manifest["clip_mappings"] if item["clip_id"] == "G007_B057_0324YT_001")
+    assert hero_mapping["correction_key"] == "G007_B057"
+    assert hero_mapping["is_hero_camera"] is True
+    assert hero_mapping["exposure_correction_stops"] == pytest.approx(0.0)
+    assert Path(hero_mapping["master_rmd_path"]).name == "G007_B057.RMD"
+
+
+def test_approval_manifest_preserves_subset_run_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
+    for name in [
+        "G007_B057_0324YT_065.R3D",
+        "G007_C057_0324YT_065.R3D",
+    ]:
+        (tmp_path / name).write_bytes(b"")
+    parent_out = tmp_path / "subset-parent"
+    review_payload = review_calibration(
+        str(tmp_path),
+        out_dir=str(parent_out),
+        run_label="clip65_red_contamination",
+        target_type="gray_sphere",
+        processing_mode="both",
+        mode="scene",
+        matching_domain="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        exposure_calibration_path=None,
+        color_calibration_path=None,
+        calibration_mode=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+        calibration_roi={"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+        selected_clip_ids=["G007_B057_0324YT_065", "G007_C057_0324YT_065"],
+        selected_clip_groups=None,
+        clip_subset_file=None,
+        target_strategies=["hero-camera"],
+        reference_clip_id=None,
+        hero_clip_id="G007_B057_0324YT_065",
+    )
+    approval_payload = approve_master_rmd(
+        review_payload["analysis_dir"],
+        target_strategy="hero-camera",
+        hero_clip_id="G007_B057_0324YT_065",
+    )
+    approval_manifest = json.loads(Path(approval_payload["approval_manifest"]).read_text(encoding="utf-8"))
+    batch_manifest = json.loads(Path(approval_payload["batch_manifest"]).read_text(encoding="utf-8"))
+    assert approval_manifest["run_label"] == "clip65_red_contamination"
+    assert approval_manifest["matching_domain"] == "scene"
+    assert approval_manifest["selected_clip_ids"] == ["G007_B057_0324YT_065", "G007_C057_0324YT_065"]
+    assert batch_manifest["run_label"] == "clip65_red_contamination"
+    assert batch_manifest["matching_domain"] == "scene"
+    assert all(entry["approved_run_label"] == "clip65_red_contamination" for entry in batch_manifest["entries"])
 
 
 def test_clear_preview_cache_only_removes_review_artifacts(tmp_path: Path) -> None:
@@ -1801,7 +2718,7 @@ def test_clear_preview_cache_only_removes_review_artifacts(tmp_path: Path) -> No
     (report_dir / "contact_sheet.json").write_text("{}", encoding="utf-8")
     (report_dir / "contact_sheet.html").write_text("{}", encoding="utf-8")
     (approval_dir / "calibration_report.pdf").write_text("pdf", encoding="utf-8")
-    (approval_dir / "Master_RMD").mkdir()
+    (approval_dir / "MasterRMD").mkdir()
     payload = clear_preview_cache(str(analysis_root))
     assert payload["removed_count"] >= 3
     assert not (previews / "G007_D060_0324M6_001.original.review.jpg").exists()
@@ -1809,7 +2726,7 @@ def test_clear_preview_cache_only_removes_review_artifacts(tmp_path: Path) -> No
     assert (analysis_root / "summary.json").exists()
     assert (analysis_root / "array_calibration.json").exists()
     assert (approval_dir / "calibration_report.pdf").exists()
-    assert (approval_dir / "Master_RMD").exists()
+    assert (approval_dir / "MasterRMD").exists()
 
 
 def test_approve_master_rmd_creates_manifest_pdf_and_exact_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1821,7 +2738,56 @@ def test_approve_master_rmd_creates_manifest_pdf_and_exact_names(tmp_path: Path,
     payload = approve_master_rmd(str(tmp_path / "analysis-out"))
     assert Path(payload["approval_manifest"]).exists()
     assert Path(payload["calibration_report_pdf"]).exists()
-    assert (Path(payload["master_rmd_dir"]) / "G007_D060_0324M6_001.RMD").exists()
+    assert (Path(payload["master_rmd_dir"]) / "G007_D060.RMD").exists()
+    assert Path(payload["batch_manifest"]).exists()
+    assert Path(payload["batch_scripts"]["sh"]).exists()
+    assert Path(payload["batch_scripts"]["tcsh"]).exists()
+    assert Path(payload["batch_readme"]).exists()
+
+
+def test_approval_export_writes_batch_mapping_and_portable_scripts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
+    clip_a = tmp_path / "G007_B057_0324YT_001.R3D"
+    clip_b = tmp_path / "G007_C057_0324GR_001.R3D"
+    clip_c = tmp_path / "G007_D060_0324M6_001.R3D"
+    clip_a.write_bytes(b"")
+    clip_b.write_bytes(b"")
+    clip_c.write_bytes(b"")
+    review_dir = tmp_path / "review-export"
+    review_calibration(
+        str(tmp_path),
+        out_dir=str(review_dir),
+        target_type="gray_sphere",
+        processing_mode="both",
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        exposure_calibration_path=None,
+        color_calibration_path=None,
+        calibration_mode=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+        calibration_roi={"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+        target_strategies=["median"],
+        reference_clip_id=None,
+    )
+    payload = approve_master_rmd(str(review_dir))
+    approval_manifest = json.loads(Path(payload["approval_manifest"]).read_text(encoding="utf-8"))
+    batch_manifest = json.loads(Path(payload["batch_manifest"]).read_text(encoding="utf-8"))
+    assert approval_manifest["correction_key_model"]["name"] == "group_key_from_clip_id"
+    assert Path(payload["master_rmd_dir"]).name == "MasterRMD"
+    assert any(item["correction_key"] == "G007_B057" for item in approval_manifest["master_rmd_exports"])
+    first_entry = next(item for item in batch_manifest["entries"] if item["clip_id"] == "G007_B057_0324YT_001")
+    assert first_entry["master_rmd_name"] == "G007_B057.RMD"
+    assert first_entry["correction_key"] == "G007_B057"
+    assert first_entry["approved_strategy"] == "median"
+    sh_script = Path(payload["batch_scripts"]["sh"]).read_text(encoding="utf-8")
+    tcsh_script = Path(payload["batch_scripts"]["tcsh"]).read_text(encoding="utf-8")
+    assert "SOURCE_ROOT" in sh_script
+    assert "--loadRMD \"$MASTER_RMD_DIR/G007_B057.RMD\" --useRMD 1" in sh_script
+    assert "correction_key: G007_B057" in sh_script
+    assert "--loadRMD \"$MASTER_RMD_DIR/G007_B057.RMD\" --useRMD 1" in tcsh_script
 
 
 def test_load_review_bundle_for_ui(tmp_path: Path) -> None:

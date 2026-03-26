@@ -6,12 +6,13 @@ from typing import Optional
 import typer
 
 from .calibration import calibrate_card_path, calibrate_color_path, calibrate_exposure_path, calibrate_sphere_path
+from .execution import CancellationError
 from .matching import analyze_path
-from .report import build_contact_sheet_report
+from .report import build_contact_sheet_report, normalize_target_strategy_name
 from .rmd import write_rmds_from_analysis
 from .transcode import write_transcode_plan
 from .validation import validate_pipeline
-from .workflow import approve_master_rmd, clear_preview_cache, review_calibration
+from .workflow import approve_master_rmd, clear_preview_cache, normalize_matching_domain, review_calibration
 
 app = typer.Typer(no_args_is_help=True, help="R3DMatch CLI")
 
@@ -230,9 +231,11 @@ def report_contact_sheet_command(
 def review_calibration_command(
     input_path: str,
     out: str = typer.Option(..., "--out", help="Review output directory"),
+    run_label: Optional[str] = typer.Option(None, "--run-label", help="Optional subset/run label; creates a nested run folder under --out when provided"),
     target_type: str = typer.Option(..., "--target-type", help="Target type: gray_card, gray_sphere, or color_chart"),
     processing_mode: str = typer.Option("both", "--processing-mode", help="Processing mode: exposure, color, or both"),
     mode: str = typer.Option("scene", "--mode", help="Matching mode: scene or view"),
+    matching_domain: str = typer.Option("scene", "--matching-domain", help="Matching domain: scene or perceptual"),
     lut: Optional[str] = typer.Option(None, "--lut", help="Optional LUT override (.cube)"),
     calibration: Optional[str] = typer.Option(None, "--calibration", help="Optional legacy/single exposure calibration JSON"),
     exposure_calibration: Optional[str] = typer.Option(None, "--exposure-calibration", help="Optional exposure calibration JSON"),
@@ -245,8 +248,12 @@ def review_calibration_command(
     roi_y: Optional[float] = typer.Option(None, "--roi-y", help="Shared normalized ROI Y origin"),
     roi_w: Optional[float] = typer.Option(None, "--roi-w", help="Shared normalized ROI width"),
     roi_h: Optional[float] = typer.Option(None, "--roi-h", help="Shared normalized ROI height"),
-    target_strategy: list[str] = typer.Option(["median"], "--target-strategy", help="Target strategy: median, brightest-valid, or manual; repeat to compare multiple"),
+    clip_id: list[str] = typer.Option([], "--clip-id", help="Repeat to include only specific clip IDs in this calibration subset"),
+    clip_group: list[str] = typer.Option([], "--clip-group", help="Repeat to include all clips from a discovered subset group (for example take number)"),
+    clip_subset_file: Optional[str] = typer.Option(None, "--clip-subset-file", help="Optional JSON file describing clip_ids / clip_groups / run_label for this subset run"),
+    target_strategy: list[str] = typer.Option(["median"], "--target-strategy", help="Target strategy: median, brightest-valid, manual, or hero-camera; repeat to compare multiple"),
     reference_clip_id: Optional[str] = typer.Option(None, "--reference-clip-id", help="Reference clip ID for manual target strategy"),
+    hero_clip_id: Optional[str] = typer.Option(None, "--hero-clip-id", help="Hero clip ID for hero-camera target strategy"),
     preview_mode: str = typer.Option("calibration", "--preview-mode", help="Preview mode: calibration or monitoring"),
     preview_output_space: Optional[str] = typer.Option(None, "--preview-output-space", help="Preview output color space"),
     preview_output_gamma: Optional[str] = typer.Option(None, "--preview-output-gamma", help="Preview output gamma"),
@@ -264,12 +271,23 @@ def review_calibration_command(
         if float(roi_x) + float(roi_w) > 1.0 or float(roi_y) + float(roi_h) > 1.0:
             raise typer.BadParameter("Normalized ROI must remain inside the image bounds")
         calibration_roi = {"x": float(roi_x), "y": float(roi_y), "w": float(roi_w), "h": float(roi_h)}
+    normalized_strategies = [normalize_target_strategy_name(item) for item in target_strategy]
+    if "manual" in normalized_strategies and not reference_clip_id:
+        raise typer.BadParameter("manual target strategy requires --reference-clip-id")
+    if "hero_camera" in normalized_strategies and not hero_clip_id:
+        raise typer.BadParameter("hero-camera target strategy requires --hero-clip-id")
+    try:
+        resolved_matching_domain = normalize_matching_domain(matching_domain)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     payload = review_calibration(
         input_path,
         out_dir=out,
+        run_label=run_label,
         target_type=target_type,
         processing_mode=processing_mode,
         mode=mode,
+        matching_domain=resolved_matching_domain,
         backend=backend,
         lut_override=lut,
         calibration_path=calibration,
@@ -279,8 +297,12 @@ def review_calibration_command(
         sample_count=sample_count,
         sampling_strategy=sampling_strategy,
         calibration_roi=calibration_roi,
+        selected_clip_ids=clip_id,
+        selected_clip_groups=clip_group,
+        clip_subset_file=clip_subset_file,
         target_strategies=target_strategy,
         reference_clip_id=reference_clip_id,
+        hero_clip_id=hero_clip_id,
         preview_mode=preview_mode,
         preview_output_space=preview_output_space,
         preview_output_gamma=preview_output_gamma,
@@ -295,10 +317,22 @@ def review_calibration_command(
 def approve_master_rmd_command(
     analysis_dir: str,
     out: Optional[str] = typer.Option(None, "--out", help="Approval output directory; defaults to <analysis_dir>/approval"),
-    target_strategy: str = typer.Option("median", "--target-strategy", help="Chosen target strategy: median, brightest-valid, or manual"),
+    target_strategy: str = typer.Option("median", "--target-strategy", help="Chosen target strategy: median, brightest-valid, manual, or hero-camera"),
     reference_clip_id: Optional[str] = typer.Option(None, "--reference-clip-id", help="Reference clip ID for manual target strategy"),
+    hero_clip_id: Optional[str] = typer.Option(None, "--hero-clip-id", help="Hero clip ID for hero-camera target strategy"),
 ) -> None:
-    payload = approve_master_rmd(analysis_dir, out_dir=out, target_strategy=target_strategy, reference_clip_id=reference_clip_id)
+    normalized_strategy = normalize_target_strategy_name(target_strategy)
+    if normalized_strategy == "manual" and not reference_clip_id:
+        raise typer.BadParameter("manual target strategy requires --reference-clip-id")
+    if normalized_strategy == "hero_camera" and not hero_clip_id:
+        raise typer.BadParameter("hero-camera target strategy requires --hero-clip-id")
+    payload = approve_master_rmd(
+        analysis_dir,
+        out_dir=out,
+        target_strategy=target_strategy,
+        reference_clip_id=reference_clip_id,
+        hero_clip_id=hero_clip_id,
+    )
     typer.echo(str(payload))
 
 
@@ -319,7 +353,14 @@ def desktop_ui_command() -> None:
 
 
 def main() -> None:
-    app()
+    try:
+        app()
+    except CancellationError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=130) from exc
+    except RuntimeError as exc:
+        typer.echo(f"ERROR: {exc}")
+        raise typer.Exit(code=1) from exc
 
 
 if __name__ == "__main__":

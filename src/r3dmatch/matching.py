@@ -8,7 +8,8 @@ from typing import Dict, Iterable, List, Optional
 import numpy as np
 
 from .calibration import build_array_calibration_from_analysis, calibration_baselines, color_calibration_gains, derive_array_group_key, extract_center_region, load_color_calibration, load_exposure_calibration, percentile_clip, write_array_calibration_json
-from .identity import legacy_camera_group_from_clip_id
+from .execution import raise_if_cancelled
+from .identity import clip_id_from_path, legacy_camera_group_from_clip_id, subset_key_from_clip_id
 from .luts import CubeLut, apply_lut, load_cube_lut
 from .models import ClipResult, FrameStat, MonitoringContext, SamplePlan
 from .sdk import resolve_backend
@@ -30,10 +31,30 @@ def analyze_path(
     sampling_strategy: str = "uniform",
     clamp_stops: float = 3.0,
     calibration_roi: Optional[Dict[str, float]] = None,
+    selected_clip_ids: Optional[List[str]] = None,
+    selected_clip_groups: Optional[List[str]] = None,
 ) -> Dict[str, object]:
+    raise_if_cancelled("Run cancelled before source discovery.")
     clips = discover_clips(input_path)
     if not clips:
         raise ValueError(f"No .R3D clips found under {input_path}")
+
+    requested_clip_ids = {str(item).strip() for item in (selected_clip_ids or []) if str(item).strip()}
+    requested_clip_groups = {str(item).strip() for item in (selected_clip_groups or []) if str(item).strip()}
+    if requested_clip_ids or requested_clip_groups:
+        filtered = []
+        for clip in clips:
+            raise_if_cancelled("Run cancelled while filtering selected clips.")
+            clip_id = clip_id_from_path(str(clip))
+            subset_key = subset_key_from_clip_id(clip_id)
+            if clip_id in requested_clip_ids or subset_key in requested_clip_groups:
+                filtered.append(clip)
+        clips = filtered
+        if not clips:
+            raise ValueError(
+                "No .R3D clips matched the requested subset selection "
+                f"(clip_ids={sorted(requested_clip_ids)}, clip_groups={sorted(requested_clip_groups)})"
+            )
 
     out_root = Path(out_dir).expanduser().resolve()
     analysis_dir = out_root / "analysis"
@@ -41,18 +62,20 @@ def analyze_path(
     analysis_dir.mkdir(parents=True, exist_ok=True)
     sidecar_dir.mkdir(parents=True, exist_ok=True)
 
-    provisional = [
-        analyze_clip(
-            str(clip),
-            mode=mode,
-            backend=backend,
-            lut_override=lut_override,
-            sample_count=sample_count,
-            sampling_strategy=sampling_strategy,
-            calibration_roi=calibration_roi,
+    provisional: list[ClipResult] = []
+    for clip in clips:
+        raise_if_cancelled("Run cancelled during clip measurement.")
+        provisional.append(
+            analyze_clip(
+                str(clip),
+                mode=mode,
+                backend=backend,
+                lut_override=lut_override,
+                sample_count=sample_count,
+                sampling_strategy=sampling_strategy,
+                calibration_roi=calibration_roi,
+            )
         )
-        for clip in clips
-    ]
 
     should_use_array_batch = calibration_mode == "array-gray-sphere" or (
         Path(input_path).expanduser().resolve().is_dir()
@@ -108,6 +131,7 @@ def analyze_path(
 
     final_results: list[ClipResult] = []
     for item in provisional:
+        raise_if_cancelled("Run cancelled while writing analysis outputs.")
         derived_group_baseline = group_baselines[item.group_key]
         clip_trim = 0.0
         applied_baseline = calibrated_baselines.get(item.clip_id, calibrated_baselines.get(item.group_key, derived_group_baseline))
@@ -263,6 +287,8 @@ def analyze_path(
             for item in final_results
         ],
         "calibration_roi": calibration_roi,
+        "selected_clip_ids": sorted(requested_clip_ids) if requested_clip_ids else None,
+        "selected_clip_groups": sorted(requested_clip_groups) if requested_clip_groups else None,
     }
     write_json(out_root / "summary.json", summary)
     return summary
@@ -278,6 +304,7 @@ def analyze_clip(
     sampling_strategy: str,
     calibration_roi: Optional[Dict[str, float]] = None,
 ) -> ClipResult:
+    raise_if_cancelled("Run cancelled before clip decode.")
     backend_impl = resolve_backend(backend)
     clip = backend_impl.inspect_clip(source_path)
     sample_plan = build_sample_plan(clip.total_frames, sample_count=sample_count, strategy=sampling_strategy)
@@ -307,6 +334,7 @@ def analyze_clip(
         max_frames=sample_plan.max_frames,
         frame_step=sample_plan.frame_step,
     ):
+        raise_if_cancelled("Run cancelled during frame measurement.")
         stat = analyze_frame(frame_index, timestamp_seconds, image, mode=mode, lut=lut)
         frame_stats.append(stat)
         measurement = measure_frame_color_and_exposure(image, mode=mode, lut=lut, calibration_roi=calibration_roi)
@@ -487,12 +515,14 @@ def resolve_lut(path: Optional[str]) -> Optional[CubeLut]:
 
 
 def discover_clips(input_path: str) -> List[Path]:
+    raise_if_cancelled("Run cancelled before source scan.")
     path = Path(input_path).expanduser().resolve()
     if path.is_file():
         return [path] if is_valid_clip_file(path) else []
 
     clips: list[Path] = []
     for candidate in path.rglob("*"):
+        raise_if_cancelled("Run cancelled during source scan.")
         if not candidate.is_file():
             continue
         if is_valid_clip_file(candidate):

@@ -5,6 +5,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Dict
 
+from .color import is_identity_cdl_payload, rgb_gains_to_cdl
 from .identity import rmd_name_for_clip_id
 from .models import ClipResult
 
@@ -14,6 +15,16 @@ def sidecar_filename_for_clip_id(clip_id: str) -> str:
 
 
 def build_sidecar_payload(result: ClipResult) -> Dict[str, object]:
+    rgb_gains = (
+        [
+            result.pending_color_gains["r"],
+            result.pending_color_gains["g"],
+            result.pending_color_gains["b"],
+        ]
+        if result.pending_color_gains
+        else None
+    )
+    cdl_payload = rgb_gains_to_cdl(rgb_gains) if rgb_gains else None
     return {
         "schema": "r3dmatch_v2",
         "clip_id": result.clip_id,
@@ -22,11 +33,9 @@ def build_sidecar_payload(result: ClipResult) -> Dict[str, object]:
             "offset_stops": result.final_offset_stops,
         },
         "color": {
-            "rgb_gains": [
-                result.pending_color_gains["r"],
-                result.pending_color_gains["g"],
-                result.pending_color_gains["b"],
-            ] if result.pending_color_gains else None,
+            "rgb_gains": rgb_gains,
+            "cdl": cdl_payload,
+            "cdl_enabled": bool(cdl_payload is not None and not is_identity_cdl_payload(cdl_payload)),
         },
         "confidence": {
             "exposure": result.confidence,
@@ -49,11 +58,9 @@ def build_sidecar_payload(result: ClipResult) -> Dict[str, object]:
                 "final_offset_stops": result.final_offset_stops,
             },
             "color": {
-                "rgb_neutral_gains": [
-                    result.pending_color_gains["r"],
-                    result.pending_color_gains["g"],
-                    result.pending_color_gains["b"],
-                ] if result.pending_color_gains else None,
+                "rgb_neutral_gains": rgb_gains,
+                "cdl": cdl_payload,
+                "cdl_enabled": bool(cdl_payload is not None and not is_identity_cdl_payload(cdl_payload)),
             },
         },
         "monitoring": asdict(result.monitoring),

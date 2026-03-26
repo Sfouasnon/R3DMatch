@@ -13,13 +13,15 @@ import numpy as np
 from PIL import Image
 
 from .calibration import extract_center_region, load_color_calibration, load_exposure_calibration, percentile_clip
-from .color import rgb_gains_to_cdl
+from .color import identity_lggs, is_identity_cdl_payload as _color_is_identity_cdl_payload, rgb_gains_to_cdl, solve_cdl_color_model
+from .execution import CancellationError, raise_if_cancelled, run_cancellable_subprocess
 from .rmd import write_rmd_for_clip_with_metadata, write_rmds_from_analysis
 
 
 PREVIEW_VARIANTS = ("original", "exposure", "color", "both")
 REVIEW_PREVIEW_TRANSFORM = "REDLine IPP2 Log3G10 / Medium / Medium"
 DEFAULT_REVIEW_TARGET_STRATEGIES = ("median",)
+STRATEGY_ORDER = ["median", "brightest_valid", "manual", "hero_camera"]
 DEFAULT_CALIBRATION_PREVIEW = {
     "preview_mode": "calibration",
     "output_space": "REDWideGamutRGB",
@@ -50,6 +52,42 @@ ROLLOFF_CODES = {"none": 0, "hard": 1, "default": 2, "medium": 3, "soft": 4}
 TONEMAP_CODES = {"low": 0, "medium": 1, "high": 2, "none": 3}
 SHADOW_ROLLOFF_VALUES = {"hard": -0.25, "medium": 0.0, "soft": 0.25}
 LOGO_PATH = Path(__file__).resolve().parent / "static" / "r3dmatch_logo.png"
+COLOR_PREVIEW_OVERRIDE_ENV = "R3DMATCH_ENABLE_UNVERIFIED_COLOR_PREVIEW"
+
+
+def _normalize_matching_domain(value: str) -> str:
+    normalized = str(value).strip().lower()
+    aliases = {
+        "scene": "scene",
+        "scene-referred": "scene",
+        "scenereferred": "scene",
+        "perceptual": "perceptual",
+        "monitoring": "perceptual",
+        "view": "perceptual",
+    }
+    if normalized not in aliases:
+        raise ValueError("matching domain must be scene or perceptual")
+    return aliases[normalized]
+
+
+def _matching_domain_label(value: str) -> str:
+    normalized = _normalize_matching_domain(value)
+    if normalized == "scene":
+        return "Scene-Referred (REDWideGamutRGB / Log3G10)"
+    return "Perceptual (IPP2 / BT.709 / BT.1886)"
+
+
+def _measurement_preview_settings_for_domain(matching_domain: str) -> Dict[str, object]:
+    normalized = _normalize_matching_domain(matching_domain)
+    defaults = DEFAULT_CALIBRATION_PREVIEW if normalized == "scene" else DEFAULT_DISPLAY_REVIEW_PREVIEW
+    return _normalize_preview_settings(
+        preview_mode=str(defaults["preview_mode"]),
+        preview_output_space=str(defaults["output_space"]),
+        preview_output_gamma=str(defaults["output_gamma"]),
+        preview_highlight_rolloff=str(defaults["highlight_rolloff"]),
+        preview_shadow_rolloff=str(defaults["shadow_rolloff"]),
+        preview_lut=None,
+    )
 
 
 def _load_analysis_records(input_path: str) -> List[Dict[str, object]]:
@@ -93,16 +131,18 @@ def normalize_target_strategy_name(name: str) -> str:
     aliases = {
         "brightest_valid": "brightest_valid",
         "best_exposed": "brightest_valid",
+        "hero_camera": "hero_camera",
         "median": "median",
         "manual": "manual",
     }
     if normalized not in aliases:
-        raise ValueError("target strategy must be one of: median, brightest-valid, manual")
+        raise ValueError("target strategy must be one of: median, brightest-valid, manual, hero-camera")
     return aliases[normalized]
 
 
 def strategy_display_name(name: str) -> str:
     return {
+        "hero_camera": "Hero Camera",
         "median": "Median",
         "brightest_valid": "Brightest Valid",
         "manual": "Manual Reference",
@@ -144,8 +184,19 @@ def clear_preview_cache(input_path: str, *, report_dir: Optional[str] = None) ->
         if commands_path.exists():
             commands_path.unlink()
             removed.append(str(commands_path))
+        validation_path = preview_root / "rmd_validation.json"
+        if validation_path.exists():
+            validation_path.unlink()
+            removed.append(str(validation_path))
     if report_root.exists():
-        for name in ("contact_sheet.json", "contact_sheet.html", "preview_contact_sheet.pdf", "review_manifest.json"):
+        for name in (
+            "contact_sheet.json",
+            "contact_sheet.html",
+            "preview_contact_sheet.pdf",
+            "review_manifest.json",
+            "review_package.json",
+            "review_validation.json",
+        ):
             path = report_root / name
             if path.exists():
                 path.unlink()
@@ -169,7 +220,7 @@ def _resolve_redline_executable() -> str:
 
 
 def _detect_redline_capabilities(redline_executable: str) -> Dict[str, object]:
-    help_result = subprocess.run([redline_executable, "--help"], capture_output=True, text=True, check=False)
+    help_result = run_cancellable_subprocess([redline_executable, "--help"])
     help_text = (help_result.stdout or "") + (help_result.stderr or "")
     version_line = next((line.strip() for line in help_text.splitlines() if "REDline Build" in line), None)
     return {
@@ -237,6 +288,20 @@ def _preview_transform_label(settings: Dict[str, object]) -> str:
     return " / ".join(parts)
 
 
+def _color_preview_policy() -> Dict[str, object]:
+    enabled = os.environ.get(COLOR_PREVIEW_OVERRIDE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    note = (
+        None
+        if enabled
+        else "Color/CDL corrections are still computed and exported, but color preview is disabled for operator review on this REDLine build because the rendered color path has not been proven visually trustworthy."
+    )
+    return {
+        "enabled": enabled,
+        "status": "enabled_unverified_override" if enabled else "disabled_unverified",
+        "note": note,
+    }
+
+
 def _report_grid_columns(clip_count: int) -> int:
     if clip_count <= 6:
         return 3
@@ -253,6 +318,13 @@ def _report_tiles_per_page(columns: int) -> int:
 
 def _chunk_tiles(items: List[Dict[str, object]], chunk_size: int) -> List[List[Dict[str, object]]]:
     return [items[index:index + chunk_size] for index in range(0, len(items), chunk_size)] or [[]]
+
+
+def _format_cdl_gain_saturation(color_metrics: Dict[str, object]) -> str:
+    color_model = color_metrics.get("lift_gamma_gain_saturation") or {}
+    gain = color_model.get("gain") or color_metrics.get("rgb_gains") or [1.0, 1.0, 1.0]
+    saturation = float(color_model.get("saturation", color_metrics.get("saturation", 1.0)))
+    return f"{float(gain[0]):.3f}, {float(gain[1]):.3f}, {float(gain[2]):.3f} | sat {saturation:.3f}"
 
 
 def _extract_preview_corrections(sidecar_payload: Dict[str, object]) -> Dict[str, object]:
@@ -298,10 +370,12 @@ def _measure_rendered_preview_roi(preview_path: str, calibration_roi: Optional[D
     measured_log2 = float(np.median(np.log2(trimmed_luma)))
     rgb_mean = np.median(pixels, axis=0)
     chroma = rgb_mean / max(float(np.sum(rgb_mean)), 1e-6)
+    saturation_fraction = float(np.mean(np.max(pixels, axis=1) >= 0.998)) if pixels.size else 0.0
     return {
         "measured_log2_luminance_monitoring": measured_log2,
         "measured_rgb_mean_monitoring": [float(rgb_mean[0]), float(rgb_mean[1]), float(rgb_mean[2])],
         "measured_rgb_chromaticity_monitoring": [float(chroma[0]), float(chroma[1]), float(chroma[2])],
+        "measured_saturation_fraction_monitoring": saturation_fraction,
         "valid_pixel_count_monitoring": int(pixels.shape[0]),
     }
 
@@ -311,35 +385,83 @@ def _build_strategy_payloads(
     *,
     target_strategies: List[str],
     reference_clip_id: Optional[str],
+    hero_clip_id: Optional[str] = None,
+    target_type: Optional[str] = None,
     monitoring_measurements_by_clip: Optional[Dict[str, Dict[str, object]]] = None,
+    matching_domain: str = "scene",
 ) -> List[Dict[str, object]]:
     if not analysis_records:
         return []
-    measured_log2 = np.array(
-        [
-            float(
-                (monitoring_measurements_by_clip or {}).get(str(record["clip_id"]), {}).get(
-                    "measured_log2_luminance_monitoring",
-                    record.get("diagnostics", {}).get("measured_log2_luminance_monitoring", record.get("diagnostics", {}).get("measured_log2_luminance", 0.0)),
-                )
+    resolved_matching_domain = _normalize_matching_domain(matching_domain)
+
+    def measured_log2_for_record(record: Dict[str, object]) -> float:
+        clip_id = str(record["clip_id"])
+        measurement = (monitoring_measurements_by_clip or {}).get(clip_id, {})
+        return float(
+            measurement.get(
+                "measured_log2_luminance_monitoring",
+                record.get("diagnostics", {}).get("measured_log2_luminance_monitoring", record.get("diagnostics", {}).get("measured_log2_luminance", 0.0)),
             )
-            for record in analysis_records
-        ],
+        )
+
+    def measured_rgb_for_record(record: Dict[str, object]) -> List[float]:
+        clip_id = str(record["clip_id"])
+        measurement = (monitoring_measurements_by_clip or {}).get(clip_id, {})
+        return [
+            float(value)
+            for value in measurement.get(
+                "measured_rgb_chromaticity_monitoring",
+                record.get("diagnostics", {}).get("measured_rgb_chromaticity", [1 / 3, 1 / 3, 1 / 3]),
+            )
+        ]
+
+    def measured_saturation_for_record(record: Dict[str, object]) -> float:
+        clip_id = str(record["clip_id"])
+        measurement = (monitoring_measurements_by_clip or {}).get(clip_id, {})
+        return float(
+            measurement.get(
+                "measured_saturation_fraction_monitoring",
+                record.get("diagnostics", {}).get("saturation_fraction", 0.0) or 0.0,
+            )
+        )
+
+    measured_log2 = np.array(
+        [measured_log2_for_record(record) for record in analysis_records],
         dtype=np.float32,
     )
-    measured_chroma = np.array([record.get("diagnostics", {}).get("measured_rgb_chromaticity", [1 / 3, 1 / 3, 1 / 3]) for record in analysis_records], dtype=np.float32)
+    measured_chroma = np.array([measured_rgb_for_record(record) for record in analysis_records], dtype=np.float32)
+    measured_saturation = np.array([measured_saturation_for_record(record) for record in analysis_records], dtype=np.float32)
     payloads: List[Dict[str, object]] = []
     for requested in target_strategies:
         strategy = normalize_target_strategy_name(requested)
         if strategy == "median":
             target_log2 = float(np.median(measured_log2))
             target_rgb = [float(np.median(measured_chroma[:, index])) for index in range(3)]
+            target_saturation = float(np.median(measured_saturation)) if measured_saturation.size else 0.0
             resolved_reference = None
+            resolved_hero = None
+            strategy_summary = "Matched to the batch median target."
         elif strategy == "brightest_valid":
             target_index = int(np.argmax(measured_log2))
             target_log2 = float(measured_log2[target_index])
             target_rgb = [float(value) for value in measured_chroma[target_index]]
+            target_saturation = float(measured_saturation[target_index]) if measured_saturation.size else 0.0
             resolved_reference = str(analysis_records[target_index]["clip_id"])
+            resolved_hero = None
+            strategy_summary = f"Matched to brightest valid clip {resolved_reference}."
+        elif strategy == "hero_camera":
+            if not hero_clip_id:
+                raise ValueError("hero-camera target strategy requires --hero-clip-id")
+            matches = [record for record in analysis_records if str(record["clip_id"]) == hero_clip_id]
+            if not matches:
+                raise ValueError(f"hero clip not found in analysis records: {hero_clip_id}")
+            hero_record = matches[0]
+            target_log2 = measured_log2_for_record(hero_record)
+            target_rgb = measured_rgb_for_record(hero_record)
+            target_saturation = measured_saturation_for_record(hero_record)
+            resolved_reference = hero_clip_id
+            resolved_hero = hero_clip_id
+            strategy_summary = f"Matched to hero camera {hero_clip_id}."
         else:
             if not reference_clip_id:
                 raise ValueError("manual target strategy requires --reference-clip-id")
@@ -347,34 +469,34 @@ def _build_strategy_payloads(
             if not matches:
                 raise ValueError(f"manual reference clip not found in analysis records: {reference_clip_id}")
             reference_record = matches[0]
-            target_log2 = float(
-                (monitoring_measurements_by_clip or {}).get(str(reference_record["clip_id"]), {}).get(
-                    "measured_log2_luminance_monitoring",
-                    reference_record.get("diagnostics", {}).get("measured_log2_luminance_monitoring", reference_record.get("diagnostics", {}).get("measured_log2_luminance", 0.0)),
-                )
-            )
-            target_rgb = [float(value) for value in reference_record.get("diagnostics", {}).get("measured_rgb_chromaticity", [1 / 3, 1 / 3, 1 / 3])]
+            target_log2 = measured_log2_for_record(reference_record)
+            target_rgb = measured_rgb_for_record(reference_record)
+            target_saturation = measured_saturation_for_record(reference_record)
             resolved_reference = reference_clip_id
+            resolved_hero = None
+            strategy_summary = f"Matched to manual reference clip {reference_clip_id}."
 
         strategy_clips = []
         for record in analysis_records:
             measured = record.get("diagnostics", {})
             monitoring_measured = (monitoring_measurements_by_clip or {}).get(str(record["clip_id"]), {})
-            measured_rgb = [float(value) for value in measured.get("measured_rgb_chromaticity", [1 / 3, 1 / 3, 1 / 3])]
-            measured_monitoring_log2 = float(
-                monitoring_measured.get(
-                    "measured_log2_luminance_monitoring",
-                    measured.get("measured_log2_luminance_monitoring", measured.get("measured_log2_luminance", 0.0)),
-                )
+            measured_rgb = measured_rgb_for_record(record)
+            measured_monitoring_log2 = measured_log2_for_record(record)
+            measured_saturation_fraction = measured_saturation_for_record(record)
+            color_solution = solve_cdl_color_model(
+                measured_rgb_chromaticity=measured_rgb,
+                target_rgb_chromaticity=target_rgb,
+                measured_saturation_fraction=measured_saturation_fraction,
+                target_saturation_fraction=target_saturation,
             )
-            raw_gains = [
-                target_rgb[0] / max(measured_rgb[0], 1e-6),
-                target_rgb[1] / max(measured_rgb[1], 1e-6),
-                target_rgb[2] / max(measured_rgb[2], 1e-6),
-            ]
-            gain_norm = (raw_gains[0] * raw_gains[1] * raw_gains[2]) ** (1.0 / 3.0)
-            rgb_gains = [float(value / max(gain_norm, 1e-6)) for value in raw_gains]
-            color_cdl = rgb_gains_to_cdl(rgb_gains)
+            rgb_gains = [float(value) for value in color_solution["diagnostic_rgb_gains"]]
+            color_lggs = dict(color_solution["color_model"])
+            color_cdl = dict(color_solution["cdl"])
+            is_hero_camera = bool(strategy == "hero_camera" and str(record["clip_id"]) == hero_clip_id)
+            if is_hero_camera:
+                rgb_gains = [1.0, 1.0, 1.0]
+                color_lggs = identity_lggs()
+                color_cdl = rgb_gains_to_cdl(rgb_gains)
             strategy_clips.append(
                 {
                     "clip_id": str(record["clip_id"]),
@@ -385,14 +507,20 @@ def _build_strategy_payloads(
                     "measured_log2_luminance_raw": float(measured.get("measured_log2_luminance_raw", measured.get("measured_log2_luminance", 0.0))),
                     "measured_rgb_chromaticity": [float(value) for value in measured_rgb],
                     "monitoring_measurement_source": "rendered_preview" if monitoring_measured else "analysis_diagnostic",
-                    "exposure_offset_stops": float(target_log2 - measured_monitoring_log2),
+                    "exposure_offset_stops": 0.0 if is_hero_camera else float(target_log2 - measured_monitoring_log2),
                     "rgb_gains": rgb_gains,
+                    "color_lggs": color_lggs,
                     "color_cdl": color_cdl,
+                    "measured_saturation_fraction": measured_saturation_fraction,
+                    "target_saturation_fraction": target_saturation,
+                    "saturation_source": str(color_solution["saturation_source"]),
                     "confidence": float(record.get("confidence", 0.0)),
                     "flags": list(record.get("flags", [])),
                     "calibration_roi": measured.get("calibration_roi"),
                     "measurement_mode": measured.get("calibration_measurement_mode"),
-                    "exposure_measurement_domain": measured.get("exposure_measurement_domain", "monitoring"),
+                    "exposure_measurement_domain": resolved_matching_domain,
+                    "color_measurement_domain": resolved_matching_domain,
+                    "is_hero_camera": is_hero_camera,
                 }
             )
 
@@ -401,8 +529,13 @@ def _build_strategy_payloads(
                 "strategy_key": strategy,
                 "strategy_label": strategy_display_name(strategy),
                 "reference_clip_id": resolved_reference,
+                "hero_clip_id": resolved_hero,
                 "target_log2_luminance": target_log2,
                 "target_rgb_chromaticity": target_rgb,
+                "target_saturation_fraction": target_saturation,
+                "strategy_summary": strategy_summary,
+                "matching_domain": resolved_matching_domain,
+                "matching_domain_label": _matching_domain_label(resolved_matching_domain),
                 "clips": strategy_clips,
             }
         )
@@ -576,6 +709,7 @@ def _probe_redline_application(
     redline_capabilities: Dict[str, object],
     use_rmd_mode: int = 1,
 ) -> Dict[str, object]:
+    raise_if_cancelled("Run cancelled before REDLine metadata probe.")
     command = _build_redline_metadata_probe_command(
         source_path,
         redline_executable=redline_executable,
@@ -586,7 +720,7 @@ def _probe_redline_application(
         redline_capabilities=redline_capabilities,
         use_rmd_mode=use_rmd_mode,
     )
-    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    completed = run_cancellable_subprocess(command)
     output = (completed.stdout or "") + (completed.stderr or "")
     if rmd_path:
         applied = completed.returncode == 0 and "Error parsing RMD file" not in output
@@ -640,18 +774,7 @@ def _is_identity_rgb_gains(rgb_gains: Optional[List[float]]) -> bool:
 
 
 def _is_identity_cdl_payload(color_cdl: Optional[Dict[str, object]]) -> bool:
-    if color_cdl is None:
-        return True
-    slope = [float(value) for value in color_cdl.get("slope", [1.0, 1.0, 1.0])]
-    offset = [float(value) for value in color_cdl.get("offset", [0.0, 0.0, 0.0])]
-    power = [float(value) for value in color_cdl.get("power", [1.0, 1.0, 1.0])]
-    saturation = float(color_cdl.get("saturation", 1.0))
-    return (
-        all(abs(value - 1.0) <= 1e-9 for value in slope)
-        and all(abs(value) <= 1e-9 for value in offset)
-        and all(abs(value - 1.0) <= 1e-9 for value in power)
-        and abs(saturation - 1.0) <= 1e-9
-    )
+    return _color_is_identity_cdl_payload(color_cdl)
 
 
 def render_preview_frame(
@@ -671,6 +794,7 @@ def render_preview_frame(
     use_rmd_mode: int = 1,
     color_method: Optional[str] = None,
 ) -> Dict[str, object]:
+    raise_if_cancelled("Run cancelled before preview render.")
     color_cdl = None
     resolved_color_method = color_method
     if red_gain is not None or green_gain is not None or blue_gain is not None:
@@ -700,7 +824,7 @@ def render_preview_frame(
         rmd_path=rmd_path,
         use_rmd_mode=use_rmd_mode,
     )
-    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    completed = run_cancellable_subprocess(command)
     actual_output = _resolve_rendered_output_path(output_path)
     return {
         "command": command,
@@ -815,6 +939,7 @@ def generate_preview_stills(
     strategy_rmd_root: Optional[str] = None,
     render_originals: bool = True,
 ) -> Dict[str, Dict[str, object]]:
+    raise_if_cancelled("Run cancelled before preview generation.")
     preview_root = Path(previews_dir).expanduser().resolve()
     preview_root.mkdir(parents=True, exist_ok=True)
     sidecars = _load_sidecar_map(input_path)
@@ -823,6 +948,7 @@ def generate_preview_stills(
     command_records: List[Dict[str, object]] = []
     rmd_validation_records: List[Dict[str, object]] = []
     selected_rmd_use_mode = 1
+    color_preview_policy = _color_preview_policy()
     render_settings = _normalize_preview_settings(
         preview_mode=str(DEFAULT_DISPLAY_REVIEW_PREVIEW["preview_mode"]),
         preview_output_space=str(DEFAULT_DISPLAY_REVIEW_PREVIEW["output_space"]),
@@ -858,6 +984,7 @@ def generate_preview_stills(
             )
 
     for record in analysis_records:
+        raise_if_cancelled("Run cancelled while rendering preview stills.")
         clip_id = str(record["clip_id"])
         source_path = str(record["source_path"])
         sample_plan = dict(record.get("sample_plan", {}))
@@ -911,6 +1038,7 @@ def generate_preview_stills(
         preview_paths[clip_id]["original"] = str(original_path) if original_path.exists() else None
 
         for strategy_payload in resolved_strategy_payloads:
+            raise_if_cancelled("Run cancelled while rendering corrected previews.")
             strategy_key = str(strategy_payload["strategy_key"])
             clip_entry = next((item for item in strategy_payload["clips"] if item["clip_id"] == clip_id), None)
             if clip_entry is None:
@@ -924,6 +1052,7 @@ def generate_preview_stills(
             }
             preview_paths[clip_id]["strategies"][strategy_key] = {}
             for variant, variant_settings in variants.items():
+                raise_if_cancelled("Run cancelled while rendering corrected previews.")
                 preview_path = preview_root / preview_filename_for_clip_id(clip_id, variant, strategy=strategy_key, run_id=run_id)
                 look_metadata_path = None
                 rmd_metadata = None
@@ -954,6 +1083,9 @@ def generate_preview_stills(
                             "color": {
                                 "rgb_neutral_gains": variant_settings["gains"] if variant in {"color", "both"} else None,
                                 "cdl": clip_entry.get("color_cdl") if variant in {"color", "both"} else None,
+                                "cdl_enabled": bool(
+                                    variant in {"color", "both"} and not _is_identity_cdl_payload(clip_entry.get("color_cdl"))
+                                ),
                             },
                         },
                     }
@@ -975,34 +1107,6 @@ def generate_preview_stills(
                     red_gain = float(variant_settings["gains"][0])
                     green_gain = float(variant_settings["gains"][1])
                     blue_gain = float(variant_settings["gains"][2])
-                corrected_render = render_preview_frame(
-                    source_path,
-                    str(preview_path),
-                    frame_index=frame_index,
-                    redline_executable=redline_executable,
-                    redline_capabilities=redline_capabilities,
-                    preview_settings=render_settings,
-                    use_as_shot_metadata=False,
-                    exposure=None,
-                    red_gain=None,
-                    green_gain=None,
-                    blue_gain=None,
-                    rmd_path=look_metadata_path,
-                    use_rmd_mode=selected_rmd_use_mode,
-                )
-                if int(corrected_render["returncode"]) != 0:
-                    raise RuntimeError(
-                        f"REDLine preview render failed for {clip_id} ({variant}). "
-                        f"Command: {shlex.join(corrected_render['command'])}. STDERR: {str(corrected_render['stderr']).strip()}"
-                    )
-                preview_path = Path(str(corrected_render["output_path"]))
-                if not preview_path.exists():
-                    raise RuntimeError(
-                        f"REDLine preview render did not create expected file for {clip_id} ({variant}): {preview_path}"
-                    )
-
-                diff_metrics = _compute_image_difference_metrics(original_path, preview_path)
-                mean_diff = diff_metrics["mean_absolute_difference"]
                 color_cdl = clip_entry.get("color_cdl") if variant in {"color", "both"} else None
                 cdl_enabled = bool(
                     (isinstance(rmd_metadata, dict) and rmd_metadata.get("cdl_enabled"))
@@ -1012,6 +1116,48 @@ def generate_preview_stills(
                         and rmd_metadata["settings"].get("cdl_enabled")
                     )
                 )
+                color_preview_disabled = variant in {"color", "both"} and not bool(color_preview_policy["enabled"])
+                output_reused_from_variant = None
+                corrected_render = None
+                if color_preview_disabled:
+                    if variant == "color":
+                        source_preview_path = original_path
+                        output_reused_from_variant = "original"
+                    else:
+                        exposure_preview = preview_paths[clip_id]["strategies"][strategy_key].get("exposure")
+                        source_preview_path = Path(str(exposure_preview)) if exposure_preview else original_path
+                        output_reused_from_variant = "exposure"
+                    shutil.copyfile(source_preview_path, preview_path)
+                    preview_path = preview_path.resolve()
+                else:
+                    corrected_render = render_preview_frame(
+                        source_path,
+                        str(preview_path),
+                        frame_index=frame_index,
+                        redline_executable=redline_executable,
+                        redline_capabilities=redline_capabilities,
+                        preview_settings=render_settings,
+                        use_as_shot_metadata=False,
+                        exposure=None,
+                        red_gain=None,
+                        green_gain=None,
+                        blue_gain=None,
+                        rmd_path=look_metadata_path,
+                        use_rmd_mode=selected_rmd_use_mode,
+                    )
+                    if int(corrected_render["returncode"]) != 0:
+                        raise RuntimeError(
+                            f"REDLine preview render failed for {clip_id} ({variant}). "
+                            f"Command: {shlex.join(corrected_render['command'])}. STDERR: {str(corrected_render['stderr']).strip()}"
+                        )
+                    preview_path = Path(str(corrected_render["output_path"]))
+                    if not preview_path.exists():
+                        raise RuntimeError(
+                            f"REDLine preview render did not create expected file for {clip_id} ({variant}): {preview_path}"
+                        )
+
+                diff_metrics = _compute_image_difference_metrics(original_path, preview_path)
+                mean_diff = diff_metrics["mean_absolute_difference"]
                 correction_payload_identity = bool(
                     abs(float(variant_settings["exposure"])) <= 1e-9
                     and _is_identity_rgb_gains(variant_settings["gains"])
@@ -1022,28 +1168,33 @@ def generate_preview_stills(
                     and any(abs(float(value) - 1.0) > 1e-6 for value in variant_settings["gains"])
                 )
                 error_message = None
-                if requires_change and (mean_diff is None or float(mean_diff) < 1e-3):
+                if requires_change and not color_preview_disabled and (mean_diff is None or float(mean_diff) < 1e-3):
                     error_message = "RMD correction did not change rendered pixels"
                     print(
                         f"[r3dmatch] ERROR: {error_message} clip={clip_id} strategy={strategy_key} "
-                        f"variant={variant} command={shlex.join(corrected_render['command'])}"
+                        f"variant={variant} command={shlex.join(corrected_render['command']) if corrected_render else 'preview-copy'}"
                     )
+                if color_preview_disabled:
+                    error_message = None
                 validation_record = {
                     "clip_id": clip_id,
                     "strategy": strategy_key,
                     "variant": variant,
-                    "application_method": "rmd",
+                    "application_method": "preview_color_disabled" if color_preview_disabled else "rmd",
                     "rmd_path": look_metadata_path,
                     "use_rmd_mode": selected_rmd_use_mode,
                     "exposure_offset": float(variant_settings["exposure"]),
                     "rgb_gains": [red_gain, green_gain, blue_gain] if red_gain is not None else None,
                     "color_cdl": color_cdl,
                     "cdl_enabled": cdl_enabled,
+                    "preview_color_applied": not color_preview_disabled,
+                    "preview_disabled_reason": color_preview_policy["note"] if color_preview_disabled else None,
+                    "output_reused_from_variant": output_reused_from_variant,
                     "correction_payload_identity": correction_payload_identity,
                     "pixel_diff_from_baseline": mean_diff,
                     "max_pixel_diff_from_baseline": diff_metrics["max_absolute_difference"],
                     "pixel_output_changed": diff_metrics["pixel_output_changed"],
-                    "validation_method": "pixel_diff_from_baseline",
+                    "validation_method": "pixel_diff_from_baseline" if not color_preview_disabled else "preview_fallback_copy",
                     "error": error_message,
                 }
                 rmd_validation_records.append(validation_record)
@@ -1051,7 +1202,7 @@ def generate_preview_stills(
                     f"[r3dmatch] preview render clip={clip_id} mode=corrected strategy={strategy_key} "
                     f"variant={variant} exposure={float(variant_settings['exposure']):.6f} "
                     f"redGain={red_gain} greenGain={green_gain} blueGain={blue_gain} pixel_diff={mean_diff} "
-                    f"application_method=rmd"
+                    f"application_method={'preview_color_disabled' if color_preview_disabled else 'rmd'}"
                 )
                 command_records.append(
                     {
@@ -1063,38 +1214,48 @@ def generate_preview_stills(
                         "redGain": red_gain,
                         "greenGain": green_gain,
                         "blueGain": blue_gain,
-                        "command": corrected_render["command"],
+                        "command": corrected_render["command"] if corrected_render else None,
                         "output": str(preview_path),
                         "look_metadata_path": look_metadata_path,
                         "rmd_path": look_metadata_path,
                         "rmd_metadata": rmd_metadata,
-                        "returncode": corrected_render["returncode"],
-                        "stdout": corrected_render["stdout"],
-                        "stderr": corrected_render["stderr"],
-                        "application_method": "rmd",
+                        "returncode": corrected_render["returncode"] if corrected_render else 0,
+                        "stdout": corrected_render["stdout"] if corrected_render else "",
+                        "stderr": corrected_render["stderr"] if corrected_render else "",
+                        "application_method": "preview_color_disabled" if color_preview_disabled else "rmd",
                         "pixel_diff_from_baseline": mean_diff,
                         "max_pixel_diff_from_baseline": diff_metrics["max_absolute_difference"],
                         "pixel_output_changed": diff_metrics["pixel_output_changed"],
                         "correction_payload_identity": correction_payload_identity,
                         "cdl_enabled": cdl_enabled,
+                        "preview_color_applied": not color_preview_disabled,
+                        "preview_disabled_reason": color_preview_policy["note"] if color_preview_disabled else None,
+                        "output_reused_from_variant": output_reused_from_variant,
                         "color_payload_summary": color_cdl,
+                        "color_model_summary": clip_entry.get("color_lggs") if variant in {"color", "both"} else None,
                         "error": error_message,
                         "as_shot_metadata_used": False,
                         "explicit_transform_used": True,
                         "explicit_correction_flags_used": False,
                         "correction_application_method": "rmd",
                         "use_rmd_mode": selected_rmd_use_mode,
-                        "validation_method": "pixel_diff_from_baseline",
+                        "validation_method": "pixel_diff_from_baseline" if not color_preview_disabled else "preview_fallback_copy",
                     }
                 )
                 preview_paths[clip_id]["strategies"][strategy_key][variant] = str(preview_path)
-    (preview_root / "preview_commands.json").write_text(json.dumps({"commands": command_records}, indent=2), encoding="utf-8")
+    (preview_root / "preview_commands.json").write_text(
+        json.dumps({"color_preview_policy": color_preview_policy, "commands": command_records}, indent=2),
+        encoding="utf-8",
+    )
     (preview_root / "rmd_validation.json").write_text(
         json.dumps(
             {
                 "selected_use_rmd_mode": selected_rmd_use_mode,
+                "color_preview_policy": color_preview_policy,
                 "pipeline_valid": all(
-                    bool(item["correction_payload_identity"]) or bool(item["pixel_output_changed"])
+                    bool(item["correction_payload_identity"])
+                    or bool(item["pixel_output_changed"])
+                    or not bool(item.get("preview_color_applied", True))
                     for item in rmd_validation_records
                 )
                 if rmd_validation_records
@@ -1117,6 +1278,10 @@ def build_contact_sheet_report(
     color_calibration_path: Optional[str] = None,
     target_type: Optional[str] = None,
     processing_mode: Optional[str] = None,
+    run_label: Optional[str] = None,
+    matching_domain: str = "scene",
+    selected_clip_ids: Optional[List[str]] = None,
+    selected_clip_groups: Optional[List[str]] = None,
     preview_mode: str = "calibration",
     preview_output_space: Optional[str] = None,
     preview_output_gamma: Optional[str] = None,
@@ -1127,25 +1292,23 @@ def build_contact_sheet_report(
     calibration_roi: Optional[Dict[str, float]] = None,
     target_strategies: Optional[List[str]] = None,
     reference_clip_id: Optional[str] = None,
+    hero_clip_id: Optional[str] = None,
 ) -> Dict[str, object]:
+    raise_if_cancelled("Run cancelled before report generation.")
     root = Path(input_path).expanduser().resolve()
     out_root = Path(out_dir).expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
     if clear_cache:
         clear_preview_cache(str(root), report_dir=str(out_root))
     analysis_records = _load_analysis_records(input_path)
+    resolved_matching_domain = _normalize_matching_domain(matching_domain)
     resolved_strategies = [normalize_target_strategy_name(item) for item in (target_strategies or list(DEFAULT_REVIEW_TARGET_STRATEGIES))]
-    run_id = root.name or "review"
+    resolved_run_label = run_label or root.name or "review"
+    run_id = resolved_run_label
     redline_executable = _resolve_redline_executable()
     redline_capabilities = _detect_redline_capabilities(redline_executable)
-    measurement_preview_settings = _normalize_preview_settings(
-        preview_mode="calibration",
-        preview_output_space=None,
-        preview_output_gamma=None,
-        preview_highlight_rolloff=None,
-        preview_shadow_rolloff=None,
-        preview_lut=None,
-    )
+    color_preview_policy = _color_preview_policy()
+    measurement_preview_settings = _measurement_preview_settings_for_domain(resolved_matching_domain)
     display_preview_settings = _normalize_preview_settings(
         preview_mode=str(DEFAULT_DISPLAY_REVIEW_PREVIEW["preview_mode"]),
         preview_output_space=preview_output_space or str(DEFAULT_DISPLAY_REVIEW_PREVIEW["output_space"]),
@@ -1169,6 +1332,7 @@ def build_contact_sheet_report(
     )
     monitoring_measurements_by_clip = {}
     for record in analysis_records:
+        raise_if_cancelled("Run cancelled while measuring rendered originals.")
         clip_id = str(record["clip_id"])
         original_frame = measurement_preview_paths.get(clip_id, {}).get("original")
         if original_frame:
@@ -1180,7 +1344,10 @@ def build_contact_sheet_report(
         analysis_records,
         target_strategies=resolved_strategies,
         reference_clip_id=reference_clip_id,
+        hero_clip_id=hero_clip_id,
+        target_type=target_type,
         monitoring_measurements_by_clip=monitoring_measurements_by_clip,
+        matching_domain=resolved_matching_domain,
     )
     preview_paths = generate_preview_stills(
         input_path,
@@ -1196,6 +1363,7 @@ def build_contact_sheet_report(
 
     shared_originals = []
     for record in analysis_records:
+        raise_if_cancelled("Run cancelled while collecting review metadata.")
         clip_id = str(record["clip_id"])
         shared_originals.append(
             {
@@ -1212,8 +1380,10 @@ def build_contact_sheet_report(
 
     strategies = []
     for strategy_payload in strategy_payloads:
+        raise_if_cancelled("Run cancelled while assembling strategy report payloads.")
         strategy_clips = []
         for record in analysis_records:
+            raise_if_cancelled("Run cancelled while assembling strategy report payloads.")
             group_key = str(record["group_key"])
             clip_id = str(record["clip_id"])
             exposure_entry = exposure_by_group.get(group_key)
@@ -1235,6 +1405,7 @@ def build_contact_sheet_report(
                         "both": preview_paths.get(clip_id, {}).get("strategies", {}).get(strategy_payload["strategy_key"], {}).get("both"),
                     },
                     "calibration_roi": strategy_clip["calibration_roi"],
+                    "is_hero_camera": strategy_clip["is_hero_camera"],
                     "metrics": {
                         "exposure": {
                             "raw_offset_stops": record.get("raw_offset_stops"),
@@ -1246,6 +1417,14 @@ def build_contact_sheet_report(
                         },
                         "color": {
                             "rgb_gains": strategy_clip["rgb_gains"],
+                            "rgb_gains_diagnostic": strategy_clip["rgb_gains"],
+                            "cdl": strategy_clip["color_cdl"],
+                            "lift_gamma_gain_saturation": strategy_clip["color_lggs"],
+                            "saturation": strategy_clip["color_lggs"]["saturation"],
+                            "saturation_source": strategy_clip["saturation_source"],
+                            "measured_saturation_fraction": strategy_clip["measured_saturation_fraction"],
+                            "target_saturation_fraction": strategy_clip["target_saturation_fraction"],
+                            "measurement_domain": strategy_clip["color_measurement_domain"],
                             "measured_channel_medians": color_entry.measured_channel_medians if color_entry else None,
                         },
                         "sampling_mode": (
@@ -1257,6 +1436,10 @@ def build_contact_sheet_report(
                         "flags": strategy_clip["flags"],
                         "measurement_mode": strategy_clip["measurement_mode"],
                         "preview_transform": _preview_transform_label(display_preview_settings),
+                        "color_preview_applied": bool(color_preview_policy["enabled"]),
+                        "color_preview_status": str(color_preview_policy["status"]),
+                        "color_preview_note": color_preview_policy["note"],
+                        "is_hero_camera": strategy_clip["is_hero_camera"],
                     },
                 }
             )
@@ -1265,8 +1448,11 @@ def build_contact_sheet_report(
                 "strategy_key": strategy_payload["strategy_key"],
                 "strategy_label": strategy_payload["strategy_label"],
                 "reference_clip_id": strategy_payload["reference_clip_id"],
+                "hero_clip_id": strategy_payload.get("hero_clip_id"),
                 "target_log2_luminance": strategy_payload["target_log2_luminance"],
                 "target_rgb_chromaticity": strategy_payload["target_rgb_chromaticity"],
+                "target_saturation_fraction": strategy_payload.get("target_saturation_fraction"),
+                "strategy_summary": strategy_payload.get("strategy_summary"),
                 "calibration_roi": calibration_roi or (analysis_records[0].get("diagnostics", {}).get("calibration_roi") if analysis_records else None),
                 "clips": strategy_clips,
             }
@@ -1284,17 +1470,26 @@ def build_contact_sheet_report(
         "previews_dir": str(root / "previews"),
         "target_type": target_type or "unspecified",
         "processing_mode": processing_mode or "both",
+        "run_label": resolved_run_label,
+        "matching_domain": resolved_matching_domain,
+        "matching_domain_label": _matching_domain_label(resolved_matching_domain),
         "preview_transform": _preview_transform_label(display_preview_settings),
         "measurement_preview_transform": _preview_transform_label(measurement_preview_settings),
-        "exposure_measurement_domain": "monitoring",
+        "color_preview_enabled": bool(color_preview_policy["enabled"]),
+        "color_preview_status": str(color_preview_policy["status"]),
+        "color_preview_note": color_preview_policy["note"],
+        "exposure_measurement_domain": resolved_matching_domain,
         "preview_mode": display_preview_settings["preview_mode"],
         "preview_settings": display_preview_settings,
         "measurement_preview_settings": measurement_preview_settings,
         "redline_capabilities": redline_capabilities,
         "calibration_roi": calibration_roi or (analysis_records[0].get("diagnostics", {}).get("calibration_roi") if analysis_records else None),
         "run_id": run_id,
+        "selected_clip_ids": [str(item) for item in (selected_clip_ids or []) if str(item).strip()],
+        "selected_clip_groups": [str(item) for item in (selected_clip_groups or []) if str(item).strip()],
         "target_strategies": resolved_strategies,
         "reference_clip_id": reference_clip_id,
+        "hero_clip_id": hero_clip_id,
         "clip_count": len(analysis_records),
         "shared_originals": shared_originals,
         "strategies": strategies,
@@ -1304,36 +1499,55 @@ def build_contact_sheet_report(
     json_path = out_root / "contact_sheet.json"
     html_path = out_root / "contact_sheet.html"
     pdf_path = out_root / "preview_contact_sheet.pdf"
-    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    html_path.write_text(render_contact_sheet_html(payload), encoding="utf-8")
-    render_contact_sheet_pdf(payload, output_path=str(pdf_path), title="R3DMatch Review Contact Sheet")
     review_manifest_path = out_root / "review_manifest.json"
-    review_manifest_path.write_text(
-        json.dumps(
-            {
-                "input_path": str(root),
-                "target_type": payload["target_type"],
-                "processing_mode": payload["processing_mode"],
-                "preview_transform": payload["preview_transform"],
-                "measurement_preview_transform": payload["measurement_preview_transform"],
-                "preview_mode": payload["preview_mode"],
-                "preview_settings": payload["preview_settings"],
-                "measurement_preview_settings": payload["measurement_preview_settings"],
-                "redline_capabilities": payload["redline_capabilities"],
-                "exposure_measurement_domain": payload["exposure_measurement_domain"],
-                "calibration_roi": payload["calibration_roi"],
-                "target_strategies": payload["target_strategies"],
-                "reference_clip_id": payload["reference_clip_id"],
-                "clip_count": payload["clip_count"],
-                "report_json": str(json_path),
-                "report_html": str(html_path),
-                "preview_report_pdf": str(pdf_path),
-                "previews_dir": payload["previews_dir"],
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    try:
+        raise_if_cancelled("Run cancelled before writing review report artifacts.")
+        json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        raise_if_cancelled("Run cancelled before writing review HTML.")
+        html_path.write_text(render_contact_sheet_html(payload), encoding="utf-8")
+        raise_if_cancelled("Run cancelled before rendering review PDF.")
+        render_contact_sheet_pdf(payload, output_path=str(pdf_path), title="R3DMatch Review Contact Sheet")
+        raise_if_cancelled("Run cancelled before writing review manifest.")
+        review_manifest_path.write_text(
+            json.dumps(
+                {
+                    "input_path": str(root),
+                    "target_type": payload["target_type"],
+                    "processing_mode": payload["processing_mode"],
+                    "run_label": payload["run_label"],
+                    "matching_domain": payload["matching_domain"],
+                    "matching_domain_label": payload["matching_domain_label"],
+                    "preview_transform": payload["preview_transform"],
+                    "measurement_preview_transform": payload["measurement_preview_transform"],
+                    "color_preview_enabled": payload["color_preview_enabled"],
+                    "color_preview_status": payload["color_preview_status"],
+                    "color_preview_note": payload["color_preview_note"],
+                    "preview_mode": payload["preview_mode"],
+                    "preview_settings": payload["preview_settings"],
+                    "measurement_preview_settings": payload["measurement_preview_settings"],
+                    "redline_capabilities": payload["redline_capabilities"],
+                    "exposure_measurement_domain": payload["exposure_measurement_domain"],
+                    "calibration_roi": payload["calibration_roi"],
+                    "selected_clip_ids": payload["selected_clip_ids"],
+                    "selected_clip_groups": payload["selected_clip_groups"],
+                    "target_strategies": payload["target_strategies"],
+                    "reference_clip_id": payload["reference_clip_id"],
+                    "hero_clip_id": payload["hero_clip_id"],
+                    "clip_count": payload["clip_count"],
+                    "report_json": str(json_path),
+                    "report_html": str(html_path),
+                    "preview_report_pdf": str(pdf_path),
+                    "previews_dir": payload["previews_dir"],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except CancellationError:
+        for artifact in (json_path, html_path, pdf_path, review_manifest_path):
+            if artifact.exists():
+                artifact.unlink()
+        raise
     return {
         "report_json": str(json_path),
         "report_html": str(html_path),
@@ -1343,11 +1557,34 @@ def build_contact_sheet_report(
         "clip_count": len(analysis_records),
         "preview_transform": payload["preview_transform"],
         "measurement_preview_transform": payload["measurement_preview_transform"],
+        "run_label": payload["run_label"],
+        "matching_domain": payload["matching_domain"],
+        "matching_domain_label": payload["matching_domain_label"],
         "preview_mode": payload["preview_mode"],
         "preview_settings": payload["preview_settings"],
         "measurement_preview_settings": payload["measurement_preview_settings"],
         "redline_capabilities": payload["redline_capabilities"],
     }
+
+
+def _write_rcx_comparison_placeholder(root: Path) -> str:
+    compare_root = root / "rmd_compare"
+    compare_root.mkdir(parents=True, exist_ok=True)
+    manual_sample_root = compare_root / "manual_rcx_samples"
+    manual_sample_root.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "status": "open_question",
+        "question": "SDK-authored RMD vs RCX-authored RMD parity remains an open comparison point.",
+        "manual_sample_root": str(manual_sample_root),
+        "manual_sample_count": len(list(manual_sample_root.glob("*"))),
+        "notes": [
+            "Drop any manually exported RCX-authored RMD samples into manual_rcx_samples for side-by-side inspection.",
+            "Canonical preview/render correction currently uses the validated SDK-authored RMD path.",
+        ],
+    }
+    note_path = compare_root / "rcx_parity_notes.json"
+    note_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return str(note_path)
 
 
 def build_review_package(
@@ -1358,6 +1595,10 @@ def build_review_package(
     color_calibration_path: Optional[str] = None,
     target_type: str = "gray_sphere",
     processing_mode: str = "both",
+    run_label: Optional[str] = None,
+    matching_domain: str = "scene",
+    selected_clip_ids: Optional[List[str]] = None,
+    selected_clip_groups: Optional[List[str]] = None,
     preview_mode: str = "calibration",
     preview_output_space: Optional[str] = None,
     preview_output_gamma: Optional[str] = None,
@@ -1367,10 +1608,13 @@ def build_review_package(
     calibration_roi: Optional[Dict[str, float]] = None,
     target_strategies: Optional[List[str]] = None,
     reference_clip_id: Optional[str] = None,
+    hero_clip_id: Optional[str] = None,
 ) -> Dict[str, object]:
+    raise_if_cancelled("Run cancelled before review package assembly.")
     root = Path(out_dir).expanduser().resolve()
     report_dir = root / "report"
     review_rmd_dir = root / "review_rmd"
+    rcx_compare_note = _write_rcx_comparison_placeholder(root)
     report_payload = build_contact_sheet_report(
         out_dir,
         out_dir=str(report_dir),
@@ -1378,6 +1622,10 @@ def build_review_package(
         color_calibration_path=color_calibration_path,
         target_type=target_type,
         processing_mode=processing_mode,
+        run_label=run_label,
+        matching_domain=matching_domain,
+        selected_clip_ids=selected_clip_ids,
+        selected_clip_groups=selected_clip_groups,
         preview_mode=preview_mode,
         preview_output_space=preview_output_space,
         preview_output_gamma=preview_output_gamma,
@@ -1387,12 +1635,19 @@ def build_review_package(
         calibration_roi=calibration_roi,
         target_strategies=target_strategies,
         reference_clip_id=reference_clip_id,
+        hero_clip_id=hero_clip_id,
         clear_cache=True,
     )
+    raise_if_cancelled("Run cancelled before writing temporary review RMDs.")
     rmd_manifest = write_rmds_from_analysis(out_dir, out_dir=str(review_rmd_dir))
     package_manifest = {
         "workflow_phase": "review",
         "analysis_dir": str(root),
+        "run_label": run_label or root.name,
+        "matching_domain": _normalize_matching_domain(matching_domain),
+        "matching_domain_label": _matching_domain_label(matching_domain),
+        "selected_clip_ids": [str(item) for item in (selected_clip_ids or []) if str(item).strip()],
+        "selected_clip_groups": [str(item) for item in (selected_clip_groups or []) if str(item).strip()],
         "target_type": target_type,
         "processing_mode": processing_mode,
         "preview_transform": report_payload.get("preview_transform"),
@@ -1401,11 +1656,13 @@ def build_review_package(
         "preview_settings": report_payload.get("preview_settings"),
         "measurement_preview_settings": report_payload.get("measurement_preview_settings"),
         "redline_capabilities": report_payload.get("redline_capabilities"),
-        "exposure_measurement_domain": "monitoring",
+        "exposure_measurement_domain": _normalize_matching_domain(matching_domain),
         "calibration_roi": calibration_roi,
         "target_strategies": target_strategies or list(DEFAULT_REVIEW_TARGET_STRATEGIES),
         "reference_clip_id": reference_clip_id,
+        "hero_clip_id": hero_clip_id,
         "review_rmd_dir": str(review_rmd_dir),
+        "rcx_compare_note": rcx_compare_note,
         "report_json": report_payload["report_json"],
         "report_html": report_payload["report_html"],
         "preview_report_pdf": report_payload["preview_report_pdf"],
@@ -1426,6 +1683,7 @@ def render_contact_sheet_pdf(
     title: str,
     timestamp_label: Optional[str] = None,
 ) -> str:
+    raise_if_cancelled("Run cancelled before PDF rendering.")
     from PIL import Image, ImageDraw, ImageFont
 
     def load_font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
@@ -1472,10 +1730,15 @@ def render_contact_sheet_pdf(
         draw.text((text_x, y), title, fill="black", font=title_font)
         draw.text((text_x, y + 42), "Internal Review", fill="black", font=section_font)
         summary_lines = [
+            f"Run label: {payload.get('run_label')}",
             f"Target type: {payload.get('target_type')}",
             f"Processing mode: {payload.get('processing_mode')}",
+            f"Matching domain: {payload.get('matching_domain_label')}",
             f"Preview transform: {payload.get('preview_transform')}",
+            f"Measurement transform: {payload.get('measurement_preview_transform')}",
             f"Calibration ROI: {payload.get('calibration_roi')}",
+            f"Selected clip groups: {payload.get('selected_clip_groups') or 'all'}",
+            f"Selected clip count: {len(payload.get('selected_clip_ids') or []) or payload.get('clip_count')}",
             f"Target strategies: {', '.join(strategy_display_name(item) for item in payload.get('target_strategies', []))}",
         ]
         summary_y = y + 74
@@ -1522,6 +1785,7 @@ def render_contact_sheet_pdf(
         paged_tiles = _chunk_tiles(tiles, tiles_per_page)
 
         for page_index, page_tiles in enumerate(paged_tiles):
+            raise_if_cancelled("Run cancelled during PDF pagination.")
             _, _, y = ensure_room(y, 140)
             heading = section_title if len(paged_tiles) == 1 else f"{section_title} ({page_index + 1}/{len(paged_tiles)})"
             draw.text((margin_x, y), heading, fill="black", font=section_font)
@@ -1540,6 +1804,7 @@ def render_contact_sheet_pdf(
             _, _, y = ensure_room(y, needed_height + 20)
 
             for index, tile in enumerate(page_tiles):
+                raise_if_cancelled("Run cancelled during PDF tile rendering.")
                 row = index // columns
                 col = index % columns
                 tile_x = margin_x + col * (tile_width + tile_gap_x)
@@ -1553,7 +1818,7 @@ def render_contact_sheet_pdf(
                 meta_y = tile_y + image_height + 8
                 draw.text((tile_x, meta_y), str(tile.get("clip_id", "")), fill="black", font=clip_font)
                 draw.text((tile_x, meta_y + metadata_line_height), f"Exposure: {tile.get('exposure_offset_stops', 'n/a')}", fill="black", font=body_font)
-                draw.text((tile_x, meta_y + metadata_line_height * 2), f"RGB gains: {tile.get('rgb_gains_text', 'n/a')}", fill="black", font=body_font)
+                draw.text((tile_x, meta_y + metadata_line_height * 2), f"CDL gain/sat: {tile.get('rgb_gains_text', 'n/a')}", fill="black", font=body_font)
                 draw.text((tile_x, meta_y + metadata_line_height * 3), f"Confidence: {tile.get('confidence', 'n/a')} | log2: {tile.get('raw_log2', 'n/a')}", fill="black", font=caption_font)
             y += needed_height + section_gap
             if page_index < len(paged_tiles) - 1:
@@ -1565,7 +1830,7 @@ def render_contact_sheet_pdf(
 
     original_tiles = [
         {
-            "clip_id": clip["clip_id"],
+            "clip_id": f"{clip['clip_id']} [HERO]" if str(clip["clip_id"]) == str(payload.get("hero_clip_id") or "") else clip["clip_id"],
             "image_path": clip.get("original_frame"),
             "exposure_offset_stops": clip.get("measured_log2_luminance_monitoring"),
             "rgb_gains_text": "original",
@@ -1576,19 +1841,18 @@ def render_contact_sheet_pdf(
     ]
     draw_tiles(section_title="Original", tiles=original_tiles)
 
-    strategy_order = ["median", "brightest_valid", "manual"]
     strategies_by_key = {str(item["strategy_key"]): item for item in payload.get("strategies", [])}
-    for strategy_key in strategy_order:
+    for strategy_key in STRATEGY_ORDER:
+        raise_if_cancelled("Run cancelled during PDF strategy rendering.")
         strategy = strategies_by_key.get(strategy_key)
         if not strategy:
             continue
         tiles = []
         for clip in strategy.get("clips", []):
-            gains = clip["metrics"]["color"]["rgb_gains"]
-            gains_text = ", ".join(f"{float(value):.3f}" for value in gains) if gains else "n/a"
+            gains_text = _format_cdl_gain_saturation(clip["metrics"]["color"])
             tiles.append(
                 {
-                    "clip_id": clip["clip_id"],
+                    "clip_id": f"{clip['clip_id']} [HERO]" if clip.get("is_hero_camera") else clip["clip_id"],
                     "image_path": clip.get("both_corrected"),
                     "exposure_offset_stops": clip["metrics"]["exposure"]["final_offset_stops"],
                     "rgb_gains_text": gains_text,
@@ -1597,16 +1861,21 @@ def render_contact_sheet_pdf(
                 }
             )
         section_meta = [
+            f"Summary: {strategy.get('strategy_summary')}",
             f"Reference clip: {strategy.get('reference_clip_id')}",
+            f"Hero clip: {strategy.get('hero_clip_id')}",
             f"Target log2 luminance: {strategy.get('target_log2_luminance')}",
-            f"Exposure solve domain: monitoring | Preview transform: {payload.get('preview_transform')}",
+            f"Matching domain: {payload.get('matching_domain_label')} | Preview transform: {payload.get('preview_transform')}",
             f"Calibration ROI: {strategy.get('calibration_roi')}",
         ]
+        if payload.get("color_preview_note"):
+            section_meta.append(f"Color preview note: {payload['color_preview_note']}")
         draw_tiles(section_title=strategy["strategy_label"], tiles=tiles, section_meta=section_meta)
     pages.append(page)
 
     output = Path(output_path).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
+    raise_if_cancelled("Run cancelled before final PDF write.")
     pages[0].save(output, format="PDF", save_all=True, append_images=pages[1:])
     return str(output)
 
@@ -1633,6 +1902,16 @@ def build_ui_calibration_table(input_path: str, *, out_dir: str) -> Dict[str, ob
 
 
 def render_contact_sheet_html(payload: Dict[str, object]) -> str:
+    color_preview_section_note = (
+        f"<p class='section-meta subtle'>{payload.get('color_preview_note')}</p>"
+        if payload.get("color_preview_note")
+        else ""
+    )
+    color_preview_header_note = (
+        f"<p>Color preview: {payload.get('color_preview_status')} | {payload.get('color_preview_note')}</p>"
+        if payload.get("color_preview_note")
+        else ""
+    )
     logo_markup = (
         f"<img class='brand-logo' src='{LOGO_PATH.as_posix()}' alt='R3DMatch logo' />"
         if LOGO_PATH.exists()
@@ -1643,12 +1922,15 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
     original_cards = []
     for clip in payload.get("shared_originals", []):
         path = clip.get("original_frame")
+        is_hero_camera = str(clip["clip_id"]) == str(payload.get("hero_clip_id") or "")
+        hero_badge = "<div class='hero-badge'>Hero</div>" if is_hero_camera else ""
         image_html = (
             f"<figure><img src='../previews/{Path(path).name}' alt='{clip['clip_id']} Original' /><figcaption>Original</figcaption></figure>"
             if path else "<p class='subtle'>No original preview.</p>"
         )
         original_cards.append(
-            "<article class='clip-card'>"
+            f"<article class='clip-card{' hero' if is_hero_camera else ''}'>"
+            f"{hero_badge}"
             f"<h2>{clip['clip_id']}</h2>"
             f"<p class='subtle'>Group: {clip['group_key']}</p>"
             f"{image_html}"
@@ -1662,27 +1944,38 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
             metrics = clip["metrics"]
             gains = metrics["color"]["rgb_gains"]
             gains_text = ", ".join(f"{float(value):.3f}" for value in gains) if gains else "n/a"
+            cdl_text = _format_cdl_gain_saturation(metrics["color"])
             flags = ", ".join(metrics.get("flags", [])) if metrics.get("flags") else "none"
             image_path = clip.get("both_corrected")
+            hero_badge = "<div class='hero-badge'>Hero Camera</div>" if clip.get("is_hero_camera") else ""
+            preview_note_html = (
+                f"<div class='clip-meta subtle'>Preview note: {metrics.get('color_preview_note')}</div>"
+                if metrics.get("color_preview_note")
+                else ""
+            )
             thumbs_html = (
                 f"<figure><img src='../previews/{Path(image_path).name}' alt='{clip['clip_id']} Both' /><figcaption>Both Corrected</figcaption></figure>"
                 if image_path
                 else "<p class='subtle'>No previews generated.</p>"
             )
             cards.append(
-                "<article class='clip-card'>"
+                f"<article class='clip-card{' hero' if clip.get('is_hero_camera') else ''}'>"
+                f"{hero_badge}"
                 f"<div class='thumb-single'>{thumbs_html}</div>"
                 f"<div class='clip-label'>{clip['clip_id']}</div>"
                 f"<div class='clip-meta'>Exposure: {metrics['exposure']['final_offset_stops']}</div>"
-                f"<div class='clip-meta'>RGB gains: {gains_text}</div>"
+                f"<div class='clip-meta'>CDL gain/sat: {cdl_text}</div>"
+                f"<div class='clip-meta subtle'>RGB diagnostic: {gains_text}</div>"
                 f"<div class='clip-meta'>Confidence: {metrics['confidence']} | log2: {metrics['exposure']['measured_log2_luminance_monitoring']}</div>"
                 f"<div class='clip-meta subtle'>Group: {clip['group_key']} | Flags: {flags}</div>"
+                f"{preview_note_html}"
                 "</article>"
             )
         strategy_sections.append(
             f"<section class='report-section'>"
             f"<h2>{strategy['strategy_label']}</h2>"
-            f"<p class='section-meta subtle'>Reference clip: {strategy.get('reference_clip_id')} | Target log2: {strategy.get('target_log2_luminance')} | ROI: {strategy.get('calibration_roi')}</p>"
+            f"<p class='section-meta subtle'>{strategy.get('strategy_summary')} | Reference clip: {strategy.get('reference_clip_id')} | Hero clip: {strategy.get('hero_clip_id')} | Target log2: {strategy.get('target_log2_luminance')} | Matching domain: {payload.get('matching_domain_label')} | ROI: {strategy.get('calibration_roi')}</p>"
+            f"{color_preview_section_note}"
             f"<div class='grid cols-{columns}'>{''.join(cards)}</div></section>"
         )
     return (
@@ -1704,11 +1997,13 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
         ".grid.cols-6{grid-template-columns:repeat(6,minmax(0,1fr));}"
         ".grid.cols-8{grid-template-columns:repeat(8,minmax(0,1fr));}"
         ".clip-card{background:white;border-radius:14px;padding:12px;box-shadow:0 6px 18px rgba(0,0,0,.05);}"
+        ".clip-card.hero{border:2px solid #b91c1c;}"
+        ".hero-badge{display:inline-block;background:#b91c1c;color:white;border-radius:999px;padding:4px 8px;font-size:12px;font-weight:700;margin-bottom:8px;}"
         ".thumb-single figure{margin:0;}"
         ".thumb-single img{width:100%;display:block;border-radius:10px;background:#d7d2c7;aspect-ratio:16/10;object-fit:cover;}"
         "figcaption{font-size:12px;color:#5b554e;margin-top:5px;}"
-        ".clip-label{font-size:15px;font-weight:700;margin-top:10px;}"
-        ".clip-meta{font-size:12px;line-height:1.35;margin-top:4px;}"
+        ".clip-label{font-size:16px;font-weight:700;margin-top:10px;}"
+        ".clip-meta{font-size:13px;line-height:1.35;margin-top:4px;}"
         ".subtle{color:#5b554e;}"
         "@media print{body{padding:12px;background:white;}header,.clip-card{box-shadow:none;border:1px solid #dddddd;}}"
         "</style></head>"
@@ -1716,10 +2011,15 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
         f"{logo_markup}"
         "<div class='header-copy'>"
         "<h1>R3DMatch Review Contact Sheet</h1>"
+        f"<p>Run label: {payload.get('run_label')}</p>"
         f"<p>Target type: {payload.get('target_type')}</p>"
         f"<p>Processing mode: {payload.get('processing_mode')}</p>"
+        f"<p>Matching domain: {payload.get('matching_domain_label')}</p>"
         f"<p>Preview transform: {payload.get('preview_transform')}</p>"
-        f"<p>Clip count: {payload['clip_count']} | ROI: {payload.get('calibration_roi')}</p>"
+        f"<p>Measurement transform: {payload.get('measurement_preview_transform')}</p>"
+        f"{color_preview_header_note}"
+        f"<p>Clip count: {payload['clip_count']} | ROI: {payload.get('calibration_roi')} | Hero clip: {payload.get('hero_clip_id')}</p>"
+        f"<p>Selected clip groups: {payload.get('selected_clip_groups') or 'all'} | Selected clip count: {len(payload.get('selected_clip_ids') or []) or payload.get('clip_count')}</p>"
         "</div></header>"
         f"<section class='report-section'><h2>Original</h2><p class='section-meta subtle'>Shared baseline renders for visual reference.</p><div class='grid cols-{original_columns}'>{''.join(original_cards)}</div></section>"
         f"<main>{''.join(strategy_sections)}</main>"
