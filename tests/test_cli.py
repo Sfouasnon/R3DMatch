@@ -942,6 +942,89 @@ def test_validate_review_run_contract_adds_physical_validation_metrics(tmp_path:
     assert validation["physical_validation"]["confidence"]["per_camera"][0]["roi_variance"] == pytest.approx(0.0002)
 
 
+def test_validate_review_run_contract_adds_recommendation_commit_and_post_apply_outputs(tmp_path: Path) -> None:
+    report_dir = tmp_path / "report"
+    previews_dir = tmp_path / "previews"
+    analysis_dir = tmp_path / "analysis"
+    report_dir.mkdir(parents=True)
+    previews_dir.mkdir(parents=True)
+    analysis_dir.mkdir(parents=True)
+    (tmp_path / "summary.json").write_text(json.dumps({"backend": "red", "mode": "scene"}), encoding="utf-8")
+    (previews_dir / "preview_commands.json").write_text(
+        json.dumps({"review_mode": "lightweight_analysis", "commands": [], "skipped_bulk_preview_rendering": True}),
+        encoding="utf-8",
+    )
+    payload = {
+        "clip_count": 1,
+        "review_mode": "lightweight_analysis",
+        "run_label": "subset_065",
+        "executive_synopsis": "The array is tightly grouped and ready for a median-based commit.",
+        "recommended_strategy": {
+            "strategy_key": "median",
+            "strategy_label": "Median",
+            "reason": "Median keeps the array centered with the smallest overall correction spread.",
+            "metrics": {"mean_confidence_penalty": 0.1},
+        },
+        "hero_recommendation": {
+            "candidate_clip_id": "G007_B057_0324YT_001",
+            "confidence": "medium",
+            "reason": "The clip sits near the robust center and is not an outlier.",
+        },
+        "operator_recommendation": "Proceed with the recommended strategy and export commit values.",
+        "shared_originals": [],
+        "strategies": [],
+        "per_camera_analysis": [
+            {
+                "camera_label": "G007_B057",
+                "clip_id": "G007_B057_0324YT_001",
+                "confidence": 0.92,
+                "note": "Within normal correction range for this subset.",
+                "is_hero_camera": False,
+                "commit_values": {
+                    "exposureAdjust": 0.125,
+                    "kelvin": 5600,
+                    "tint": -0.3,
+                },
+            }
+        ],
+    }
+    (report_dir / "contact_sheet.json").write_text(json.dumps(payload), encoding="utf-8")
+    (report_dir / "review_manifest.json").write_text(json.dumps({"review_mode": "lightweight_analysis"}), encoding="utf-8")
+    (report_dir / "review_package.json").write_text(json.dumps({"review_mode": "lightweight_analysis"}), encoding="utf-8")
+    (report_dir / "contact_sheet.html").write_text("<html></html>", encoding="utf-8")
+    _write_minimal_array_calibration(tmp_path / "array_calibration.json")
+    (analysis_dir / "G007_B057_0324YT_001.analysis.json").write_text(
+        json.dumps(
+            {
+                "clip_id": "G007_B057_0324YT_001",
+                "diagnostics": {
+                    "neutral_samples": [
+                        {"label": "left", "roi_variance": 0.0002},
+                        {"label": "center", "roi_variance": 0.0002},
+                        {"label": "right", "roi_variance": 0.0002},
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    validation = validate_review_run_contract(str(tmp_path))
+
+    assert validation["status"] == "success"
+    assert validation["recommendation"]["recommended_strategy"]["strategy_key"] == "median"
+    assert validation["recommendation"]["hero_camera"] == "G007_B057_0324YT_001"
+    assert validation["failure_modes"] == []
+    assert validation["human_summary"]["executive_summary"].startswith("The array is tightly grouped")
+    assert validation["commit_payload"]["camera_count"] == 1
+    assert Path(validation["commit_payload"]["aggregate_path"]).exists()
+    per_camera_payload = json.loads(Path(validation["commit_payload"]["per_camera_payloads"][0]["path"]).read_text(encoding="utf-8"))
+    assert per_camera_payload["camera_id"] == "G007_B057"
+    assert per_camera_payload["calibration"]["exposureAdjust"] == pytest.approx(0.125)
+    assert validation["post_apply_validation"]["status"] == "success"
+    assert validation["post_apply_validation"]["summary"]["exposure_error_reduced"] is True
+
+
 def test_validate_review_run_contract_fails_when_physical_validation_thresholds_are_exceeded(tmp_path: Path) -> None:
     report_dir = tmp_path / "report"
     previews_dir = tmp_path / "previews"
@@ -973,6 +1056,36 @@ def test_validate_review_run_contract_fails_when_physical_validation_thresholds_
     assert validation["status"] == "failed"
     assert validation["physical_validation"]["status"] == "failed"
     assert any("Physical exposure validation failed" in error or "Physical neutrality validation failed" in error for error in validation["errors"])
+    assert {item["code"] for item in validation["failure_modes"]} >= {"exposure_out_of_range", "neutrality_failure"}
+
+
+def test_validate_review_run_contract_marks_mock_runs_as_physical_validation_unsupported(tmp_path: Path) -> None:
+    report_dir = tmp_path / "report"
+    previews_dir = tmp_path / "previews"
+    report_dir.mkdir(parents=True)
+    previews_dir.mkdir(parents=True)
+    (tmp_path / "summary.json").write_text(json.dumps({"backend": "mock", "mode": "scene"}), encoding="utf-8")
+    (previews_dir / "preview_commands.json").write_text(
+        json.dumps({"review_mode": "lightweight_analysis", "commands": [], "skipped_bulk_preview_rendering": True}),
+        encoding="utf-8",
+    )
+    (report_dir / "contact_sheet.json").write_text(
+        json.dumps({"clip_count": 0, "review_mode": "lightweight_analysis", "shared_originals": [], "strategies": []}),
+        encoding="utf-8",
+    )
+    (report_dir / "review_manifest.json").write_text(json.dumps({"review_mode": "lightweight_analysis"}), encoding="utf-8")
+    (report_dir / "review_package.json").write_text(json.dumps({"review_mode": "lightweight_analysis"}), encoding="utf-8")
+    (report_dir / "contact_sheet.html").write_text("<html></html>", encoding="utf-8")
+    payload = json.loads((tmp_path / "array_calibration.json").read_text(encoding="utf-8")) if (tmp_path / "array_calibration.json").exists() else None
+    _write_minimal_array_calibration(tmp_path / "array_calibration.json")
+    mock_payload = json.loads((tmp_path / "array_calibration.json").read_text(encoding="utf-8"))
+    mock_payload["backend"] = "mock"
+    (tmp_path / "array_calibration.json").write_text(json.dumps(mock_payload), encoding="utf-8")
+
+    validation = validate_review_run_contract(str(tmp_path))
+
+    assert validation["status"] == "success"
+    assert validation["physical_validation"]["status"] == "unsupported"
 
 
 def test_web_app_status_reports_review_validation_failure_detail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
