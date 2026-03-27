@@ -442,6 +442,33 @@ def _apply_monitoring_review_transform(image: np.ndarray) -> np.ndarray:
     return np.power(contrast, 1.0 / 2.4)
 
 
+def _sample_distribution(values: np.ndarray) -> Dict[str, object]:
+    array = np.asarray(values, dtype=np.float32).reshape(-1)
+    if array.size == 0:
+        return {
+            "count": 0,
+            "mean": 0.0,
+            "median": 0.0,
+            "stddev": 0.0,
+            "minimum": 0.0,
+            "maximum": 0.0,
+            "p05": 0.0,
+            "p95": 0.0,
+            "preview_values": [],
+        }
+    return {
+        "count": int(array.size),
+        "mean": float(np.mean(array)),
+        "median": float(np.median(array)),
+        "stddev": float(np.std(array)),
+        "minimum": float(np.min(array)),
+        "maximum": float(np.max(array)),
+        "p05": float(np.percentile(array, 5.0)),
+        "p95": float(np.percentile(array, 95.0)),
+        "preview_values": [float(value) for value in array[: min(32, array.size)].tolist()],
+    }
+
+
 def _measure_region_statistics(region: np.ndarray) -> Dict[str, object]:
     luminance = np.clip(region[0] * 0.2126 + region[1] * 0.7152 + region[2] * 0.0722, 1e-6, 1.0)
     valid_mask = (luminance > 0.002) & (luminance < 0.998)
@@ -458,6 +485,7 @@ def _measure_region_statistics(region: np.ndarray) -> Dict[str, object]:
     saturation_fraction = float(np.mean(np.max(pixels, axis=1) >= 0.998)) if pixels.size else 0.0
     black_fraction = float(np.mean(np.min(pixels, axis=1) <= 0.002)) if pixels.size else 0.0
     roi_variance = float(np.var(trimmed_luma)) if trimmed_luma.size else 0.0
+    log2_values = np.log2(trimmed_luma) if trimmed_luma.size else np.asarray([], dtype=np.float32)
     return {
         "measured_log2_luminance": measured_log2,
         "measured_rgb_mean": [float(rgb_mean[0]), float(rgb_mean[1]), float(rgb_mean[2])],
@@ -466,36 +494,55 @@ def _measure_region_statistics(region: np.ndarray) -> Dict[str, object]:
         "saturation_fraction": saturation_fraction,
         "black_fraction": black_fraction,
         "roi_variance": roi_variance,
+        "gray_luminance_distribution": _sample_distribution(trimmed_luma),
+        "gray_log2_distribution": _sample_distribution(log2_values),
     }
 
 
-def _neutral_sample_regions(region: np.ndarray) -> list[tuple[str, np.ndarray]]:
+def _neutral_sample_regions(region: np.ndarray) -> list[tuple[str, Dict[str, object], np.ndarray]]:
     _, height, width = region.shape
     sample_width = max(1, int(round(width * 0.24)))
     sample_height = max(1, int(round(height * 0.28)))
     center_y = height * 0.5
     center_x_positions = [width * 0.28, width * 0.5, width * 0.72]
     labels = ["left", "center", "right"]
-    samples: list[tuple[str, np.ndarray]] = []
+    samples: list[tuple[str, Dict[str, object], np.ndarray]] = []
     for label, center_x in zip(labels, center_x_positions):
         x0 = max(0, min(width - sample_width, int(round(center_x - sample_width / 2.0))))
         y0 = max(0, min(height - sample_height, int(round(center_y - sample_height / 2.0))))
-        samples.append((label, region[:, y0:y0 + sample_height, x0:x0 + sample_width]))
+        samples.append(
+            (
+                label,
+                {
+                    "pixel": {"x0": int(x0), "y0": int(y0), "x1": int(x0 + sample_width), "y1": int(y0 + sample_height)},
+                    "normalized_within_roi": {
+                        "x": float(x0) / float(max(width, 1)),
+                        "y": float(y0) / float(max(height, 1)),
+                        "w": float(sample_width) / float(max(width, 1)),
+                        "h": float(sample_height) / float(max(height, 1)),
+                    },
+                },
+                region[:, y0:y0 + sample_height, x0:x0 + sample_width],
+            )
+        )
     return samples
 
 
 def _measure_three_sample_statistics(region: np.ndarray) -> Dict[str, object]:
     sample_measurements = []
-    for label, sample_region in _neutral_sample_regions(region):
+    for label, sample_bounds, sample_region in _neutral_sample_regions(region):
         stats = _measure_region_statistics(sample_region)
         sample_measurements.append(
             {
                 "label": label,
+                "bounds": sample_bounds,
                 "measured_log2_luminance": float(stats["measured_log2_luminance"]),
                 "measured_rgb_mean": [float(value) for value in stats["measured_rgb_mean"]],
                 "measured_rgb_chromaticity": [float(value) for value in stats["measured_rgb_chromaticity"]],
                 "valid_pixel_count": int(stats["valid_pixel_count"]),
                 "roi_variance": float(stats["roi_variance"]),
+                "gray_luminance_distribution": dict(stats.get("gray_luminance_distribution") or {}),
+                "gray_log2_distribution": dict(stats.get("gray_log2_distribution") or {}),
             }
         )
     log2_values = np.asarray([item["measured_log2_luminance"] for item in sample_measurements], dtype=np.float32)

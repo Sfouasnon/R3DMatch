@@ -166,7 +166,7 @@ class R3DMatchDesktopApp:
 
         self.strategy_vars = {
             "median": tk.BooleanVar(value=True),
-            "brightest-valid": tk.BooleanVar(value=True),
+            "optimal-exposure": tk.BooleanVar(value=True),
             "manual": tk.BooleanVar(value=False),
         }
 
@@ -239,7 +239,7 @@ class R3DMatchDesktopApp:
         checks = ttk.Frame(strategies)
         checks.pack(fill="x")
         ttk.Checkbutton(checks, text="median", variable=self.strategy_vars["median"]).pack(side="left", padx=(0, 16))
-        ttk.Checkbutton(checks, text="brightest-valid", variable=self.strategy_vars["brightest-valid"]).pack(side="left", padx=(0, 16))
+        ttk.Checkbutton(checks, text="Optimal Exposure (Best Match to Gray)", variable=self.strategy_vars["optimal-exposure"]).pack(side="left", padx=(0, 16))
         ttk.Checkbutton(checks, text="manual", variable=self.strategy_vars["manual"]).pack(side="left")
         ttk.Label(strategies, text="Reference Clip ID").pack(anchor="w", pady=(8, 0))
         self.reference_entry = ttk.Entry(strategies, textvariable=self.reference_clip_id)

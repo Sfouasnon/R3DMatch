@@ -1,6 +1,9 @@
 # Python
 __pycache__/
 *.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Build
 build/
@@ -10,10 +13,14 @@ dist/
 # Outputs
 runs/
 out_*
-*.json
+calibration_card/
 
 # macOS
 .DS_Store
 
 # Env
 .env
+.venv/
+
+# Local scratch
+.codex_write_test

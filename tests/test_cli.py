@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import time
 import types
 from pathlib import Path
 from typing import Optional
@@ -18,6 +19,24 @@ from r3dmatch.ftps_ingest import ingest_ftps_batch, plan_ftps_request
 from r3dmatch.identity import group_key_from_clip_id, rmd_name_for_clip_id, subset_key_from_clip_id
 from r3dmatch.matching import analyze_path, camera_group_from_clip_id, discover_clips, measure_frame_color_and_exposure
 from r3dmatch.models import GrayCardROI, SamplingRegion, SphereROI
+from r3dmatch.rcp2_apply import (
+    MemoryRcp2Transport,
+    Rcp2TimeoutError,
+    apply_calibration_payload,
+    build_camera_verification_report,
+    summarize_apply_report,
+)
+from r3dmatch.rcp2_websocket import (
+    PARAMETER_SPECS,
+    JsonWebSocketClient,
+    Rcp2WebSocketSession,
+    Rcp2WebSocketTimeout,
+    build_periodic_get_payload,
+    build_websocket_text_frame,
+    build_websocket_upgrade_request,
+    expected_websocket_accept,
+    extract_parameter_state,
+)
 from r3dmatch.report import _build_strategy_payloads, _compute_image_difference_metrics, _report_grid_columns, _report_tiles_per_page, build_contact_sheet_report, build_lightweight_analysis_report, build_review_package, preview_filename_for_clip_id, render_contact_sheet_html, render_contact_sheet_pdf, render_preview_frame
 from r3dmatch.rmd import render_rmd_xml, rmd_filename_for_clip_id, write_rmd_for_clip_with_metadata, write_rmds_from_analysis
 from r3dmatch.ui import build_table_rows, load_review_bundle
@@ -25,10 +44,103 @@ from r3dmatch.sdk import MockR3DBackend, RedSdkDecoder, resolve_backend
 from r3dmatch.sidecar import build_sidecar_payload, sidecar_filename_for_clip_id
 from r3dmatch.transcode import build_redline_command, build_redline_command_variants, write_transcode_plan
 from r3dmatch.validation import validate_pipeline
-from r3dmatch.web_app import _normalize_subset_form, _resolve_selected_clip_ids, _subset_selection_ui, build_review_web_command, create_app, scan_sources
-from r3dmatch.workflow import approve_master_rmd, clear_preview_cache, resolve_review_output_dir, review_calibration, validate_review_run_contract
+from r3dmatch.web_app import _normalize_subset_form, _preferred_roi_preview_record, _resolve_selected_clip_ids, _resolved_output_path_for_form, _scan_preview_path, _subset_selection_ui, build_review_web_command, create_app, scan_sources
+from r3dmatch.workflow import approve_master_rmd, build_post_apply_verification_from_reviews, clear_preview_cache, resolve_review_output_dir, review_calibration, validate_review_run_contract
 
 runner = CliRunner()
+
+
+def test_build_websocket_upgrade_request_contains_expected_headers() -> None:
+    request = build_websocket_upgrade_request(host="10.20.61.191", port=9998, key="dGhlIHNhbXBsZSBub25jZQ==").decode("utf-8")
+    assert request.startswith("GET / HTTP/1.1\r\n")
+    assert "Host: 10.20.61.191:9998\r\n" in request
+    assert "Upgrade: websocket\r\n" in request
+    assert "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" in request
+    assert expected_websocket_accept("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+
+
+def test_build_websocket_text_frame_masks_payload() -> None:
+    frame = build_websocket_text_frame("hello", mask_key=b"\x01\x02\x03\x04")
+    assert frame[:2] == bytes([0x81, 0x80 | 5])
+    assert frame[2:6] == b"\x01\x02\x03\x04"
+    assert frame[6:] == bytes([
+        ord("h") ^ 0x01,
+        ord("e") ^ 0x02,
+        ord("l") ^ 0x03,
+        ord("l") ^ 0x04,
+        ord("o") ^ 0x01,
+    ])
+
+
+def test_extract_parameter_state_uses_edit_info_divider_and_display() -> None:
+    state = extract_parameter_state(
+        [
+            {"type": "rcp_cur_int_edit_info", "id": "EXPOSURE_ADJUST", "divider": 1000, "cur": 12},
+            {"type": "rcp_cur_int", "id": "EXPOSURE_ADJUST", "cur": {"val": 12}},
+            {"type": "rcp_cur_str", "id": "EXPOSURE_ADJUST", "display": {"str": "0.012", "abbr": "0.012"}},
+        ],
+        parameter_id="EXPOSURE_ADJUST",
+        fallback_divider=1000,
+    )
+    assert state.parameter_id == "EXPOSURE_ADJUST"
+    assert state.raw_value == 12
+    assert state.divider == 1000
+    assert state.value == pytest.approx(0.012)
+    assert state.display == "0.012"
+
+
+def test_parameter_specs_use_documented_fallback_dividers() -> None:
+    assert PARAMETER_SPECS["exposureAdjust"].default_divider == 1000
+    assert PARAMETER_SPECS["kelvin"].default_divider == 1
+    assert PARAMETER_SPECS["tint"].default_divider == 1000
+
+
+def test_build_periodic_get_payload_normalizes_parameter_id() -> None:
+    payload = build_periodic_get_payload(parameter_id="RCP_PARAM_TINT", interval_ms=500)
+    assert payload == {"type": "rcp_get_periodic_on", "id": "TINT", "interval_ms": 500}
+
+
+def test_collect_matching_messages_ignores_stale_pending_matches(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = JsonWebSocketClient(
+        host="10.20.61.191",
+        port=9998,
+        connect_timeout_ms=100,
+        operation_timeout_ms=100,
+        settle_timeout_ms=10,
+    )
+    session = Rcp2WebSocketSession(sock=types.SimpleNamespace(), host="10.20.61.191", port=9998)
+    session.message_counter = 5
+    session.pending_messages.append(
+        {
+            "type": "rcp_cur_int",
+            "id": "EXPOSURE_ADJUST",
+            "cur": {"val": 12},
+            "_r3dmatch_message_index": 4,
+        }
+    )
+    calls = {"count": 0}
+
+    def fake_recv_json(_session: object, _timeout_s: float) -> dict[str, object]:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {
+                "type": "rcp_cur_int",
+                "id": "EXPOSURE_ADJUST",
+                "cur": {"val": 15},
+                "_r3dmatch_message_index": 6,
+            }
+        raise Rcp2WebSocketTimeout("done")
+
+    monkeypatch.setattr(client, "recv_json", fake_recv_json)
+    messages = client.collect_matching_messages(
+        session,
+        matcher=lambda message: str(message.get("id") or "") == "EXPOSURE_ADJUST",
+        timeout_ms=100,
+        settle_timeout_ms=10,
+        minimum_message_index=5,
+    )
+    assert len(messages) == 1
+    assert messages[0]["cur"]["val"] == 15
 
 
 def _write_test_preview(path: Path, color: tuple[int, int, int] = (128, 128, 128)) -> None:
@@ -489,7 +601,7 @@ def test_web_app_routes_and_validation(tmp_path: Path, monkeypatch: pytest.Monke
         state.task.preview_mode = str(kwargs.get("preview_mode", ""))
 
     monkeypatch.setattr("r3dmatch.web_app._start_command_task", fake_start)
-    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan, form=None: None)
     app = create_app()
     client = app.test_client()
 
@@ -534,6 +646,107 @@ def test_web_app_routes_and_validation(tmp_path: Path, monkeypatch: pytest.Monke
     assert started["kwargs"]["preview_mode"] == "calibration"
 
 
+def test_resolved_output_path_for_form_matches_workflow_group_run_label(tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"
+    scan = {
+        "clip_ids": [f"G007_{camera}065_0325XX_001" for camera in ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]],
+    }
+    form = {
+        "output_path": str(out_dir),
+        "run_label": "",
+        "selected_clip_ids": [],
+        "selected_clip_groups": ["065"],
+    }
+    assert _resolved_output_path_for_form(form, scan) == str(out_dir / "subset_065")
+
+
+def test_web_run_review_uses_canonical_group_output_path_not_subset_count(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    started: dict[str, object] = {}
+
+    def fake_start(state, command, output_path, **kwargs):  # type: ignore[no-untyped-def]
+        started["command"] = command
+        started["output_path"] = output_path
+        state.task.command = " ".join(command)
+        state.task.output_path = output_path
+        state.task.canonical_output_path = output_path
+        state.task.status = "running"
+
+    monkeypatch.setattr("r3dmatch.web_app._start_command_task", fake_start)
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan, form=None: None)
+    app = create_app()
+    client = app.test_client()
+    input_root = tmp_path / "input"
+    out_dir = tmp_path / "out"
+    for camera in ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]:
+        rdc = input_root / f"G007_{camera}065_0325XX.RDC"
+        rdc.mkdir(parents=True, exist_ok=True)
+        (rdc / f"G007_{camera}065_0325XX_001.R3D").write_bytes(b"")
+
+    scan_response = client.post("/scan", data={"input_path": str(input_root), "output_path": str(out_dir)})
+    assert scan_response.status_code == 200
+
+    run_response = client.post(
+        "/run-review",
+        data={
+            "input_path": str(input_root),
+            "output_path": str(out_dir),
+            "backend": "mock",
+            "target_type": "gray_sphere",
+            "processing_mode": "both",
+            "matching_domain": "scene",
+            "review_mode": "lightweight_analysis",
+            "preview_mode": "calibration",
+            "roi_x": "0.43",
+            "roi_y": "0.42",
+            "roi_w": "0.14",
+            "roi_h": "0.16",
+            "selected_clip_groups": ["065"],
+            "target_strategies": ["median"],
+        },
+    )
+    assert run_response.status_code == 200
+    assert started["output_path"] == str(out_dir / "subset_065")
+    assert "subset_12" not in str(started["output_path"])
+
+
+def test_preferred_roi_preview_record_prefers_group_063_when_available() -> None:
+    scan = {
+        "clip_records": [
+            {
+                "clip_id": "G007_A065_0325F6_001",
+                "subset_group": "065",
+                "camera_label": "Cam A",
+                "source_path": "/tmp/G007_A065_0325F6_001.R3D",
+            },
+            {
+                "clip_id": "G007_A063_032563_001",
+                "subset_group": "063",
+                "camera_label": "Cam A",
+                "source_path": "/tmp/G007_A063_032563_001.R3D",
+            },
+        ],
+        "clip_ids": ["G007_A065_0325F6_001", "G007_A063_032563_001"],
+        "clip_groups": [
+            {"group_id": "063", "clip_ids": ["G007_A063_032563_001"], "clip_count": 1},
+            {"group_id": "065", "clip_ids": ["G007_A065_0325F6_001"], "clip_count": 1},
+        ],
+    }
+    form = {
+        "selected_clip_groups": ["065"],
+        "selected_clip_ids": [],
+        "advanced_clip_selection": False,
+    }
+    record = _preferred_roi_preview_record(form, scan)
+    assert record is not None
+    assert record["clip_id"] == "G007_A063_032563_001"
+
+
+def test_scan_preview_path_changes_with_selected_roi_clip() -> None:
+    first = _scan_preview_path("/tmp/calibration", clip_id="G007_A063_032563_001", preview_mode="calibration")
+    second = _scan_preview_path("/tmp/calibration", clip_id="G007_A065_0325F6_001", preview_mode="calibration")
+    assert first != second
+
+
 def test_build_review_web_command_supports_ftps_source_mode() -> None:
     command = build_review_web_command(
         "/Users/sfouasnon/Desktop/R3DMatch",
@@ -572,7 +785,7 @@ def test_build_review_web_command_supports_ftps_source_mode() -> None:
 
 
 def test_web_app_subset_panel_defaults_to_group_control_and_read_only_clips(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan, form=None: None)
     app = create_app()
     client = app.test_client()
     for name in [
@@ -613,7 +826,7 @@ def test_web_app_advanced_clip_mode_disables_group_submission(tmp_path: Path, mo
         state.task.logs = ["started\n"]
 
     monkeypatch.setattr("r3dmatch.web_app._start_command_task", fake_start)
-    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan, form=None: None)
     app = create_app()
     client = app.test_client()
     for name in [
@@ -651,7 +864,7 @@ def test_web_app_advanced_clip_mode_disables_group_submission(tmp_path: Path, mo
 
 
 def test_web_app_status_progress_and_completion_links(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan, form=None: None)
     app = create_app()
     client = app.test_client()
     out_dir = tmp_path / "out"
@@ -671,7 +884,7 @@ def test_web_app_status_progress_and_completion_links(tmp_path: Path, monkeypatc
     state.task.status = "running"
     state.task.returncode = 0
     state.task.clip_count = 3
-    state.task.strategies_text = "median, brightest-valid"
+    state.task.strategies_text = "median, optimal-exposure"
     state.task.preview_mode = "calibration"
     status_response = client.get("/status")
     assert status_response.status_code == 200
@@ -686,7 +899,7 @@ def test_web_app_status_progress_and_completion_links(tmp_path: Path, monkeypatc
 
 
 def test_web_app_status_prefers_live_process_over_stale_completed_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan, form=None: None)
     app = create_app()
     client = app.test_client()
     out_dir = tmp_path / "out"
@@ -716,7 +929,7 @@ def test_web_app_status_prefers_live_process_over_stale_completed_state(tmp_path
 
 
 def test_web_app_status_marks_finishing_and_stalled_with_live_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan, form=None: None)
     app = create_app()
     client = app.test_client()
     out_dir = tmp_path / "out"
@@ -1059,6 +1272,166 @@ def test_validate_review_run_contract_fails_when_physical_validation_thresholds_
     assert {item["code"] for item in validation["failure_modes"]} >= {"exposure_out_of_range", "neutrality_failure"}
 
 
+def test_validate_review_run_contract_warns_and_excludes_single_outlier_when_cluster_is_still_usable(tmp_path: Path) -> None:
+    report_dir = tmp_path / "report"
+    previews_dir = tmp_path / "previews"
+    analysis_dir = tmp_path / "analysis"
+    report_dir.mkdir(parents=True)
+    previews_dir.mkdir(parents=True)
+    analysis_dir.mkdir(parents=True)
+    (tmp_path / "summary.json").write_text(json.dumps({"backend": "red", "mode": "scene"}), encoding="utf-8")
+    (previews_dir / "preview_commands.json").write_text(
+        json.dumps({"review_mode": "lightweight_analysis", "commands": [], "skipped_bulk_preview_rendering": True}),
+        encoding="utf-8",
+    )
+    clip_ids = [
+        "G007_A064_0325RN_001",
+        "H007_A064_0325PK_001",
+        "I007_A064_0325XY_001",
+        "G007_B064_032526_001",
+    ]
+    (report_dir / "contact_sheet.json").write_text(
+        json.dumps(
+            {
+                "clip_count": 4,
+                "review_mode": "lightweight_analysis",
+                "run_label": "subset_064",
+                "executive_synopsis": "The subset has one intentional low-exposure outlier but the remaining cluster is coherent.",
+                "recommended_strategy": {
+                    "strategy_key": "median",
+                    "strategy_label": "Median",
+                    "reason": "Median keeps the main cluster balanced.",
+                    "metrics": {"mean_confidence_penalty": 0.22},
+                },
+                "hero_recommendation": {
+                    "candidate_clip_id": "G007_B064_032526_001",
+                    "confidence": "medium",
+                    "reason": "The clip sits near the center of the stable cluster.",
+                },
+                "operator_recommendation": "Proceed with the non-excluded cameras and review the intentional outlier separately.",
+                "shared_originals": [],
+                "strategies": [],
+                "per_camera_analysis": [
+                    {
+                        "camera_label": "G007_A064",
+                        "clip_id": clip_ids[0],
+                        "confidence": 0.81,
+                        "note": "Within normal correction range for this subset.",
+                        "is_hero_camera": False,
+                        "commit_values": {"exposureAdjust": -0.12, "kelvin": 5664, "tint": 0.0},
+                    },
+                    {
+                        "camera_label": "H007_A064",
+                        "clip_id": clip_ids[1],
+                        "confidence": 0.79,
+                        "note": "Within normal correction range for this subset.",
+                        "is_hero_camera": False,
+                        "commit_values": {"exposureAdjust": -0.05, "kelvin": 5664, "tint": 0.1},
+                    },
+                    {
+                        "camera_label": "I007_A064",
+                        "clip_id": clip_ids[2],
+                        "confidence": 0.30,
+                        "note": "Intentional low-exposure camera. Review required.",
+                        "is_hero_camera": False,
+                        "commit_values": {"exposureAdjust": -1.219, "kelvin": 5664, "tint": 0.2},
+                    },
+                    {
+                        "camera_label": "G007_B064",
+                        "clip_id": clip_ids[3],
+                        "confidence": 0.84,
+                        "note": "Within normal correction range for this subset.",
+                        "is_hero_camera": False,
+                        "commit_values": {"exposureAdjust": 0.02, "kelvin": 5664, "tint": -0.1},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (report_dir / "review_manifest.json").write_text(json.dumps({"review_mode": "lightweight_analysis"}), encoding="utf-8")
+    (report_dir / "review_package.json").write_text(json.dumps({"review_mode": "lightweight_analysis"}), encoding="utf-8")
+    (report_dir / "contact_sheet.html").write_text("<html></html>", encoding="utf-8")
+
+    array_payload = {
+        "schema": "r3dmatch_array_calibration_v1",
+        "backend": "red",
+        "measurement_domain": "scene",
+        "target": {
+            "exposure": {"log2_luminance_target": -2.473931188332412},
+            "color": {"target_rgb_chromaticity": [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]},
+        },
+        "global_scene_intent": {
+            "white_balance_model": {
+                "model_key": "shared_kelvin_per_camera_tint",
+                "model_label": "Shared Kelvin / Per-Camera Tint",
+                "shared_kelvin": 5664,
+                "shared_tint": 0.0,
+            }
+        },
+        "cameras": [],
+    }
+    camera_specs = [
+        (clip_ids[0], "G007_A064", [0.18, 0.18, 0.18], 0.0, 0.82, 0.01, 0.001),
+        (clip_ids[1], "H007_A064", [0.18, 0.18, 0.18], 0.0, 0.79, 0.01, 0.001),
+        (clip_ids[2], "I007_A064", [0.4, 0.4, 0.4], 0.0, 0.30, 0.35, 0.02),
+        (clip_ids[3], "G007_B064", [0.18, 0.18, 0.18], 0.0, 0.84, 0.01, 0.001),
+    ]
+    for clip_id, camera_id, rgb_mean, exposure_offset, quality_confidence, sample_log2_spread, sample_chroma_spread in camera_specs:
+        array_payload["cameras"].append(
+            {
+                "clip_id": clip_id,
+                "camera_id": camera_id,
+                "source_path": str(tmp_path / f"{clip_id}.R3D"),
+                "measurement": {
+                    "measured_rgb_mean": rgb_mean,
+                    "measured_rgb_chromaticity": [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
+                    "neutral_sample_log2_spread": sample_log2_spread,
+                    "neutral_sample_chromaticity_spread": sample_chroma_spread,
+                },
+                "solution": {
+                    "exposure_offset_stops": exposure_offset,
+                    "rgb_gains": [1.0, 1.0, 1.0],
+                    "kelvin": 5664,
+                    "tint": 0.0,
+                },
+                "quality": {
+                    "confidence": quality_confidence,
+                    "neutral_sample_log2_spread": sample_log2_spread,
+                    "neutral_sample_chromaticity_spread": sample_chroma_spread,
+                    "post_color_residual": 0.0,
+                },
+            }
+        )
+        (analysis_dir / f"{clip_id}.analysis.json").write_text(
+            json.dumps({"clip_id": clip_id, "diagnostics": {"neutral_samples": [{"roi_variance": 0.0002}]}}),
+            encoding="utf-8",
+        )
+    (tmp_path / "array_calibration.json").write_text(json.dumps(array_payload), encoding="utf-8")
+
+    validation = validate_review_run_contract(str(tmp_path))
+
+    assert validation["status"] == "success"
+    assert validation["physical_validation"]["status"] == "warning"
+    assert validation["physical_validation"]["cluster_is_usable_after_exclusions"] is True
+    assert validation["physical_validation"]["excluded_camera_count"] == 1
+    assert validation["physical_validation"]["included_camera_count"] == 3
+    assert validation["physical_validation"]["excluded_cameras"][0]["clip_id"] == "I007_A064_0325XY_001"
+    assert any("Excluded 1 outlier camera" in warning for warning in validation["warnings"])
+    assert {item["code"] for item in validation["failure_modes"]} >= {"excluded_cameras_present"}
+    assert validation["human_summary"]["pass_fail_explanation"].startswith("The main camera cluster remains usable")
+    assert validation["run_assessment"]["status"] == "READY_WITH_WARNINGS"
+    assert validation["run_assessment"]["recommendation_strength"] == "MEDIUM_CONFIDENCE"
+    assert validation["run_assessment"]["safe_to_push_later"] is True
+    assert validation["human_summary"]["run_status"] == "READY_WITH_WARNINGS"
+    assert len(validation["commit_payload"]["safe_camera_targets"]) == 3
+    excluded_payload = next(item for item in validation["commit_payload"]["per_camera_payloads"] if item["camera_id"] == "I007_A064")
+    excluded_payload_json = json.loads(Path(excluded_payload["path"]).read_text(encoding="utf-8"))
+    assert excluded_payload_json["excluded_from_commit"] is True
+    assert excluded_payload_json["safe_to_commit"] is False
+    assert excluded_payload_json["trust_class"] == "EXCLUDED"
+
+
 def test_validate_review_run_contract_marks_mock_runs_as_physical_validation_unsupported(tmp_path: Path) -> None:
     report_dir = tmp_path / "report"
     previews_dir = tmp_path / "previews"
@@ -1089,7 +1462,7 @@ def test_validate_review_run_contract_marks_mock_runs_as_physical_validation_uns
 
 
 def test_web_app_status_reports_review_validation_failure_detail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan, form=None: None)
     app = create_app()
     client = app.test_client()
     out_dir = tmp_path / "out"
@@ -1127,7 +1500,7 @@ def test_web_app_status_reports_review_validation_failure_detail(tmp_path: Path,
 
 
 def test_web_app_status_fails_when_review_validation_exists_only_in_wrong_location(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan, form=None: None)
     app = create_app()
     client = app.test_client()
     out_dir = tmp_path / "out"
@@ -1154,7 +1527,7 @@ def test_web_app_status_fails_when_review_validation_exists_only_in_wrong_locati
 
 
 def test_web_app_status_ignores_stale_review_artifacts_from_previous_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan, form=None: None)
     app = create_app()
     client = app.test_client()
     out_dir = tmp_path / "out"
@@ -1210,7 +1583,7 @@ def test_web_app_status_ignores_stale_review_artifacts_from_previous_run(tmp_pat
 
 
 def test_web_app_status_prefers_completed_over_late_cancel_when_validation_succeeds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan, form=None: None)
     app = create_app()
     client = app.test_client()
     out_dir = tmp_path / "out"
@@ -1237,7 +1610,7 @@ def test_web_app_status_prefers_completed_over_late_cancel_when_validation_succe
 
 
 def test_web_app_status_hides_optional_validation_warning_from_completed_detail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan, form=None: None)
     app = create_app()
     client = app.test_client()
     out_dir = tmp_path / "out"
@@ -1263,7 +1636,7 @@ def test_web_app_status_hides_optional_validation_warning_from_completed_detail(
 
 
 def test_web_app_status_accepts_canonical_review_validation_with_validated_at_even_if_mtime_is_old(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan, form=None: None)
     app = create_app()
     client = app.test_client()
     out_dir = tmp_path / "subset_065"
@@ -1302,6 +1675,110 @@ def test_web_app_status_accepts_canonical_review_validation_with_validated_at_ev
     assert payload["stage"] == "Complete"
     assert payload["validation_status"] == "success"
     assert payload["status_detail"] == ""
+    assert payload["output_folder"] == str(out_dir)
+    assert payload["validation_path"] == str(validation_path)
+
+
+def test_web_app_status_uses_canonical_task_output_path_over_stale_guessed_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan, form=None: None)
+    app = create_app()
+    client = app.test_client()
+    parent_dir = tmp_path / "runs"
+    stale_out_dir = parent_dir / "subset_12"
+    real_out_dir = parent_dir / "subset_065"
+    stale_out_dir.mkdir(parents=True)
+    report_dir = real_out_dir / "report"
+    report_dir.mkdir(parents=True)
+    validation_path = report_dir / "review_validation.json"
+    validation_path.write_text(
+        json.dumps(
+            {
+                "status": "success",
+                "errors": [],
+                "warnings": [],
+                "review_mode": "lightweight_analysis",
+                "validated_at": 301.0,
+                "validation_path": str(validation_path),
+                "physical_validation": {"status": "success"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = app.config["UI_STATE"]
+    state.form.update({"output_path": str(parent_dir), "resolved_output_path": str(stale_out_dir)})
+    state.task.command = "python3 -m r3dmatch.cli review-calibration /tmp/in --out /tmp/out --review-mode lightweight_analysis"
+    state.task.output_path = str(stale_out_dir)
+    state.task.canonical_output_path = str(real_out_dir)
+    state.task.status = "running"
+    state.task.returncode = 0
+    state.task.stage = "Building report"
+    state.task.stage_index = 4
+    state.task.started_at = 300.0
+    state.task.last_output_at = 300.0
+    state.task.last_progress_at = 300.0
+
+    payload = client.get("/status").get_json()
+
+    assert payload["status"] == "completed"
+    assert payload["stage"] == "Complete"
+    assert payload["validation_status"] == "success"
+    assert payload["status_detail"] == ""
+    assert payload["output_folder"] == str(real_out_dir)
+    assert payload["validation_path"] == str(validation_path)
+    assert payload["finalization_debug"]["resolved_run_directory"] == str(real_out_dir)
+    assert payload["finalization_debug"]["resolved_validation_path"] == str(validation_path)
+
+
+def test_web_app_status_mismatched_form_path_cannot_override_successful_validation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan, form=None: None)
+    app = create_app()
+    client = app.test_client()
+    parent_dir = tmp_path / "runs"
+    stale_out_dir = parent_dir / "subset_12"
+    real_out_dir = parent_dir / "subset_065"
+    stale_out_dir.mkdir(parents=True)
+    report_dir = real_out_dir / "report"
+    report_dir.mkdir(parents=True)
+    validation_path = report_dir / "review_validation.json"
+    validation_path.write_text(
+        json.dumps(
+            {
+                "status": "success",
+                "errors": [],
+                "warnings": ["Optional artifact missing: preview_contact_sheet_pdf"],
+                "review_mode": "lightweight_analysis",
+                "clip_count": 12,
+                "validated_at": 500.5,
+                "validation_path": str(validation_path),
+                "physical_validation": {"status": "success"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.utime(validation_path, (450.0, 450.0))
+
+    state = app.config["UI_STATE"]
+    state.form.update({"output_path": str(parent_dir), "resolved_output_path": str(stale_out_dir)})
+    state.task.command = "python3 -m r3dmatch.cli review-calibration /tmp/in --out /tmp/out --review-mode lightweight_analysis"
+    state.task.output_path = str(stale_out_dir)
+    state.task.canonical_output_path = str(real_out_dir)
+    state.task.status = "running"
+    state.task.returncode = 0
+    state.task.stage = "Building report"
+    state.task.stage_index = 4
+    state.task.started_at = 500.0
+    state.task.last_output_at = 500.0
+    state.task.last_progress_at = 500.0
+
+    payload = client.get("/status").get_json()
+
+    assert payload["status"] == "completed"
+    assert payload["stage"] == "Complete"
+    assert payload["validation_status"] == "success"
+    assert payload["status_detail"] == ""
+    assert payload["output_folder"] == str(real_out_dir)
+    assert payload["validation_path"] == str(validation_path)
 
 
 def test_validate_review_run_contract_writes_validation_path_and_timestamp(tmp_path: Path) -> None:
@@ -1464,7 +1941,7 @@ def test_web_review_command_includes_subset_and_matching_domain() -> None:
 
 
 def test_web_app_scan_page_shows_roi_mode_and_preview_placeholder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan: None)
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", lambda input_path, scan, form=None: None)
     app = create_app()
     client = app.test_client()
     response = client.post("/scan", data={"input_path": str(tmp_path), "output_path": str(tmp_path / "out")})
@@ -1476,6 +1953,28 @@ def test_web_app_scan_page_shows_roi_mode_and_preview_placeholder(tmp_path: Path
     assert b"full" in response.data
     assert b"manual" in response.data
     assert b"Hero Camera" in response.data
+
+
+def test_web_app_scan_page_shows_roi_guidance_and_preview_note(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clip_dir = tmp_path / "G007_A063_032563.RDC"
+    clip_dir.mkdir()
+    (clip_dir / "G007_A063_032563_001.R3D").write_bytes(b"")
+
+    def fake_preview(input_path, scan, form=None):  # type: ignore[no-untyped-def]
+        scan["preview_note"] = "ROI preview uses G007_A063_032563_001 from group 063 with the active calibration preview transform."
+        scan["preview_warning"] = None
+        return "/tmp/roi-preview.jpg"
+
+    monkeypatch.setattr("r3dmatch.web_app._ensure_scan_preview", fake_preview)
+    app = create_app()
+    client = app.test_client()
+    response = client.post(
+        "/scan",
+        data={"input_path": str(tmp_path), "output_path": str(tmp_path / "out"), "selected_clip_groups": ["063"]},
+    )
+    assert response.status_code == 200
+    assert b"Draw region around gray target" in response.data
+    assert b"ROI preview uses G007_A063_032563_001 from group 063" in response.data
 
 
 def test_ui_self_check_reports_visible_sections() -> None:
@@ -1576,7 +2075,12 @@ def test_target_strategies_use_scene_domain_values_by_default() -> None:
             },
         },
     ]
-    strategies = _build_strategy_payloads(records, target_strategies=["brightest-valid", "manual"], reference_clip_id="G007_B057_0324YT_001")
+    strategies = _build_strategy_payloads(
+        records,
+        target_strategies=["optimal-exposure", "manual"],
+        reference_clip_id="G007_B057_0324YT_001",
+        anchor_target_log2=-1.1,
+    )
     assert strategies[0]["reference_clip_id"] == "G007_B057_0324YT_001"
     assert strategies[0]["target_log2_luminance"] == pytest.approx(-1.0)
     assert strategies[1]["reference_clip_id"] == "G007_B057_0324YT_001"
@@ -1614,14 +2118,206 @@ def test_target_strategies_use_perceptual_domain_values_when_requested() -> None
     ]
     strategies = _build_strategy_payloads(
         records,
-        target_strategies=["brightest-valid", "manual"],
+        target_strategies=["optimal-exposure", "manual"],
         reference_clip_id="G007_B057_0324YT_001",
         matching_domain="perceptual",
+        anchor_target_log2=-1.6,
     )
     assert strategies[0]["reference_clip_id"] == "G007_C057_0324YT_001"
     assert strategies[0]["target_log2_luminance"] == pytest.approx(-1.5)
     assert strategies[1]["reference_clip_id"] == "G007_B057_0324YT_001"
     assert strategies[1]["target_log2_luminance"] == pytest.approx(-3.0)
+
+
+def test_optimal_exposure_prefers_best_gray_match_and_excludes_untrusted_outlier() -> None:
+    records = [
+        {
+            "clip_id": "I007_A065_0325D0_001",
+            "group_key": "array_batch",
+            "source_path": "/tmp/I007_A065_0325D0_001.R3D",
+            "confidence": 0.95,
+            "flags": [],
+            "diagnostics": {
+                "measured_log2_luminance": -1.52,
+                "measured_log2_luminance_monitoring": -1.52,
+                "measured_log2_luminance_raw": -1.52,
+                "measured_rgb_chromaticity": [0.343, 0.331, 0.326],
+                "neutral_sample_log2_spread": 0.03,
+                "neutral_sample_chromaticity_spread": 0.002,
+            },
+        },
+        {
+            "clip_id": "G007_D065_0325BJ_001",
+            "group_key": "array_batch",
+            "source_path": "/tmp/G007_D065_0325BJ_001.R3D",
+            "confidence": 0.95,
+            "flags": [],
+            "diagnostics": {
+                "measured_log2_luminance": -2.84,
+                "measured_log2_luminance_monitoring": -2.84,
+                "measured_log2_luminance_raw": -2.84,
+                "measured_rgb_chromaticity": [0.338, 0.329, 0.333],
+                "neutral_sample_log2_spread": 0.03,
+                "neutral_sample_chromaticity_spread": 0.002,
+            },
+        },
+        {
+            "clip_id": "H007_D065_0325CS_001",
+            "group_key": "array_batch",
+            "source_path": "/tmp/H007_D065_0325CS_001.R3D",
+            "confidence": 0.92,
+            "flags": [],
+            "diagnostics": {
+                "measured_log2_luminance": -2.95,
+                "measured_log2_luminance_monitoring": -2.95,
+                "measured_log2_luminance_raw": -2.95,
+                "measured_rgb_chromaticity": [0.337, 0.33, 0.333],
+                "neutral_sample_log2_spread": 0.02,
+                "neutral_sample_chromaticity_spread": 0.002,
+            },
+        },
+        {
+            "clip_id": "I007_D065_0325BP_001",
+            "group_key": "array_batch",
+            "source_path": "/tmp/I007_D065_0325BP_001.R3D",
+            "confidence": 0.89,
+            "flags": [],
+            "diagnostics": {
+                "measured_log2_luminance": -2.85,
+                "measured_log2_luminance_monitoring": -2.85,
+                "measured_log2_luminance_raw": -2.85,
+                "measured_rgb_chromaticity": [0.342, 0.331, 0.327],
+                "neutral_sample_log2_spread": 0.03,
+                "neutral_sample_chromaticity_spread": 0.003,
+            },
+        },
+    ]
+    quality_by_clip = {
+        "I007_A065_0325D0_001": {
+            "confidence": 0.58,
+            "neutral_sample_log2_spread": 0.34,
+            "neutral_sample_chromaticity_spread": 0.002,
+            "flags": ["neutral_sample_exposure_spread_high"],
+        },
+        "G007_D065_0325BJ_001": {
+            "confidence": 0.85,
+            "neutral_sample_log2_spread": 0.03,
+            "neutral_sample_chromaticity_spread": 0.003,
+            "flags": [],
+        },
+        "H007_D065_0325CS_001": {
+            "confidence": 0.74,
+            "neutral_sample_log2_spread": 0.04,
+            "neutral_sample_chromaticity_spread": 0.004,
+            "flags": [],
+        },
+        "I007_D065_0325BP_001": {
+            "confidence": 0.79,
+            "neutral_sample_log2_spread": 0.05,
+            "neutral_sample_chromaticity_spread": 0.004,
+            "flags": [],
+        },
+    }
+    strategies = _build_strategy_payloads(
+        records,
+        target_strategies=["optimal-exposure"],
+        reference_clip_id=None,
+        matching_domain="scene",
+        quality_by_clip=quality_by_clip,
+        anchor_target_log2=-2.84,
+    )
+    strategy = strategies[0]
+    assert strategy["reference_clip_id"] == "G007_D065_0325BJ_001"
+    assert strategy["selection_diagnostics"]["fallback_mode"] == "trusted_anchor"
+    assert strategy["selection_diagnostics"]["scored_candidates"][0]["clip_id"] == "G007_D065_0325BJ_001"
+    assert strategy["selection_diagnostics"]["screened_candidates"][0]["clip_id"] == "I007_A065_0325D0_001"
+    assert "closest to the gray target" in strategy["strategy_summary"]
+
+
+def test_optimal_exposure_screens_out_secondary_exposure_cluster() -> None:
+    records = [
+        {
+            "clip_id": "G007_A064_0325AA_001",
+            "group_key": "array_batch",
+            "source_path": "/tmp/G007_A064_0325AA_001.R3D",
+            "confidence": 0.82,
+            "flags": [],
+            "diagnostics": {
+                "measured_log2_luminance": -2.82,
+                "measured_log2_luminance_monitoring": -2.82,
+                "measured_log2_luminance_raw": -2.82,
+                "measured_rgb_chromaticity": [0.342, 0.331, 0.327],
+                "neutral_sample_log2_spread": 0.03,
+                "neutral_sample_chromaticity_spread": 0.003,
+            },
+        },
+        {
+            "clip_id": "H007_A064_0325BB_001",
+            "group_key": "array_batch",
+            "source_path": "/tmp/H007_A064_0325BB_001.R3D",
+            "confidence": 0.79,
+            "flags": [],
+            "diagnostics": {
+                "measured_log2_luminance": -2.78,
+                "measured_log2_luminance_monitoring": -2.78,
+                "measured_log2_luminance_raw": -2.78,
+                "measured_rgb_chromaticity": [0.342, 0.331, 0.327],
+                "neutral_sample_log2_spread": 0.04,
+                "neutral_sample_chromaticity_spread": 0.003,
+            },
+        },
+        {
+            "clip_id": "I007_A064_0325CC_001",
+            "group_key": "array_batch",
+            "source_path": "/tmp/I007_A064_0325CC_001.R3D",
+            "confidence": 0.77,
+            "flags": [],
+            "diagnostics": {
+                "measured_log2_luminance": -2.75,
+                "measured_log2_luminance_monitoring": -2.75,
+                "measured_log2_luminance_raw": -2.75,
+                "measured_rgb_chromaticity": [0.341, 0.332, 0.327],
+                "neutral_sample_log2_spread": 0.03,
+                "neutral_sample_chromaticity_spread": 0.004,
+            },
+        },
+        {
+            "clip_id": "J007_A064_0325DD_001",
+            "group_key": "array_batch",
+            "source_path": "/tmp/J007_A064_0325DD_001.R3D",
+            "confidence": 0.84,
+            "flags": [],
+            "diagnostics": {
+                "measured_log2_luminance": -1.92,
+                "measured_log2_luminance_monitoring": -1.92,
+                "measured_log2_luminance_raw": -1.92,
+                "measured_rgb_chromaticity": [0.342, 0.331, 0.327],
+                "neutral_sample_log2_spread": 0.02,
+                "neutral_sample_chromaticity_spread": 0.003,
+            },
+        },
+    ]
+    quality_by_clip = {
+        item["clip_id"]: {
+            "confidence": float(item["confidence"]),
+            "neutral_sample_log2_spread": float(item["diagnostics"]["neutral_sample_log2_spread"]),
+            "neutral_sample_chromaticity_spread": float(item["diagnostics"]["neutral_sample_chromaticity_spread"]),
+            "flags": [],
+        }
+        for item in records
+    }
+    strategy = _build_strategy_payloads(
+        records,
+        target_strategies=["optimal-exposure"],
+        reference_clip_id=None,
+        matching_domain="scene",
+        quality_by_clip=quality_by_clip,
+        anchor_target_log2=-2.79,
+    )[0]
+    assert strategy["reference_clip_id"] in {"G007_A064_0325AA_001", "H007_A064_0325BB_001", "I007_A064_0325CC_001"}
+    screened = {row["clip_id"]: row for row in strategy["selection_diagnostics"]["screened_candidates"]}
+    assert "J007_A064_0325DD_001" in screened
+    assert "outside primary exposure cluster" in screened["J007_A064_0325DD_001"]["reasons"]
 
 
 def test_gray_target_keeps_saturation_neutral() -> None:
@@ -2507,7 +3203,7 @@ def test_cli_review_and_approve_workflow(tmp_path: Path, monkeypatch: pytest.Mon
             "--target-strategy",
             "median",
             "--target-strategy",
-            "brightest-valid",
+            "optimal-exposure",
         ],
     )
     assert review_result.exit_code == 0
@@ -2516,15 +3212,15 @@ def test_cli_review_and_approve_workflow(tmp_path: Path, monkeypatch: pytest.Mon
     assert (review_dir / "review_rmd" / "G007_D060_0324M6_001.RMD").exists()
     review_manifest = json.loads((review_dir / "report" / "review_manifest.json").read_text(encoding="utf-8"))
     assert review_manifest["calibration_roi"] == {"x": 0.25, "y": 0.25, "w": 0.5, "h": 0.5}
-    assert review_manifest["target_strategies"] == ["median", "brightest_valid"]
-    approve_result = runner.invoke(app, ["approve-master-rmd", str(review_dir), "--target-strategy", "brightest-valid"])
+    assert review_manifest["target_strategies"] == ["median", "optimal_exposure"]
+    approve_result = runner.invoke(app, ["approve-master-rmd", str(review_dir), "--target-strategy", "optimal-exposure"])
     assert approve_result.exit_code == 0
     assert (review_dir / "approval" / "MasterRMD" / "G007_D060.RMD").exists()
     assert (review_dir / "approval" / "batch" / "manifest.json").exists()
     assert (review_dir / "approval" / "approval_manifest.json").exists()
     assert (review_dir / "approval" / "calibration_report.pdf").exists()
     approval_manifest = json.loads((review_dir / "approval" / "approval_manifest.json").read_text(encoding="utf-8"))
-    assert approval_manifest["selected_target_strategy"] == "brightest_valid"
+    assert approval_manifest["selected_target_strategy"] == "optimal_exposure"
     assert approval_manifest["master_rmd_folder_name"] == "MasterRMD"
 
 
@@ -2748,7 +3444,7 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
         out_dir=str(tmp_path / "report"),
         target_type="gray_sphere",
         processing_mode="both",
-        target_strategies=["median", "brightest-valid"],
+        target_strategies=["median", "optimal-exposure"],
         preview_mode="monitoring",
         preview_lut=str(tmp_path / "show.cube"),
     )
@@ -2766,9 +3462,10 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert report_json["measurement_preview_settings"]["preview_mode"] == "calibration"
     assert report_json["redline_capabilities"]["supports_lut"] is True
     assert report_json["calibration_roi"] == {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4}
-    assert report_json["target_strategies"] == ["median", "brightest_valid"]
+    assert report_json["target_strategies"] == ["median", "optimal_exposure"]
     assert report_json["shared_originals"][0]["original_frame"].endswith("G007_D060_0324M6_001.original.review.analysis-out.jpg")
     assert report_json["strategies"][0]["clips"][0]["both_corrected"].endswith("G007_D060_0324M6_001.both.review.median.analysis-out.jpg")
+    assert "render_truth_summary" in report_json
     assert report_json["strategies"][0]["clips"][0]["metrics"]["preview_transform"] == report_json["preview_transform"]
     assert "measured_log2_luminance_monitoring" in report_json["strategies"][0]["clips"][0]["metrics"]["exposure"]
     assert "measured_log2_luminance_raw" in report_json["strategies"][0]["clips"][0]["metrics"]["exposure"]
@@ -2797,6 +3494,7 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     html = Path(payload["report_html"]).read_text(encoding="utf-8")
     assert "Color preview" in html
     assert "G007_D060_0324M6_001" in html
+    assert "Render proof" in html
     assert "../previews/G007_D060_0324M6_001.original.review.analysis-out.jpg" in html
     assert "both.review.median.analysis-out.jpg" in html
     assert payload["preview_mode"] == "monitoring"
@@ -2830,7 +3528,7 @@ def test_lightweight_analysis_report_generates_customer_facing_summary(tmp_path:
         target_type="gray_sphere",
         processing_mode="both",
         matching_domain="scene",
-        target_strategies=["median", "brightest-valid"],
+        target_strategies=["median", "optimal-exposure"],
     )
     assert Path(payload["report_json"]).exists()
     assert Path(payload["report_html"]).exists()
@@ -2840,7 +3538,17 @@ def test_lightweight_analysis_report_generates_customer_facing_summary(tmp_path:
     assert report_json["report_kind"] == "lightweight_analysis"
     assert report_json["executive_synopsis"]
     assert "median strategy" in report_json["executive_synopsis"].lower()
-    assert report_json["recommended_strategy"]["strategy_key"] in {"median", "brightest_valid"}
+    assert report_json["recommended_strategy"]["strategy_key"] in {"median", "optimal_exposure"}
+    assert report_json["visuals"]["exposure_plot_svg"]
+    assert report_json["visuals"]["before_after_exposure_svg"]
+    assert report_json["visuals"]["confidence_chart_svg"]
+    assert report_json["visuals"]["strategy_chart_svg"]
+    assert report_json["visuals"]["trust_chart_svg"]
+    assert report_json["visuals"]["stability_chart_svg"]
+    assert report_json["run_assessment"]["status"] in {"READY", "READY_WITH_WARNINGS", "REVIEW_REQUIRED", "DO_NOT_PUSH"}
+    assert report_json["run_assessment"]["recommendation_strength"] in {"HIGH_CONFIDENCE", "MEDIUM_CONFIDENCE", "LOW_CONFIDENCE"}
+    assert report_json["per_camera_analysis"][0]["trust_class"] in {"TRUSTED", "USE_WITH_CAUTION", "UNTRUSTED", "EXCLUDED"}
+    assert "selection_diagnostics" in report_json["strategy_comparison"][0]
     assert report_json["white_balance_model"]["model_key"] in {
         "shared_kelvin_per_camera_tint",
         "constrained_kelvin_per_camera_tint",
@@ -2853,10 +3561,21 @@ def test_lightweight_analysis_report_generates_customer_facing_summary(tmp_path:
     assert preview_commands["commands"] == []
     html = Path(payload["report_html"]).read_text(encoding="utf-8")
     assert "R3DMatch Diagnostic Review" in html
+    assert any(label in html for label in ["SAFE TO COMMIT", "COMMIT WITH WARNINGS", "REVIEW REQUIRED", "DO NOT PUSH"])
     assert "Strategy Comparison" in html
+    assert "Before / After Exposure" in html
+    assert "Confidence / Reliability" in html
+    assert "Should I Trust This Run?" in html
+    assert "Trust & Eligibility" in html
+    assert "Sample Stability Ranking" in html
     assert "Per-Camera Analysis" in html
     assert "Lightweight Analysis" in html
     assert "Shared Kelvin" in html
+    assert "Click to enlarge" in html
+    assert "chart-modal" in html
+    assert "chart-launch" in html
+    assert "Why This Was Chosen" in html
+    assert "Most cameras are consistent" in html
 
 
 def test_lightweight_analysis_report_uses_array_calibration_quality_metrics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2894,7 +3613,7 @@ def test_lightweight_analysis_report_uses_array_calibration_quality_metrics(tmp_
         target_type="gray_sphere",
         processing_mode="both",
         matching_domain="scene",
-        target_strategies=["median", "brightest-valid"],
+        target_strategies=["median", "optimal-exposure"],
     )
     report_json = json.loads(Path(payload["report_json"]).read_text(encoding="utf-8"))
     row = next(item for item in report_json["per_camera_analysis"] if item["clip_id"] == camera["clip_id"])
@@ -2903,6 +3622,94 @@ def test_lightweight_analysis_report_uses_array_calibration_quality_metrics(tmp_
     assert row["neutral_sample_chromaticity_spread"] == pytest.approx(0.0045)
     assert row["post_color_residual"] == pytest.approx(0.007)
     assert "quality_override_test" in row["note"]
+    assert row["trust_class"] in {"USE_WITH_CAUTION", "UNTRUSTED", "EXCLUDED"}
+    assert row["trust_reason"]
+
+
+def test_lightweight_analysis_report_writes_exposure_debug_trace_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
+    for name in [
+        "G007_A063_032563_001.R3D",
+        "G007_B063_0325V8_001.R3D",
+        "G007_C063_032589_001.R3D",
+    ]:
+        (tmp_path / name).write_bytes(b"")
+    analyze_path(
+        str(tmp_path),
+        out_dir=str(tmp_path / "analysis-out"),
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+        calibration_roi={"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+    )
+    payload = build_lightweight_analysis_report(
+        str(tmp_path / "analysis-out"),
+        out_dir=str(tmp_path / "report"),
+        target_type="gray_sphere",
+        processing_mode="both",
+        matching_domain="scene",
+        target_strategies=["median", "optimal-exposure"],
+    )
+    report_json = json.loads(Path(payload["report_json"]).read_text(encoding="utf-8"))
+    debug_payload = dict(report_json.get("debug_exposure_trace") or {})
+    assert Path(debug_payload["summary_path"]).exists()
+    summary = json.loads(Path(debug_payload["summary_path"]).read_text(encoding="utf-8"))
+    assert summary["roi_alignment"]["shared_roi"] is True
+    first_camera = summary["cameras"][0]
+    camera_trace_path = Path(debug_payload["directory"]) / f"{first_camera['camera_id']}.json"
+    assert camera_trace_path.exists()
+    trace = json.loads(camera_trace_path.read_text(encoding="utf-8"))
+    assert trace["sampling"]["neutral_samples_monitoring"][0]["bounds"]["normalized_within_roi"]["w"] > 0.0
+    assert "gray_log2_distribution" in trace["sampling"]["neutral_samples_monitoring"][0]
+    assert Path(trace["sampling"]["roi_overlay_path"]).exists()
+
+
+def test_lightweight_analysis_report_run_assessment_is_deterministic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
+    for name in [
+        "G007_A064_0325RN_001.R3D",
+        "H007_A064_0325PK_001.R3D",
+        "I007_A064_0325XY_001.R3D",
+        "G007_B064_032526_001.R3D",
+    ]:
+        (tmp_path / name).write_bytes(b"")
+    analyze_path(
+        str(tmp_path),
+        out_dir=str(tmp_path / "analysis-out"),
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+        calibration_roi={"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+    )
+
+    first = build_lightweight_analysis_report(
+        str(tmp_path / "analysis-out"),
+        out_dir=str(tmp_path / "report-a"),
+        target_type="gray_sphere",
+        processing_mode="both",
+        matching_domain="scene",
+        target_strategies=["median", "optimal-exposure"],
+    )
+    second = build_lightweight_analysis_report(
+        str(tmp_path / "analysis-out"),
+        out_dir=str(tmp_path / "report-b"),
+        target_type="gray_sphere",
+        processing_mode="both",
+        matching_domain="scene",
+        target_strategies=["median", "optimal-exposure"],
+    )
+
+    first_json = json.loads(Path(first["report_json"]).read_text(encoding="utf-8"))
+    second_json = json.loads(Path(second["report_json"]).read_text(encoding="utf-8"))
+    assert first_json["run_assessment"]["status"] == second_json["run_assessment"]["status"]
+    assert first_json["run_assessment"]["recommendation_strength"] == second_json["run_assessment"]["recommendation_strength"]
+    assert [item["trust_class"] for item in first_json["per_camera_analysis"]] == [item["trust_class"] for item in second_json["per_camera_analysis"]]
 
 
 def test_validate_review_run_contract_accepts_lightweight_report_without_preview_images(tmp_path: Path) -> None:
@@ -3092,6 +3899,7 @@ def test_render_contact_sheet_html_uses_logo_and_dynamic_grid(tmp_path: Path) ->
                             "confidence": 0.95,
                             "flags": [],
                         },
+                        "render_validation": {"pixel_output_changed": True, "pixel_diff_from_baseline": 12.5},
                     }
                     for i in range(1, 4)
                 ],
@@ -3104,6 +3912,8 @@ def test_render_contact_sheet_html_uses_logo_and_dynamic_grid(tmp_path: Path) ->
     assert "grid cols-3" in html
     assert "../previews/CAM001.original.review.run01.jpg" in html
     assert "../previews/CAM001.both.review.median.run01.jpg" in html
+    assert "correction-cue" in html
+    assert "Render proof" in html
     assert "font-size:30px" in html
     assert "font-size:20px" in html
 
@@ -3325,6 +4135,41 @@ def test_render_preview_frame_corrected_image_differs_from_baseline(tmp_path: Pa
     assert metrics["pixel_output_changed"] is True
     assert "--useMeta" in baseline["command"]
     assert "--useMeta" not in corrected["command"]
+
+
+def test_contact_sheet_strategy_clip_uses_corrected_asset_and_render_truth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
+    clip_a = tmp_path / "G007_B057_0324YT_001.R3D"
+    clip_b = tmp_path / "G007_C057_0324YT_001.R3D"
+    clip_a.write_bytes(b"")
+    clip_b.write_bytes(b"")
+    analyze_path(
+        str(tmp_path),
+        out_dir=str(tmp_path / "analysis-out"),
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+    )
+    payload = build_contact_sheet_report(
+        str(tmp_path / "analysis-out"),
+        out_dir=str(tmp_path / "report"),
+        target_type="gray_sphere",
+        processing_mode="both",
+        target_strategies=["median"],
+    )
+    report_json = json.loads(Path(payload["report_json"]).read_text(encoding="utf-8"))
+    strategy_clip = next(
+        clip
+        for clip in report_json["strategies"][0]["clips"]
+        if abs(float((clip["metrics"]["exposure"].get("final_offset_stops") or 0.0))) > 1e-6
+    )
+    assert strategy_clip["both_corrected"] != strategy_clip["original_frame"]
+    assert strategy_clip["render_validation"]["pixel_output_changed"] is True
+    assert float(strategy_clip["render_validation"]["pixel_diff_from_baseline"]) > 0.0
+    assert Path(strategy_clip["both_corrected"]).name == Path(str(strategy_clip["render_validation"]["output"])).name
 
 
 def test_multi_strategy_review_includes_manual_reference_and_shared_originals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3604,6 +4449,43 @@ def test_approve_master_rmd_writes_commit_package_with_commit_values(tmp_path: P
     assert Path(first["master_rmd_path"]).name.endswith(".RMD")
 
 
+def test_review_commit_payload_includes_inventory_camera_targets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
+    for path in [
+        tmp_path / "GA" / "G007_A065_0325F6.RDC" / "G007_A065_0325F6_001.R3D",
+        tmp_path / "GB" / "G007_B065_0325PN.RDC" / "G007_B065_0325PN_001.R3D",
+    ]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"")
+    review_dir = tmp_path / "review-rcp2"
+    review_calibration(
+        str(tmp_path),
+        out_dir=str(review_dir),
+        target_type="gray_sphere",
+        processing_mode="both",
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        exposure_calibration_path=None,
+        color_calibration_path=None,
+        calibration_mode=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+        calibration_roi={"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+        target_strategies=["median"],
+        reference_clip_id=None,
+        source_mode="local_folder",
+    )
+    validation = json.loads((review_dir / "report" / "review_validation.json").read_text(encoding="utf-8"))
+    aggregate = json.loads(Path(validation["commit_payload"]["aggregate_path"]).read_text(encoding="utf-8"))
+    assert aggregate["camera_targets"][0]["inventory_camera_label"] == "GA"
+    assert aggregate["camera_targets"][0]["inventory_camera_ip"].startswith("172.20.114.")
+    per_camera = json.loads(Path(validation["commit_payload"]["per_camera_payloads"][0]["path"]).read_text(encoding="utf-8"))
+    assert per_camera["inventory_camera_label"] == "GA"
+    assert per_camera["inventory_camera_ip"].startswith("172.20.114.")
+
+
 def test_plan_ftps_request_normalizes_reel_clips_and_camera_subset() -> None:
     plan = plan_ftps_request(reel_identifier="7", clip_spec="63,64-65", requested_cameras=["aa", "KB"])
     assert plan["reel_identifier"] == "007"
@@ -3664,9 +4546,1066 @@ def test_ingest_ftps_batch_writes_manifest_and_partial_status(tmp_path: Path) ->
     assert saved["successful_cameras"] == ["AA"]
     assert saved["failed_cameras"] == ["AB"]
     assert saved["clips_found"] == 1
+    assert saved["status"] == "partial"
+    assert saved["manifest_path"] == str(manifest_path)
+    assert saved["requested_camera_ips"]["AA"] == "172.20.114.141"
+    assert saved["per_camera_status"][1]["failure_code"] == "no_matching_clips"
     downloaded = Path(saved["per_camera_status"][0]["downloaded_files"][0]["local_path"])
     assert downloaded.exists()
     assert downloaded.read_bytes().startswith(b"mock:172.20.114.141")
+
+
+def test_apply_calibration_payload_dry_run_uses_inventory_targets(tmp_path: Path) -> None:
+    payload = {
+        "schema_version": "r3dmatch_rcp2_ready_v1",
+        "camera_id": "G007_A065",
+        "clip_id": "G007_A065_0325F6_001",
+        "inventory_camera_label": "GA",
+        "inventory_camera_ip": "172.20.114.165",
+        "format": "rcp2_ready",
+        "calibration": {"exposureAdjust": -0.821145, "kelvin": 5663, "tint": -0.2},
+        "confidence": 0.68,
+        "is_hero_camera": False,
+        "notes": [],
+    }
+    payload_path = tmp_path / "GA.json"
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    result = apply_calibration_payload(str(payload_path), out_path=str(tmp_path / "apply.json"))
+    assert result["status"] == "dry_run"
+    assert result["transport_mode"] == "dry_run"
+    assert result["results"][0]["inventory_camera_label"] == "GA"
+    assert result["results"][0]["status"] == "dry_run"
+    assert result["results"][0]["readback"]["kelvin"] == 5663
+    assert Path(result["report_path"]).exists()
+
+
+def test_apply_calibration_payload_reports_readback_mismatch(tmp_path: Path) -> None:
+    payload = {
+        "schema_version": "r3dmatch_rcp2_ready_v1",
+        "camera_id": "H007_D065",
+        "clip_id": "H007_D065_0325CS_001",
+        "inventory_camera_label": "HD",
+        "inventory_camera_ip": "172.20.114.172",
+        "format": "rcp2_ready",
+        "calibration": {"exposureAdjust": 0.9, "kelvin": 5663, "tint": 0.7},
+        "confidence": 0.71,
+        "is_hero_camera": False,
+        "notes": [],
+    }
+    payload_path = tmp_path / "HD.json"
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    transport = MemoryRcp2Transport(readback_overrides={"172.20.114.172": {"exposureAdjust": 0.9, "kelvin": 5900, "tint": 0.7}})
+    result = apply_calibration_payload(str(payload_path), transport=transport)
+    assert result["status"] == "failed"
+    assert result["results"][0]["status"] == "mismatch_after_writeback"
+    assert result["results"][0]["verification"]["mismatched_fields"] == ["kelvin"]
+
+
+def test_apply_calibration_payload_retries_once_after_timeout_then_succeeds(tmp_path: Path) -> None:
+    payload = {
+        "schema_version": "r3dmatch_rcp2_ready_v1",
+        "camera_id": "G007_A065",
+        "clip_id": "G007_A065_0325F6_001",
+        "inventory_camera_label": "GA",
+        "inventory_camera_ip": "172.20.114.165",
+        "format": "rcp2_ready",
+        "calibration": {"exposureAdjust": -0.821145, "kelvin": 5663, "tint": -0.2},
+        "confidence": 0.68,
+        "is_hero_camera": False,
+        "notes": [],
+    }
+    payload_path = tmp_path / "GA.json"
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    class RetryOnceTransport:
+        mode = "live"
+
+        def __init__(self) -> None:
+            self.open_count = 0
+
+        def open(self, *, host: str, port: int, camera_label: str) -> dict:
+            self.open_count += 1
+            if self.open_count == 1:
+                raise Rcp2TimeoutError(f"timeout talking to {camera_label}")
+            return {"host": host, "port": port, "camera_label": camera_label, "state": {}}
+
+        def close(self, session: object) -> None:
+            return None
+
+        def read_state(self, session: object) -> dict:
+            return dict((session or {}).get("state") or {})
+
+        def write_state(self, session: object, values: dict) -> None:
+            session["state"] = dict(values)
+
+    result = apply_calibration_payload(str(payload_path), transport=RetryOnceTransport(), retry_count=1)
+    assert result["status"] == "success"
+    assert result["results"][0]["status"] == "applied_successfully"
+    assert len(result["results"][0]["attempts"]) == 2
+    assert result["results"][0]["attempts"][0]["failure_reason"] == "timeout"
+    assert result["results"][0]["attempts"][1]["status"] == "applied_successfully"
+
+
+def test_apply_calibration_payload_reports_timeout_and_generates_full_report(tmp_path: Path) -> None:
+    payload = {
+        "schema_version": "r3dmatch_rcp2_ready_v1",
+        "camera_id": "G007_A065",
+        "clip_id": "G007_A065_0325F6_001",
+        "inventory_camera_label": "GA",
+        "inventory_camera_ip": "172.20.114.165",
+        "format": "rcp2_ready",
+        "calibration": {"exposureAdjust": -0.821145, "kelvin": 5663, "tint": -0.2},
+        "confidence": 0.68,
+        "is_hero_camera": False,
+        "notes": [],
+    }
+    payload_path = tmp_path / "GA.json"
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    class TimeoutTransport:
+        mode = "live"
+
+        def open(self, *, host: str, port: int, camera_label: str) -> dict:
+            raise Rcp2TimeoutError(f"connect timeout to {host}:{port}")
+
+        def close(self, session: object) -> None:
+            return None
+
+        def read_state(self, session: object) -> dict:
+            raise AssertionError("read_state should not be called after a failed open")
+
+        def write_state(self, session: object, values: dict) -> None:
+            raise AssertionError("write_state should not be called after a failed open")
+
+    out_path = tmp_path / "apply-timeout.json"
+    result = apply_calibration_payload(str(payload_path), transport=TimeoutTransport(), retry_count=1, out_path=str(out_path))
+    assert result["status"] == "failed"
+    assert result["results"][0]["status"] == "timeout"
+    assert result["results"][0]["failure_reason"] == "timeout"
+    assert len(result["results"][0]["attempts"]) == 2
+    assert result["operator_status"] == "failed"
+    assert out_path.exists()
+
+
+def test_apply_calibration_payload_rejects_invalid_payload_before_transport(tmp_path: Path) -> None:
+    payload = {
+        "schema_version": "r3dmatch_rcp2_ready_v1",
+        "camera_id": "G007_A065",
+        "clip_id": "G007_A065_0325F6_001",
+        "inventory_camera_label": "GA",
+        "inventory_camera_ip": "172.20.114.165",
+        "format": "rcp2_ready",
+        "calibration": {"exposureAdjust": 9.5, "kelvin": 90000, "tint": 99.0},
+        "confidence": 0.68,
+        "is_hero_camera": False,
+        "notes": [],
+    }
+    payload_path = tmp_path / "GA-invalid.json"
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    class NoTouchTransport:
+        mode = "live"
+
+        def open(self, *, host: str, port: int, camera_label: str) -> dict:
+            raise AssertionError("transport should not be touched for invalid payloads")
+
+        def close(self, session: object) -> None:
+            return None
+
+        def read_state(self, session: object) -> dict:
+            raise AssertionError("transport should not be touched for invalid payloads")
+
+        def write_state(self, session: object, values: dict) -> None:
+            raise AssertionError("transport should not be touched for invalid payloads")
+
+    result = apply_calibration_payload(str(payload_path), transport=NoTouchTransport())
+    assert result["status"] == "failed"
+    assert result["results"][0]["status"] == "invalid_payload"
+    assert result["results"][0]["failure_reason"] == "invalid_payload"
+    assert "outside the safe range" in result["results"][0]["error"]
+
+
+def test_apply_calibration_payload_isolates_partial_success_by_camera(tmp_path: Path) -> None:
+    payloads_dir = tmp_path / "payloads"
+    payloads_dir.mkdir(parents=True, exist_ok=True)
+    ga_path = payloads_dir / "GA.json"
+    ga_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "r3dmatch_rcp2_ready_v1",
+                "camera_id": "G007_A065",
+                "clip_id": "G007_A065_0325F6_001",
+                "inventory_camera_label": "GA",
+                "inventory_camera_ip": "172.20.114.165",
+                "format": "rcp2_ready",
+                "calibration": {"exposureAdjust": -0.82, "kelvin": 5663, "tint": -0.2},
+                "confidence": 0.68,
+                "is_hero_camera": False,
+                "notes": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    ic_path = payloads_dir / "IC.json"
+    ic_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "r3dmatch_rcp2_ready_v1",
+                "camera_id": "I007_C065",
+                "clip_id": "I007_C065_0325WK_001",
+                "inventory_camera_label": "IC",
+                "inventory_camera_ip": "172.20.114.175",
+                "format": "rcp2_ready",
+                "calibration": {"exposureAdjust": -0.15, "kelvin": 5663, "tint": -0.8},
+                "confidence": 0.91,
+                "is_hero_camera": True,
+                "notes": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    aggregate_path = tmp_path / "commit.json"
+    aggregate_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "r3dmatch_calibration_commit_payload_v1",
+                "per_camera_payloads": [
+                    {"path": str(ga_path)},
+                    {"path": str(ic_path)},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class PartialTransport:
+        mode = "live"
+
+        def open(self, *, host: str, port: int, camera_label: str) -> dict:
+            if host == "172.20.114.175":
+                raise Rcp2TimeoutError(f"connect timeout to {host}:{port}")
+            return {"host": host, "port": port, "camera_label": camera_label, "state": {}}
+
+        def close(self, session: object) -> None:
+            return None
+
+        def read_state(self, session: object) -> dict:
+            return dict((session or {}).get("state") or {})
+
+        def write_state(self, session: object, values: dict) -> None:
+            session["state"] = dict(values)
+
+    result = apply_calibration_payload(str(aggregate_path), transport=PartialTransport(), retry_count=0)
+    assert result["status"] == "partial"
+    assert result["status_counts"]["applied_successfully"] == 1
+    assert result["status_counts"]["timeout"] == 1
+    assert {row["inventory_camera_label"]: row["status"] for row in result["results"]} == {
+        "GA": "applied_successfully",
+        "IC": "timeout",
+    }
+
+
+def test_cli_apply_calibration_dry_run_writes_report(tmp_path: Path) -> None:
+    payload = {
+        "schema_version": "r3dmatch_rcp2_ready_v1",
+        "camera_id": "I007_C065",
+        "clip_id": "I007_C065_0325WK_001",
+        "inventory_camera_label": "IC",
+        "inventory_camera_ip": "172.20.114.175",
+        "format": "rcp2_ready",
+        "calibration": {"exposureAdjust": 0.0, "kelvin": 5663, "tint": -0.1},
+        "confidence": 0.92,
+        "is_hero_camera": True,
+        "notes": [],
+    }
+    payload_path = tmp_path / "IC.json"
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    report_path = tmp_path / "apply-report.json"
+    result = runner.invoke(app, ["apply-calibration", str(payload_path), "--out", str(report_path)])
+    assert result.exit_code == 0
+    saved = json.loads(report_path.read_text(encoding="utf-8"))
+    assert saved["status"] == "dry_run"
+    assert saved["results"][0]["inventory_camera_label"] == "IC"
+
+
+def test_cli_apply_calibration_live_forwards_live_flag_and_sdk_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = {
+        "schema_version": "r3dmatch_rcp2_ready_v1",
+        "camera_id": "G007_A065",
+        "clip_id": "G007_A065_0325F6_001",
+        "inventory_camera_label": "GA",
+        "inventory_camera_ip": "172.20.114.165",
+        "format": "rcp2_ready",
+        "calibration": {"exposureAdjust": -0.1, "kelvin": 5663, "tint": -0.2},
+        "confidence": 0.68,
+        "is_hero_camera": False,
+        "notes": [],
+    }
+    payload_path = tmp_path / "GA.json"
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    report_path = tmp_path / "apply-live-report.json"
+    calls = {}
+
+    def fake_apply_calibration_payload(payload_path: str, **kwargs):
+        calls["payload_path"] = payload_path
+        calls["kwargs"] = dict(kwargs)
+        report = {
+            "status": "failed",
+            "transport_mode": "live",
+            "results": [
+                {
+                    "inventory_camera_label": "GA",
+                    "status": "failed_to_connect",
+                    "error": "connect timeout",
+                }
+            ],
+            "report_path": kwargs.get("out_path"),
+        }
+        Path(str(kwargs["out_path"])).write_text(json.dumps(report), encoding="utf-8")
+        return report
+
+    monkeypatch.setattr("r3dmatch.cli.apply_calibration_payload", fake_apply_calibration_payload)
+    result = runner.invoke(
+        app,
+        [
+            "apply-calibration",
+            str(payload_path),
+            "--live",
+            "--sdk-root",
+            "/tmp/fake_sdk",
+            "--out",
+            str(report_path),
+        ],
+    )
+    assert result.exit_code == 0
+    assert calls["payload_path"] == str(payload_path)
+    assert calls["kwargs"]["live"] is True
+    assert calls["kwargs"]["sdk_root"] == "/tmp/fake_sdk"
+    assert calls["kwargs"]["transport_kind"] == "websocket"
+    saved = json.loads(report_path.read_text(encoding="utf-8"))
+    assert saved["transport_mode"] == "live"
+    assert saved["results"][0]["status"] == "failed_to_connect"
+
+
+def test_cli_read_camera_state_uses_helper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    del tmp_path
+    calls = {}
+
+    def fake_read_camera_state(**kwargs):
+        calls["kwargs"] = dict(kwargs)
+        return {
+            "schema_version": "r3dmatch_rcp2_camera_state_v1",
+            "transport_mode": "live_websocket",
+            "state": {"exposureAdjust": 0.0, "kelvin": 5600, "tint": 0.0},
+        }
+
+    monkeypatch.setattr("r3dmatch.cli.read_camera_state", fake_read_camera_state)
+    result = runner.invoke(
+        app,
+        [
+            "read-camera-state",
+            "10.20.61.191",
+            "--camera-label",
+            "KOMODO",
+        ],
+    )
+    assert result.exit_code == 0
+    assert calls["kwargs"]["host"] == "10.20.61.191"
+    assert calls["kwargs"]["port"] == 9998
+    assert calls["kwargs"]["transport_kind"] == "websocket"
+
+
+def test_cli_test_rcp2_write_uses_helper(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {}
+
+    def fake_test_rcp2_write_smoke(**kwargs):
+        calls["kwargs"] = dict(kwargs)
+        return {
+            "schema_version": "r3dmatch_rcp2_write_smoke_v1",
+            "transport_mode": "live_websocket",
+            "restored_matches_original": True,
+        }
+
+    monkeypatch.setattr("r3dmatch.cli.test_rcp2_write_smoke", fake_test_rcp2_write_smoke)
+    result = runner.invoke(app, ["test-rcp2-write", "10.20.61.191"])
+    assert result.exit_code == 0
+    assert calls["kwargs"]["host"] == "10.20.61.191"
+    assert calls["kwargs"]["port"] == 9998
+    assert calls["kwargs"]["field_name"] == "exposureAdjust"
+    assert calls["kwargs"]["transport_kind"] == "websocket"
+
+
+def test_summarize_apply_report_uses_operator_tolerances() -> None:
+    report = {
+        "results": [
+            {
+                "inventory_camera_label": "GA",
+                "status": "applied_successfully",
+                "requested": {"exposureAdjust": 0.5, "kelvin": 5663, "tint": 0.0},
+                "readback": {"exposureAdjust": 0.505, "kelvin": 5670, "tint": 0.005},
+            },
+            {
+                "inventory_camera_label": "GB",
+                "status": "applied_successfully",
+                "requested": {"exposureAdjust": 0.5, "kelvin": 5663, "tint": 0.0},
+                "readback": {"exposureAdjust": 0.52, "kelvin": 5800, "tint": 0.2},
+            },
+        ]
+    }
+    summary = summarize_apply_report(report)
+    assert summary["operator_status"] == "partial"
+    assert summary["operator_status_counts"]["applied_with_deviation"] == 1
+    assert summary["operator_status_counts"]["mismatch_after_writeback"] == 1
+    assert summary["results"][0]["operator_result"]["display_status"] == "applied_with_deviation"
+    assert summary["results"][1]["operator_result"]["display_status"] == "mismatch_after_writeback"
+
+
+def test_summarize_apply_report_accepts_boundary_tolerances_and_flags_timeout() -> None:
+    report = {
+        "results": [
+            {
+                "inventory_camera_label": "GA",
+                "status": "applied_successfully",
+                "requested": {"exposureAdjust": 0.5, "kelvin": 5663, "tint": 0.0},
+                "readback": {"exposureAdjust": 0.51, "kelvin": 5713, "tint": 0.01},
+            },
+            {
+                "inventory_camera_label": "GB",
+                "status": "timeout",
+                "requested": {"exposureAdjust": 0.1, "kelvin": 5663, "tint": 0.0},
+                "error": "connect timeout",
+                "failure_reason": "timeout",
+            },
+        ]
+    }
+    summary = summarize_apply_report(report)
+    assert summary["operator_status"] == "partial"
+    assert summary["operator_status_counts"]["applied_with_deviation"] == 1
+    assert summary["operator_status_counts"]["timeout"] == 1
+    assert summary["results"][0]["operator_result"]["display_status"] == "applied_with_deviation"
+    assert summary["results"][1]["operator_result"]["display_status"] == "timeout"
+
+
+def test_build_post_apply_verification_from_reviews_compares_real_review_metrics(tmp_path: Path) -> None:
+    before_dir = tmp_path / "before"
+    after_dir = tmp_path / "after"
+    for root, exposure_error, neutral_error, variance_bump in [
+        (before_dir, 0.02, 0.015, 0.02),
+        (after_dir, 0.01, 0.01, 0.005),
+    ]:
+        report_dir = root / "report"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "status": "success",
+            "recommendation": {"recommended_strategy": {"strategy_key": "median"}},
+            "physical_validation": {
+                "status": "success",
+                "exposure": {
+                    "mean_exposure_error": exposure_error,
+                    "per_camera": [
+                        {"clip_id": "A", "exposure_error": exposure_error + variance_bump},
+                        {"clip_id": "B", "exposure_error": exposure_error - variance_bump / 2.0},
+                    ],
+                },
+                "neutrality": {
+                    "mean_post_neutral_error": neutral_error,
+                    "per_camera": [
+                        {"clip_id": "A", "post_neutral_error": neutral_error + variance_bump / 4.0},
+                        {"clip_id": "B", "post_neutral_error": neutral_error - variance_bump / 8.0},
+                    ],
+                },
+            },
+        }
+        (report_dir / "review_validation.json").write_text(json.dumps(payload), encoding="utf-8")
+    comparison = build_post_apply_verification_from_reviews(str(before_dir), str(after_dir), out_path=str(before_dir / "report" / "post_apply_verification.json"))
+    assert comparison["status"] == "success"
+    assert comparison["summary"]["exposure_improved"] is True
+    assert comparison["summary"]["neutrality_improved"] is True
+    assert comparison["summary"]["variance_reduced"] is True
+    assert Path(comparison["report_path"]).exists()
+
+
+def test_build_camera_verification_report_distinguishes_simulated_and_actual_compare(tmp_path: Path) -> None:
+    payload_path = tmp_path / "GA.json"
+    payload_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "r3dmatch_rcp2_ready_v1",
+                "camera_id": "G007_A065",
+                "clip_id": "G007_A065_0325F6_001",
+                "inventory_camera_label": "GA",
+                "inventory_camera_ip": "10.20.61.191",
+                "source_path": "/captures/GA/G007_A065_0325F6_001.R3D",
+                "calibration": {"exposureAdjust": 0.2, "kelvin": 5650, "tint": 0.4},
+                "confidence": 0.8,
+                "notes": ["Stable"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    simulated = build_camera_verification_report(str(payload_path))
+    assert simulated["verification_mode"] == "simulated_expected_state"
+    assert simulated["status"] == "simulated"
+    assert simulated["results"][0]["verification_status"] == "simulated_expected"
+    assert simulated["results"][0]["verification_level"] == "NOT_AVAILABLE"
+
+    camera_state_report = {
+        "schema_version": "r3dmatch_rcp2_camera_state_report_v1",
+        "camera_count": 1,
+        "connected_camera_count": 1,
+        "results": [
+            {
+                "inventory_camera_label": "GA",
+                "status": "success",
+                "state": {"exposureAdjust": 0.205, "kelvin": 5655, "tint": 0.405},
+            }
+        ],
+    }
+    compared = build_camera_verification_report(str(payload_path), camera_state_report=camera_state_report)
+    assert compared["verification_mode"] == "camera_state_report_compare"
+    assert compared["status"] == "success"
+    assert compared["within_tolerance_camera_count"] == 1
+    assert compared["results"][0]["verification_status"] == "within_tolerance"
+    assert compared["results"][0]["verification_level"] == "WITHIN_TOLERANCE"
+    assert compared["results"][0]["verification_confidence_score"] > 0.0
+    assert compared["results"][0]["comparison"]["matches_within_tolerance"] is True
+
+
+def test_verify_camera_state_cli_forwards_to_structured_report(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_build_camera_verification_report(payload_path: str, **kwargs: object) -> dict[str, object]:
+        captured["payload_path"] = payload_path
+        captured["kwargs"] = kwargs
+        return {"schema_version": "r3dmatch_rcp2_verification_report_v1", "status": "simulated"}
+
+    monkeypatch.setattr("r3dmatch.cli.build_camera_verification_report", fake_build_camera_verification_report)
+    payload_path = tmp_path / "GA.json"
+    payload_path.write_text("{}", encoding="utf-8")
+    result = runner.invoke(app, ["verify-camera-state", str(payload_path), "--camera", "GA"])
+    assert result.exit_code == 0
+    assert captured["payload_path"] == str(payload_path)
+    assert captured["kwargs"]["requested_cameras"] == ["GA"]
+
+
+def test_web_app_status_surfaces_decision_commit_apply_and_verification(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    out_dir = tmp_path / "review-output"
+    report_dir = out_dir / "report"
+    payload_dir = report_dir / "calibration_payloads"
+    payload_dir.mkdir(parents=True, exist_ok=True)
+    started_at = time.time()
+    review_validation = {
+        "status": "success",
+        "validated_at": started_at + 1.0,
+        "warnings": [],
+        "errors": [],
+        "recommendation": {
+            "recommended_strategy": {"strategy_key": "median", "strategy_label": "Median", "reason": "Median minimizes correction spread."},
+            "hero_camera": "I007_C065_0325WK_001",
+            "hero_camera_confidence": "medium",
+            "confidence_score": 0.82,
+            "summary_notes": ["Array is stable enough to commit."],
+        },
+        "physical_validation": {
+            "status": "success",
+            "exposure": {"mean_exposure_error": 0.008, "max_exposure_error": 0.01, "per_camera": []},
+            "neutrality": {"mean_post_neutral_error": 0.009, "max_post_neutral_error": 0.011, "per_camera": []},
+            "kelvin_tint_analysis": {"kelvin_is_stable": True, "tint_carries_variation": True},
+            "confidence": {"mean_confidence": 0.77},
+            "outliers": [],
+        },
+        "failure_modes": [],
+        "post_apply_validation": {
+            "status": "warning",
+            "verification_mode": "modeled_from_recommended_commit_values",
+            "summary": {"exposure_error_reduced": True, "neutrality_improved": False, "variance_reduced": True},
+            "notes": ["Modeled verification only."],
+        },
+    }
+    (report_dir / "review_validation.json").write_text(json.dumps(review_validation), encoding="utf-8")
+    report_payload = {
+        "white_balance_model": {
+            "model_key": "shared_kelvin_per_camera_tint",
+            "model_label": "Shared Kelvin / Per-Camera Tint",
+            "shared_kelvin": 5663,
+            "shared_tint": 0.0,
+            "candidates": [
+                {
+                    "model_key": "shared_kelvin_per_camera_tint",
+                    "model_label": "Shared Kelvin / Per-Camera Tint",
+                    "metrics": {"weighted_mean_post_neutral_residual": 0.002, "kelvin_axis_stddev": 0.0004},
+                }
+            ],
+        },
+        "visuals": {
+            "exposure_plot_svg": "<svg viewBox='0 0 10 10'></svg>",
+            "before_after_exposure_svg": "<svg viewBox='0 0 10 10'></svg>",
+            "confidence_chart_svg": "<svg viewBox='0 0 10 10'></svg>",
+            "strategy_chart_svg": "<svg viewBox='0 0 10 10'></svg>",
+        },
+    }
+    (report_dir / "contact_sheet.json").write_text(json.dumps(report_payload), encoding="utf-8")
+    per_camera_payload = {
+        "schema_version": "r3dmatch_rcp2_ready_v1",
+        "camera_id": "G007_A065",
+        "clip_id": "G007_A065_0325F6_001",
+        "inventory_camera_label": "GA",
+        "inventory_camera_ip": "172.20.114.165",
+        "source_path": "/captures/GA/G007_A065_0325F6_001.R3D",
+        "calibration": {"exposureAdjust": -0.821145, "kelvin": 5663, "tint": -0.2},
+        "confidence": 0.68,
+        "notes": ["Exposure outlier against the central cluster."],
+    }
+    per_camera_path = payload_dir / "G007_A065.json"
+    per_camera_path.write_text(json.dumps(per_camera_payload), encoding="utf-8")
+    commit_payload = {
+        "schema_version": "r3dmatch_calibration_commit_payload_v1",
+        "camera_targets": [
+            {
+                "camera_id": "G007_A065",
+                "clip_id": "G007_A065_0325F6_001",
+                "inventory_camera_label": "GA",
+                "inventory_camera_ip": "172.20.114.165",
+                "calibration": {"exposureAdjust": -0.821145, "kelvin": 5663, "tint": -0.2},
+                "confidence": 0.68,
+                "is_hero_camera": False,
+            }
+        ],
+        "per_camera_payloads": [{"camera_id": "G007_A065", "path": str(per_camera_path)}],
+    }
+    (report_dir / "calibration_commit_payload.json").write_text(json.dumps(commit_payload), encoding="utf-8")
+    apply_report = {
+        "schema_version": "r3dmatch_rcp2_apply_report_v1",
+        "transport_mode": "live",
+        "operator_status": "applied_with_deviation",
+        "operator_status_counts": {"applied_with_deviation": 1},
+        "results": [
+            {
+                "inventory_camera_label": "GA",
+                "status": "applied_successfully",
+                "operator_result": {"display_status": "applied_with_deviation"},
+                "requested": {"exposureAdjust": -0.82, "kelvin": 5663, "tint": -0.2},
+                "readback": {"exposureAdjust": -0.815, "kelvin": 5670, "tint": -0.195},
+            }
+        ],
+    }
+    (report_dir / "rcp2_live_apply_report.json").write_text(json.dumps(apply_report), encoding="utf-8")
+    camera_state_report = {
+        "schema_version": "r3dmatch_rcp2_camera_state_report_v1",
+        "camera_count": 1,
+        "connected_camera_count": 1,
+        "results": [
+            {
+                "inventory_camera_label": "GA",
+                "inventory_camera_ip": "172.20.114.165",
+                "camera_id": "G007_A065",
+                "clip_id": "G007_A065_0325F6_001",
+                "status": "success",
+                "state": {"exposureAdjust": -0.500, "kelvin": 5600, "tint": -0.1},
+            }
+        ],
+    }
+    (report_dir / "rcp2_camera_state_report.json").write_text(json.dumps(camera_state_report), encoding="utf-8")
+    post_apply_report = {
+        "schema_version": "r3dmatch_post_apply_verification_v1",
+        "status": "success",
+        "summary": {"exposure_improved": True, "neutrality_improved": True, "variance_reduced": True},
+        "notes": ["Compared before/after review runs."],
+    }
+    (report_dir / "post_apply_verification.json").write_text(json.dumps(post_apply_report), encoding="utf-8")
+
+    app_instance = create_app()
+    state = app_instance.config["UI_STATE"]
+    state.task.command = "python3 -m r3dmatch.cli review-calibration"
+    state.task.output_path = str(out_dir)
+    state.task.source_mode = "local_folder"
+    state.task.status = "completed"
+    state.task.returncode = 0
+    state.task.started_at = started_at
+    state.task.last_output_at = started_at + 1.0
+    state.task.last_progress_at = started_at + 1.0
+    monkeypatch.setattr("r3dmatch.web_app._process_is_alive", lambda process: False)
+    with app_instance.test_client() as client:
+        payload = client.get("/status").get_json()
+    assert payload["decision_surface"]["commit_readiness"]["state"] == "Ready for Commit"
+    assert "Median" in payload["decision_surface_html"]
+    assert "SAFE TO COMMIT" in payload["decision_surface_html"]
+    assert "Shared Kelvin / Per-Camera Tint" in payload["decision_surface_html"]
+    assert "Exposure Spread" in payload["decision_surface_html"]
+    assert "Confidence / Reliability" in payload["decision_surface_html"]
+    assert "Should I Trust This Run?" in payload["decision_surface_html"]
+    assert "Recommendation Strength" in payload["decision_surface_html"]
+    assert "chart-launch" in payload["decision_surface_html"]
+    assert "Click to enlarge" in payload["decision_surface_html"]
+    assert "No cameras excluded from reference" in payload["decision_surface_html"]
+    assert "GA" in payload["commit_table_html"]
+    assert "Exposure Correction" in payload["commit_table_html"]
+    assert "+0.00" not in payload["decision_surface_html"]
+    assert "Exposure span" not in payload["decision_surface_html"]
+    assert "Current Exposure" in payload["push_surface_html"]
+    assert "New Exposure" in payload["push_surface_html"]
+    assert "Exposure Change" in payload["push_surface_html"]
+    assert "Reference Use" in payload["push_surface_html"]
+    assert "Writeback Status" in payload["push_surface_html"]
+    assert "Included" in payload["push_surface_html"]
+    assert "Verified" in payload["push_surface_html"]
+    assert "-0.500" in payload["push_surface_html"]
+    assert "-0.821" in payload["push_surface_html"]
+    assert "<span class='delta-negative'>-0.321</span>" in payload["push_surface_html"]
+    assert "All exposure values shown in this push section are relative corrections applied to match the calibration target." in payload["push_surface_html"]
+    assert "applied_with_deviation" in payload["apply_surface_html"]
+    assert "Compared before/after review runs." in payload["verification_surface_html"]
+
+
+def test_web_app_surfaces_excluded_cameras_and_warning_commit_readiness() -> None:
+    review_validation = {
+        "status": "success",
+        "warnings": ["Excluded 1 outlier camera from commit readiness; the remaining 11-camera cluster is still usable."],
+        "run_assessment": {
+            "status": "READY_WITH_WARNINGS",
+            "recommendation_strength": "MEDIUM_CONFIDENCE",
+            "trusted_camera_count": 11,
+            "camera_count": 12,
+            "excluded_camera_count": 1,
+            "safe_to_push_later": True,
+            "anchor_summary": "Median used the center of the trusted camera group instead of a single-camera anchor.",
+            "gating_reasons": ["The exposure set is fragmented into a stable cluster plus outliers."],
+            "operator_note": "This run is usable, but at least one camera should be reviewed before any later push.",
+        },
+        "recommendation": {
+            "recommended_strategy": {"strategy_key": "median", "strategy_label": "Median", "reason": "Median keeps the main cluster balanced."},
+            "confidence_score": 0.62,
+            "recommendation_strength": "MEDIUM_CONFIDENCE",
+            "run_status": "READY_WITH_WARNINGS",
+            "summary_notes": [],
+        },
+        "physical_validation": {
+            "status": "warning",
+            "exposure": {"mean_exposure_error": 0.008},
+            "neutrality": {"max_post_neutral_error": 0.011},
+            "kelvin_tint_analysis": {"kelvin_is_stable": True, "tint_carries_variation": True},
+            "confidence": {"mean_confidence": 0.71},
+            "outliers": [{"clip_id": "I007_A064_0325XY_001"}],
+            "excluded_cameras": [
+                {
+                    "clip_id": "I007_A064_0325XY_001",
+                    "camera_id": "I007_A064",
+                    "reasons": ["validation_confidence_low"],
+                }
+            ],
+            "excluded_camera_count": 1,
+            "included_camera_count": 11,
+            "cluster_is_usable_after_exclusions": True,
+            "warnings": ["Excluded 1 outlier camera from commit readiness; the remaining 11-camera cluster is still usable."],
+        },
+        "failure_modes": [{"code": "excluded_cameras_present", "severity": "warning", "message": "1 camera was excluded from safe commit export."}],
+    }
+    report_payload = {"visuals": {"exposure_plot_svg": "<svg viewBox='0 0 10 10'></svg>"}}
+    commit_payload = {
+        "camera_targets": [
+            {
+                "camera_id": "I007_A064",
+                "clip_id": "I007_A064_0325XY_001",
+                "inventory_camera_label": "IA",
+                "inventory_camera_ip": "172.20.114.173",
+                "calibration": {"exposureAdjust": -1.219, "kelvin": 5664, "tint": 0.2},
+                "confidence": 0.30,
+                "excluded_from_commit": True,
+                "exclusion_reasons": ["validation_confidence_low"],
+            }
+        ],
+        "per_camera_payloads": [],
+    }
+    from r3dmatch.web_app import _build_operator_surfaces, _render_commit_table, _render_decision_surface
+
+    surfaces = _build_operator_surfaces(
+        review_validation=review_validation,
+        review_payload=report_payload,
+        commit_payload=commit_payload,
+        camera_state_report=None,
+        apply_report=None,
+        writeback_verification_report=None,
+        post_apply_report=None,
+        source_mode_label_text="Local Folder",
+    )
+
+    assert surfaces["commit_readiness"]["state"] == "Commit with Warnings"
+    assert surfaces["physical_validation"]["cluster_is_usable_after_exclusions"] is True
+    decision_html = _render_decision_surface(surfaces)
+    commit_html = _render_commit_table(surfaces)
+    assert "COMMIT WITH WARNINGS" in decision_html
+    assert "1 camera excluded from reference" in decision_html
+    assert "remaining cluster is still commit-worthy" in decision_html
+    assert "I007_A064" in decision_html
+    assert "Should I Trust This Run?" in decision_html
+    assert "Excluded" in commit_html
+
+
+def test_web_apply_and_verify_routes_use_existing_backend_truth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    out_dir = tmp_path / "workflow-output"
+    report_dir = out_dir / "report"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    commit_payload_path = report_dir / "calibration_commit_payload.json"
+    commit_payload_path.write_text(json.dumps({"schema_version": "r3dmatch_calibration_commit_payload_v1", "camera_targets": [], "per_camera_payloads": []}), encoding="utf-8")
+
+    app_instance = create_app()
+    state = app_instance.config["UI_STATE"]
+    state.scan = {"clip_count": 0, "clip_ids": [], "sample_clip_ids": [], "remaining_count": 0, "clip_records": [], "clip_groups": [], "warning": None, "preview_available": False}
+    state.form.update({"output_path": str(out_dir), "resolved_output_path": str(out_dir), "verification_after_path": str(tmp_path / 'after-review')})
+
+    def fake_apply_calibration_payload(*args, **kwargs):
+        report = {
+            "schema_version": "r3dmatch_rcp2_apply_report_v1",
+            "transport_mode": "dry_run",
+            "operator_status": "dry_run",
+            "operator_status_counts": {"dry_run": 1},
+            "results": [],
+        }
+        Path(str(kwargs["out_path"])).write_text(json.dumps(report), encoding="utf-8")
+        return report
+
+    def fake_build_post_apply_verification(before_review_dir: str, after_review_dir: str, *, out_path: Optional[str] = None):
+        report = {"schema_version": "r3dmatch_post_apply_verification_v1", "status": "warning", "summary": {"exposure_improved": True, "neutrality_improved": False, "variance_reduced": True}}
+        Path(str(out_path)).write_text(json.dumps(report), encoding="utf-8")
+        report["report_path"] = str(out_path)
+        return report
+
+    monkeypatch.setattr("r3dmatch.web_app.apply_calibration_payload", fake_apply_calibration_payload)
+    monkeypatch.setattr("r3dmatch.web_app.build_post_apply_verification_from_reviews", fake_build_post_apply_verification)
+
+    with app_instance.test_client() as client:
+        apply_response = client.post("/apply-calibration", data={"output_path": str(out_dir), "apply_cameras": "GA"})
+        verify_response = client.post("/verify-apply", data={"output_path": str(out_dir), "verification_after_path": str(tmp_path / 'after-review')})
+    assert apply_response.status_code == 200
+    assert verify_response.status_code == 200
+    assert (report_dir / "rcp2_apply_report.json").exists()
+    assert (report_dir / "post_apply_verification.json").exists()
+
+
+def test_web_push_routes_load_payload_and_read_current_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    out_dir = tmp_path / "workflow-output"
+    report_dir = out_dir / "report"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    payload_dir = report_dir / "calibration_payloads"
+    payload_dir.mkdir(parents=True, exist_ok=True)
+    per_camera_path = payload_dir / "GA.json"
+    per_camera_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "r3dmatch_rcp2_ready_v1",
+                "camera_id": "G007_A065",
+                "clip_id": "G007_A065_0325F6_001",
+                "inventory_camera_label": "GA",
+                "inventory_camera_ip": "10.20.61.191",
+                "source_path": "/captures/GA/G007_A065_0325F6_001.R3D",
+                "calibration": {"exposureAdjust": 0.2, "kelvin": 5650, "tint": 0.4},
+                "confidence": 0.8,
+                "notes": ["Stable"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    commit_payload_path = report_dir / "calibration_commit_payload.json"
+    commit_payload_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "r3dmatch_calibration_commit_payload_v1",
+                "camera_targets": [
+                    {
+                        "camera_id": "G007_A065",
+                        "clip_id": "G007_A065_0325F6_001",
+                        "inventory_camera_label": "GA",
+                        "inventory_camera_ip": "10.20.61.191",
+                        "calibration": {"exposureAdjust": 0.2, "kelvin": 5650, "tint": 0.4},
+                        "confidence": 0.8,
+                        "excluded_from_commit": False,
+                        "exclusion_reasons": [],
+                    }
+                ],
+                "per_camera_payloads": [{"camera_id": "G007_A065", "path": str(per_camera_path)}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_read_camera_state(*, host: str, port: int = 9998, camera_label: str = "LIVE", **_: object) -> dict[str, object]:
+        assert host == "10.20.61.191"
+        assert camera_label == "GA"
+        return {
+            "schema_version": "r3dmatch_rcp2_camera_state_v1",
+            "transport_mode": "live_websocket",
+            "host": host,
+            "port": port,
+            "camera_label": camera_label,
+            "state": {"exposureAdjust": 0.0, "kelvin": 5600, "tint": 0.0},
+        }
+
+    monkeypatch.setattr("r3dmatch.web_app.read_camera_state", fake_read_camera_state)
+
+    app_instance = create_app()
+    state = app_instance.config["UI_STATE"]
+    state.scan = {"clip_count": 0, "clip_ids": [], "sample_clip_ids": [], "remaining_count": 0, "clip_records": [], "clip_groups": [], "warning": None, "preview_available": False}
+    state.form.update({"output_path": str(out_dir), "resolved_output_path": str(out_dir)})
+
+    with app_instance.test_client() as client:
+        load_response = client.post("/load-recommended-payload", data={"output_path": str(out_dir), "apply_cameras": "GA"})
+        read_response = client.post("/read-current-camera-values", data={"output_path": str(out_dir), "apply_cameras": "GA"})
+        status_payload = client.get("/status").get_json()
+
+    assert load_response.status_code == 200
+    assert read_response.status_code == 200
+    camera_state_report = json.loads((report_dir / "rcp2_camera_state_report.json").read_text(encoding="utf-8"))
+    assert camera_state_report["connected_camera_count"] == 1
+    assert camera_state_report["results"][0]["state"]["kelvin"] == 5600
+    assert "Ready" in status_payload["push_surface_html"]
+    assert "+0.200" in status_payload["push_surface_html"]
+    assert "<span class='delta-positive'>+0.200</span>" in status_payload["push_surface_html"]
+
+
+def test_verify_last_push_route_builds_structured_verification_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    out_dir = tmp_path / "workflow-output"
+    report_dir = out_dir / "report"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    payload_dir = report_dir / "calibration_payloads"
+    payload_dir.mkdir(parents=True, exist_ok=True)
+    per_camera_path = payload_dir / "GA.json"
+    per_camera_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "r3dmatch_rcp2_ready_v1",
+                "camera_id": "G007_A065",
+                "clip_id": "G007_A065_0325F6_001",
+                "inventory_camera_label": "GA",
+                "inventory_camera_ip": "10.20.61.191",
+                "source_path": "/captures/GA/G007_A065_0325F6_001.R3D",
+                "calibration": {"exposureAdjust": 0.2, "kelvin": 5650, "tint": 0.4},
+                "confidence": 0.8,
+                "notes": ["Stable"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    commit_payload_path = report_dir / "calibration_commit_payload.json"
+    commit_payload_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "r3dmatch_calibration_commit_payload_v1",
+                "camera_targets": [
+                    {
+                        "camera_id": "G007_A065",
+                        "clip_id": "G007_A065_0325F6_001",
+                        "inventory_camera_label": "GA",
+                        "inventory_camera_ip": "10.20.61.191",
+                        "calibration": {"exposureAdjust": 0.2, "kelvin": 5650, "tint": 0.4},
+                        "confidence": 0.8,
+                        "excluded_from_commit": False,
+                        "exclusion_reasons": [],
+                    }
+                ],
+                "per_camera_payloads": [{"camera_id": "G007_A065", "path": str(per_camera_path)}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (report_dir / "rcp2_camera_state_report.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "r3dmatch_rcp2_camera_state_report_v1",
+                "camera_count": 1,
+                "connected_camera_count": 1,
+                "results": [
+                    {
+                        "inventory_camera_label": "GA",
+                        "status": "success",
+                        "state": {"exposureAdjust": 0.205, "kelvin": 5655, "tint": 0.405},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    app_instance = create_app()
+    state = app_instance.config["UI_STATE"]
+    state.scan = {"clip_count": 0, "clip_ids": [], "sample_clip_ids": [], "remaining_count": 0, "clip_records": [], "clip_groups": [], "warning": None, "preview_available": False}
+    state.form.update({"output_path": str(out_dir), "resolved_output_path": str(out_dir)})
+
+    with app_instance.test_client() as client:
+        response = client.post("/verify-last-push", data={"output_path": str(out_dir), "apply_cameras": "GA"})
+        status_payload = client.get("/status").get_json()
+
+    assert response.status_code == 200
+    verification_report = json.loads((report_dir / "rcp2_verification_report.json").read_text(encoding="utf-8"))
+    assert verification_report["verification_mode"] == "camera_state_report_compare"
+    assert verification_report["status"] == "success"
+    assert verification_report["results"][0]["verification_status"] == "within_tolerance"
+    assert verification_report["results"][0]["verification_level"] == "WITHIN_TOLERANCE"
+    assert "Verification mode: camera state report compare." in status_payload["push_surface_html"]
+
+
+def test_review_calibration_ftps_source_mode_threads_ingest_manifest_into_review(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_ingest_ftps_batch(**kwargs):
+        ingest_root = Path(kwargs["out_dir"])
+        clip_path = ingest_root / "GA" / "G007_A063_032563.RDC" / "G007_A063_032563_001.R3D"
+        clip_path.parent.mkdir(parents=True, exist_ok=True)
+        clip_path.write_bytes(b"")
+        manifest = {
+            "schema_version": "r3dmatch_ftps_ingest_v1",
+            "source_mode": "ftps_camera_pull",
+            "source_mode_label": "FTPS Camera Pull",
+            "local_ingest_root": str(ingest_root),
+            "reel_identifier": "007",
+            "clip_spec": "63",
+            "clips_requested": [63],
+            "requested_cameras": ["GA"],
+            "requested_camera_ips": {"GA": "172.20.114.165"},
+            "successful_cameras": ["GA"],
+            "failed_cameras": [],
+            "requested_camera_count": 1,
+            "successful_camera_count": 1,
+            "failed_camera_count": 0,
+            "clips_found": 1,
+            "bytes_pulled": 1,
+            "per_camera_status": [],
+            "status": "success",
+            "manifest_path": str(ingest_root / "ingest_manifest.json"),
+        }
+        Path(manifest["manifest_path"]).write_text(json.dumps(manifest), encoding="utf-8")
+        return manifest
+
+    monkeypatch.setattr("r3dmatch.workflow.ingest_ftps_batch", fake_ingest_ftps_batch)
+    review_dir = tmp_path / "review-ftps"
+    payload = review_calibration(
+        None,
+        out_dir=str(review_dir),
+        source_mode="ftps_camera_pull",
+        ftps_reel="007",
+        ftps_clip_spec="63",
+        ftps_cameras=["GA"],
+        target_type="gray_sphere",
+        processing_mode="both",
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        exposure_calibration_path=None,
+        color_calibration_path=None,
+        calibration_mode=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+        calibration_roi={"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+        target_strategies=["median"],
+        reference_clip_id=None,
+        review_mode="lightweight_analysis",
+    )
+    review_package = json.loads((Path(payload["analysis_dir"]) / "report" / "review_package.json").read_text(encoding="utf-8"))
+    validation = json.loads((Path(payload["analysis_dir"]) / "report" / "review_validation.json").read_text(encoding="utf-8"))
+    assert review_package["source_mode"] == "ftps_camera_pull"
+    assert review_package["ingest_manifest"]["status"] == "success"
+    assert review_package["ingest_manifest"]["requested_camera_ips"]["GA"] == "172.20.114.165"
+    assert validation["status"] == "success"
 
 
 def test_approval_export_writes_batch_mapping_and_portable_scripts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

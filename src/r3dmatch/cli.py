@@ -9,13 +9,24 @@ from .calibration import calibrate_card_path, calibrate_color_path, calibrate_ex
 from .execution import CancellationError
 from .ftps_ingest import DEFAULT_FTPS_PASSWORD, DEFAULT_FTPS_USERNAME, ingest_ftps_batch, normalize_source_mode
 from .matching import analyze_path
+from .rcp2_apply import (
+    DEFAULT_RCP2_PORT,
+    DEFAULT_RCP2_SDK_ROOT,
+    apply_calibration_payload,
+    build_camera_verification_report,
+    read_camera_state,
+    test_rcp2_write_smoke,
+)
 from .report import build_contact_sheet_report, normalize_review_mode, normalize_target_strategy_name
 from .rmd import write_rmds_from_analysis
 from .transcode import write_transcode_plan
 from .validation import validate_pipeline
 from .workflow import approve_master_rmd, clear_preview_cache, normalize_matching_domain, review_calibration
 
-app = typer.Typer(no_args_is_help=True, help="R3DMatch CLI")
+app = typer.Typer(
+    no_args_is_help=True,
+    help="R3DMatch CLI for RED calibration analysis, reporting, and camera verification.",
+)
 
 
 @app.command("analyze")
@@ -259,7 +270,7 @@ def review_calibration_command(
     clip_id: list[str] = typer.Option([], "--clip-id", help="Repeat to include only specific clip IDs in this calibration subset"),
     clip_group: list[str] = typer.Option([], "--clip-group", help="Repeat to include all clips from a discovered subset group (for example take number)"),
     clip_subset_file: Optional[str] = typer.Option(None, "--clip-subset-file", help="Optional JSON file describing clip_ids / clip_groups / run_label for this subset run"),
-    target_strategy: list[str] = typer.Option(["median"], "--target-strategy", help="Target strategy: median, brightest-valid, manual, or hero-camera; repeat to compare multiple"),
+    target_strategy: list[str] = typer.Option(["median"], "--target-strategy", help="Target strategy: median, optimal-exposure, manual, or hero-camera; repeat to compare multiple"),
     reference_clip_id: Optional[str] = typer.Option(None, "--reference-clip-id", help="Reference clip ID for manual target strategy"),
     hero_clip_id: Optional[str] = typer.Option(None, "--hero-clip-id", help="Hero clip ID for hero-camera target strategy"),
     preview_mode: str = typer.Option("calibration", "--preview-mode", help="Preview mode: calibration or monitoring"),
@@ -363,7 +374,7 @@ def ingest_ftps_command(
 def approve_master_rmd_command(
     analysis_dir: str,
     out: Optional[str] = typer.Option(None, "--out", help="Approval output directory; defaults to <analysis_dir>/approval"),
-    target_strategy: str = typer.Option("median", "--target-strategy", help="Chosen target strategy: median, brightest-valid, manual, or hero-camera"),
+    target_strategy: str = typer.Option("median", "--target-strategy", help="Chosen target strategy: median, optimal-exposure, manual, or hero-camera"),
     reference_clip_id: Optional[str] = typer.Option(None, "--reference-clip-id", help="Reference clip ID for manual target strategy"),
     hero_clip_id: Optional[str] = typer.Option(None, "--hero-clip-id", help="Hero clip ID for hero-camera target strategy"),
 ) -> None:
@@ -378,6 +389,109 @@ def approve_master_rmd_command(
         target_strategy=target_strategy,
         reference_clip_id=reference_clip_id,
         hero_clip_id=hero_clip_id,
+    )
+    typer.echo(str(payload))
+
+
+@app.command("apply-calibration")
+def apply_calibration_command(
+    payload_path: str,
+    out: Optional[str] = typer.Option(None, "--out", help="Optional JSON report path for the apply result"),
+    camera: list[str] = typer.Option([], "--camera", help="Repeat to restrict apply to inventory labels, camera IDs, or clip IDs"),
+    dry_run: bool = typer.Option(True, "--dry-run/--live", help="Dry-run by default; use --live to perform real camera writes over RCP2"),
+    port: int = typer.Option(DEFAULT_RCP2_PORT, "--port", help="RCP2 control port"),
+    transport: str = typer.Option("websocket", "--transport", help="RCP2 transport: websocket or raw-legacy"),
+    sdk_root: str = typer.Option(DEFAULT_RCP2_SDK_ROOT, "--sdk-root", help="Path to the RED RCP SDK root for the raw-legacy fallback"),
+) -> None:
+    payload = apply_calibration_payload(
+        payload_path,
+        out_path=out,
+        requested_cameras=camera,
+        port=port,
+        live=not dry_run,
+        sdk_root=sdk_root,
+        transport_kind=transport,
+    )
+    typer.echo(str(payload))
+
+
+@app.command("apply-camera-values")
+def apply_camera_values_command(
+    payload_path: str,
+    out: Optional[str] = typer.Option(None, "--out", help="Optional JSON report path for the apply result"),
+    camera: list[str] = typer.Option([], "--camera", help="Repeat to restrict apply to inventory labels, camera IDs, or clip IDs"),
+    port: int = typer.Option(DEFAULT_RCP2_PORT, "--port", help="RCP2 control port"),
+    transport: str = typer.Option("websocket", "--transport", help="RCP2 transport: websocket or raw-legacy"),
+    sdk_root: str = typer.Option(DEFAULT_RCP2_SDK_ROOT, "--sdk-root", help="Path to the RED RCP SDK root for the raw-legacy fallback"),
+) -> None:
+    payload = apply_calibration_payload(
+        payload_path,
+        out_path=out,
+        requested_cameras=camera,
+        port=port,
+        live=True,
+        sdk_root=sdk_root,
+        transport_kind=transport,
+    )
+    typer.echo(str(payload))
+
+
+@app.command("read-camera-state")
+def read_camera_state_command(
+    host: str,
+    port: int = typer.Option(DEFAULT_RCP2_PORT, "--port", help="RCP2 control port"),
+    camera_label: str = typer.Option("LIVE", "--camera-label", help="Label used in logs and reports"),
+    transport: str = typer.Option("websocket", "--transport", help="RCP2 transport: websocket or raw-legacy"),
+    sdk_root: str = typer.Option(DEFAULT_RCP2_SDK_ROOT, "--sdk-root", help="Path to the RED RCP SDK root for the raw-legacy fallback"),
+) -> None:
+    payload = read_camera_state(
+        host=host,
+        port=port,
+        camera_label=camera_label,
+        transport_kind=transport,
+        sdk_root=sdk_root,
+    )
+    typer.echo(str(payload))
+
+
+@app.command("test-rcp2-write")
+def test_rcp2_write_command(
+    host: str,
+    port: int = typer.Option(DEFAULT_RCP2_PORT, "--port", help="RCP2 control port"),
+    camera_label: str = typer.Option("LIVE", "--camera-label", help="Label used in logs and reports"),
+    parameter: str = typer.Option("exposureAdjust", "--parameter", help="Parameter to test with write/readback/restore: exposureAdjust, kelvin, or tint"),
+    transport: str = typer.Option("websocket", "--transport", help="RCP2 transport: websocket or raw-legacy"),
+    sdk_root: str = typer.Option(DEFAULT_RCP2_SDK_ROOT, "--sdk-root", help="Path to the RED RCP SDK root for the raw-legacy fallback"),
+) -> None:
+    payload = test_rcp2_write_smoke(
+        host=host,
+        port=port,
+        camera_label=camera_label,
+        field_name=parameter,
+        transport_kind=transport,
+        sdk_root=sdk_root,
+    )
+    typer.echo(str(payload))
+
+
+@app.command("verify-camera-state")
+def verify_camera_state_command(
+    payload_path: str,
+    out: Optional[str] = typer.Option(None, "--out", help="Optional JSON report path for the verification result"),
+    camera: list[str] = typer.Option([], "--camera", help="Repeat to restrict verification to inventory labels, camera IDs, or clip IDs"),
+    live_read: bool = typer.Option(False, "--live-read", help="Perform read-only camera queries before verification"),
+    transport: str = typer.Option("websocket", "--transport", help="RCP2 transport: websocket or raw-legacy"),
+    port: int = typer.Option(DEFAULT_RCP2_PORT, "--port", help="RCP2 control port"),
+    sdk_root: str = typer.Option(DEFAULT_RCP2_SDK_ROOT, "--sdk-root", help="Path to the RED RCP SDK root for the raw-legacy fallback"),
+) -> None:
+    payload = build_camera_verification_report(
+        payload_path,
+        out_path=out,
+        requested_cameras=camera,
+        live_read=live_read,
+        transport_kind=transport,
+        port=port,
+        sdk_root=sdk_root,
     )
     typer.echo(str(payload))
 

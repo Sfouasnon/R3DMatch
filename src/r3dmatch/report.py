@@ -24,7 +24,7 @@ from .rmd import write_rmd_for_clip_with_metadata, write_rmds_from_analysis
 PREVIEW_VARIANTS = ("original", "exposure", "color", "both")
 REVIEW_PREVIEW_TRANSFORM = "REDLine IPP2 Log3G10 / Medium / Medium"
 DEFAULT_REVIEW_TARGET_STRATEGIES = ("median",)
-STRATEGY_ORDER = ["median", "brightest_valid", "manual", "hero_camera"]
+STRATEGY_ORDER = ["median", "optimal_exposure", "manual", "hero_camera"]
 DEFAULT_CALIBRATION_PREVIEW = {
     "preview_mode": "calibration",
     "output_space": "REDWideGamutRGB",
@@ -60,6 +60,15 @@ REVIEW_MODE_LABELS = {
     "full_contact_sheet": "Full Contact Sheet",
     "lightweight_analysis": "Lightweight Analysis",
 }
+OPTIMAL_EXPOSURE_MIN_CONFIDENCE = 0.45
+OPTIMAL_EXPOSURE_MAX_SAMPLE_LOG2_SPREAD = 0.12
+OPTIMAL_EXPOSURE_MAX_SAMPLE_CHROMA_SPREAD = 0.02
+OPTIMAL_EXPOSURE_PRIMARY_CLUSTER_GAP = 0.25
+CAMERA_TRUST_CAUTION_CONFIDENCE = 0.65
+CAMERA_TRUST_CAUTION_LOG2_SPREAD = 0.08
+CAMERA_TRUST_CAUTION_CHROMA_SPREAD = 0.014
+CAMERA_TRUST_LARGE_CORRECTION = 0.75
+CAMERA_TRUST_EXTREME_CORRECTION = 1.0
 
 
 def normalize_review_mode(value: str) -> str:
@@ -201,6 +210,32 @@ def _load_array_calibration_payload(input_path: str) -> Optional[Dict[str, objec
     return None
 
 
+def _quality_by_clip(array_calibration_payload: Optional[Dict[str, object]]) -> Dict[str, Dict[str, object]]:
+    quality_by_clip: Dict[str, Dict[str, object]] = {}
+    if not array_calibration_payload:
+        return quality_by_clip
+    for camera in array_calibration_payload.get("cameras", []) or []:
+        clip_id = str(camera.get("clip_id") or "").strip()
+        if not clip_id:
+            continue
+        quality_by_clip[clip_id] = dict(camera.get("quality") or {})
+    return quality_by_clip
+
+
+def _anchor_target_log2_from_array_payload(array_calibration_payload: Optional[Dict[str, object]]) -> Optional[float]:
+    if not array_calibration_payload:
+        return None
+    target = dict(array_calibration_payload.get("target") or {})
+    exposure = dict(target.get("exposure") or {})
+    direct_value = exposure.get("log2_luminance_target")
+    if direct_value is not None:
+        return float(direct_value)
+    fallback_value = array_calibration_payload.get("target_exposure_log2")
+    if fallback_value is not None:
+        return float(fallback_value)
+    return None
+
+
 def _load_sidecar_map(input_path: str) -> Dict[str, Dict[str, object]]:
     root = Path(input_path).expanduser().resolve()
     sidecar_dir = root / "sidecars"
@@ -215,14 +250,15 @@ def _load_sidecar_map(input_path: str) -> Dict[str, Dict[str, object]]:
 def normalize_target_strategy_name(name: str) -> str:
     normalized = name.strip().lower().replace("-", "_")
     aliases = {
-        "brightest_valid": "brightest_valid",
-        "best_exposed": "brightest_valid",
+        "optimal_exposure": "optimal_exposure",
+        "brightest_valid": "optimal_exposure",
+        "best_exposed": "optimal_exposure",
         "hero_camera": "hero_camera",
         "median": "median",
         "manual": "manual",
     }
     if normalized not in aliases:
-        raise ValueError("target strategy must be one of: median, brightest-valid, manual, hero-camera")
+        raise ValueError("target strategy must be one of: median, optimal-exposure, manual, hero-camera")
     return aliases[normalized]
 
 
@@ -230,7 +266,7 @@ def strategy_display_name(name: str) -> str:
     return {
         "hero_camera": "Hero Camera",
         "median": "Median",
-        "brightest_valid": "Brightest Valid",
+        "optimal_exposure": "Optimal Exposure (Best Match to Gray)",
         "manual": "Manual Reference",
     }[normalize_target_strategy_name(name)]
 
@@ -475,11 +511,178 @@ def _build_strategy_payloads(
     target_type: Optional[str] = None,
     monitoring_measurements_by_clip: Optional[Dict[str, Dict[str, object]]] = None,
     matching_domain: str = "scene",
+    quality_by_clip: Optional[Dict[str, Dict[str, object]]] = None,
+    anchor_target_log2: Optional[float] = None,
 ) -> List[Dict[str, object]]:
     if not analysis_records:
         return []
     resolved_matching_domain = _normalize_matching_domain(matching_domain)
     saturation_supported = _target_supports_saturation(target_type)
+    resolved_quality_by_clip = quality_by_clip or {}
+
+    def quality_for_record(record: Dict[str, object]) -> Dict[str, object]:
+        return dict(resolved_quality_by_clip.get(str(record["clip_id"]), {}) or {})
+
+    def confidence_for_record(record: Dict[str, object]) -> float:
+        quality = quality_for_record(record)
+        return float(quality.get("confidence", record.get("confidence", 0.0)) or 0.0)
+
+    def sample_log2_spread_for_record(record: Dict[str, object]) -> float:
+        measured = record.get("diagnostics", {})
+        quality = quality_for_record(record)
+        return float(quality.get("neutral_sample_log2_spread", measured.get("neutral_sample_log2_spread", 0.0)) or 0.0)
+
+    def sample_chroma_spread_for_record(record: Dict[str, object]) -> float:
+        measured = record.get("diagnostics", {})
+        quality = quality_for_record(record)
+        return float(
+            quality.get(
+                "neutral_sample_chromaticity_spread",
+                measured.get("neutral_sample_chromaticity_spread", 0.0),
+            )
+            or 0.0
+        )
+
+    def merged_flags_for_record(record: Dict[str, object]) -> List[str]:
+        quality = quality_for_record(record)
+        quality_flags = [str(flag) for flag in (quality.get("flags") or []) if str(flag).strip()]
+        return list(dict.fromkeys([*(record.get("flags") or []), *quality_flags]))
+
+    def choose_optimal_exposure_candidate() -> tuple[int, Dict[str, object]]:
+        median_value = float(np.median(measured_log2))
+        median_abs_dev = float(np.median(np.abs(measured_log2 - median_value))) if measured_log2.size else 0.0
+        outlier_threshold = max(0.35, median_abs_dev * 2.0)
+        cluster_info = _primary_exposure_cluster(
+            measured_log2,
+            gap_threshold=max(OPTIMAL_EXPOSURE_PRIMARY_CLUSTER_GAP, min(outlier_threshold, 0.45)),
+        )
+        primary_cluster_indices = {int(index) for index in cluster_info.get("indices", [])}
+        candidate_rows: List[Dict[str, object]] = []
+        screened_rows: List[Dict[str, object]] = []
+        for index, record in enumerate(analysis_records):
+            confidence = confidence_for_record(record)
+            sample_log2_spread = sample_log2_spread_for_record(record)
+            sample_chroma_spread = sample_chroma_spread_for_record(record)
+            measured_value = float(measured_log2[index])
+            chroma_penalty = float(np.linalg.norm(measured_chroma[index] - np.asarray(batch_target_rgb, dtype=np.float32))) * 1.5
+            exposure_error = abs(measured_value - batch_target_log2)
+            stability_penalty = min(sample_log2_spread / OPTIMAL_EXPOSURE_MAX_SAMPLE_LOG2_SPREAD, 2.0) * 0.20
+            stability_penalty += min(sample_chroma_spread / OPTIMAL_EXPOSURE_MAX_SAMPLE_CHROMA_SPREAD, 2.0) * 0.10
+            confidence_penalty = max(0.0, 1.0 - confidence) * 0.35
+            reasons: List[str] = []
+            if primary_cluster_indices and index not in primary_cluster_indices:
+                reasons.append("outside primary exposure cluster")
+            if abs(measured_value - median_value) > outlier_threshold:
+                reasons.append("outside central exposure cluster")
+            if confidence < OPTIMAL_EXPOSURE_MIN_CONFIDENCE:
+                reasons.append("low confidence")
+            if (
+                "neutral_sample_exposure_spread_high" in merged_flags_for_record(record)
+                or sample_log2_spread > OPTIMAL_EXPOSURE_MAX_SAMPLE_LOG2_SPREAD
+            ):
+                reasons.append("unstable neutral exposure samples")
+            if (
+                "neutral_sample_chromaticity_spread_high" in merged_flags_for_record(record)
+                or sample_chroma_spread > OPTIMAL_EXPOSURE_MAX_SAMPLE_CHROMA_SPREAD
+            ):
+                reasons.append("unstable neutral chromaticity samples")
+            row = {
+                "index": index,
+                "clip_id": str(record["clip_id"]),
+                "measured_log2": measured_value,
+                "confidence": confidence,
+                "sample_log2_spread": sample_log2_spread,
+                "sample_chroma_spread": sample_chroma_spread,
+                "exposure_error": exposure_error,
+                "stability_penalty": stability_penalty,
+                "confidence_penalty": confidence_penalty,
+                "chroma_penalty": chroma_penalty,
+                "score": exposure_error + stability_penalty + confidence_penalty + chroma_penalty,
+                "reasons": reasons,
+            }
+            if reasons:
+                screened_rows.append(row)
+            else:
+                candidate_rows.append(row)
+
+        fallback_mode = "trusted_anchor"
+        if candidate_rows:
+            chosen = min(candidate_rows, key=lambda item: (float(item["score"]), -float(item["confidence"]), float(item["exposure_error"])))
+        else:
+            fallback_candidates = [
+                index
+                for index in primary_cluster_indices
+                if confidence_for_record(analysis_records[index]) >= (OPTIMAL_EXPOSURE_MIN_CONFIDENCE * 0.8)
+            ]
+            if not fallback_candidates:
+                fallback_candidates = list(primary_cluster_indices) or list(range(len(analysis_records)))
+            target_index = min(
+                fallback_candidates,
+                key=lambda item: (
+                    abs(float(measured_log2[item]) - median_value),
+                    -confidence_for_record(analysis_records[item]),
+                    sample_log2_spread_for_record(analysis_records[item]),
+                ),
+            )
+            chosen = {
+                "index": target_index,
+                "clip_id": str(analysis_records[target_index]["clip_id"]),
+                "measured_log2": float(measured_log2[target_index]),
+                "confidence": confidence_for_record(analysis_records[target_index]),
+                "sample_log2_spread": sample_log2_spread_for_record(analysis_records[target_index]),
+                "sample_chroma_spread": sample_chroma_spread_for_record(analysis_records[target_index]),
+                "exposure_error": abs(float(measured_log2[target_index]) - batch_target_log2),
+                "stability_penalty": 0.0,
+                "confidence_penalty": 0.0,
+                "chroma_penalty": 0.0,
+                "score": abs(float(measured_log2[target_index]) - batch_target_log2),
+                "reasons": ["no camera met the minimum trust criteria"],
+            }
+            fallback_mode = "median_fallback"
+
+        anchor_reason = (
+            "Matched to the most trustworthy camera already closest to the gray target."
+            if fallback_mode == "trusted_anchor"
+            else "No camera met the minimum trust criteria, so the strategy fell back to the most central camera instead of anchoring on an unreliable match."
+        )
+        diagnostics = {
+            "selection_domain": resolved_matching_domain,
+            "selection_domain_label": _matching_domain_label(resolved_matching_domain),
+            "anchor_target_log2": batch_target_log2,
+            "cluster_median_log2": median_value,
+            "outlier_threshold_stops": outlier_threshold,
+            "primary_cluster": cluster_info,
+            "trusted_candidate_count": len(candidate_rows),
+            "screened_candidate_count": len(screened_rows),
+            "fallback_mode": fallback_mode,
+            "anchor_clip_id": str(chosen["clip_id"]),
+            "anchor_confidence": float(chosen["confidence"]),
+            "anchor_score": float(chosen["score"]),
+            "anchor_reason": anchor_reason,
+            "scored_candidates": [
+                {
+                    "clip_id": str(row["clip_id"]),
+                    "score": float(row["score"]),
+                    "exposure_error": float(row["exposure_error"]),
+                    "stability_penalty": float(row["stability_penalty"]),
+                    "confidence_penalty": float(row["confidence_penalty"]),
+                    "chroma_penalty": float(row["chroma_penalty"]),
+                    "confidence": float(row["confidence"]),
+                }
+                for row in sorted(candidate_rows, key=lambda item: float(item["score"]))
+            ],
+            "screened_candidates": [
+                {
+                    "clip_id": str(row["clip_id"]),
+                    "measured_log2": float(row["measured_log2"]),
+                    "score": float(row["score"]),
+                    "confidence": float(row["confidence"]),
+                    "reasons": list(row["reasons"]),
+                }
+                for row in sorted(screened_rows, key=lambda item: float(item["score"]))
+            ],
+        }
+        return int(chosen["index"]), diagnostics
 
     def measured_log2_for_record(record: Dict[str, object]) -> float:
         return float(
@@ -515,9 +718,12 @@ def _build_strategy_payloads(
     )
     measured_chroma = np.array([measured_rgb_for_record(record) for record in analysis_records], dtype=np.float32)
     measured_saturation = np.array([measured_saturation_for_record(record) for record in analysis_records], dtype=np.float32)
+    batch_target_log2 = float(anchor_target_log2) if anchor_target_log2 is not None else float(np.median(measured_log2))
+    batch_target_rgb = [float(np.median(measured_chroma[:, index])) for index in range(3)]
     payloads: List[Dict[str, object]] = []
     for requested in target_strategies:
         strategy = normalize_target_strategy_name(requested)
+        selection_diagnostics: Dict[str, object] = {}
         if strategy == "median":
             target_log2 = float(np.median(measured_log2))
             target_rgb = [float(np.median(measured_chroma[:, index])) for index in range(3)]
@@ -525,14 +731,26 @@ def _build_strategy_payloads(
             resolved_reference = None
             resolved_hero = None
             strategy_summary = "Matched to the batch median target."
-        elif strategy == "brightest_valid":
-            target_index = int(np.argmax(measured_log2))
+        elif strategy == "optimal_exposure":
+            target_index, selection_diagnostics = choose_optimal_exposure_candidate()
             target_log2 = float(measured_log2[target_index])
             target_rgb = [float(value) for value in measured_chroma[target_index]]
             target_saturation = float(measured_saturation[target_index]) if measured_saturation.size and saturation_supported else 1.0
             resolved_reference = str(analysis_records[target_index]["clip_id"])
             resolved_hero = None
-            strategy_summary = f"Matched to brightest valid clip {resolved_reference}."
+            screened_candidates = list(selection_diagnostics.get("screened_candidates") or [])
+            if str(selection_diagnostics.get("fallback_mode")) == "median_fallback":
+                strategy_summary = (
+                    f"No camera met the minimum trust criteria, so the strategy fell back to the most central camera {resolved_reference}."
+                )
+            elif screened_candidates:
+                screened_names = ", ".join(str(item["clip_id"]) for item in screened_candidates[:3])
+                strategy_summary = (
+                    f"Matched to camera {resolved_reference}, which was closest to the gray target while staying stable enough to trust. "
+                    f"Screened out {len(screened_candidates)} less trustworthy candidate(s) such as {screened_names}."
+                )
+            else:
+                strategy_summary = f"Matched to camera {resolved_reference}, which was already closest to the gray target."
         elif strategy == "hero_camera":
             if not hero_clip_id:
                 raise ValueError("hero-camera target strategy requires --hero-clip-id")
@@ -595,9 +813,9 @@ def _build_strategy_payloads(
                     "target_rgb_chromaticity": target_rgb,
                     "clip_metadata": record.get("clip_metadata"),
                     "rgb_gains": rgb_gains,
-                    "confidence": float(record.get("confidence", 0.0) or 0.0),
-                    "sample_log2_spread": float(measured.get("neutral_sample_log2_spread", 0.0) or 0.0),
-                    "sample_chromaticity_spread": float(measured.get("neutral_sample_chromaticity_spread", 0.0) or 0.0),
+                    "confidence": confidence_for_record(record),
+                    "sample_log2_spread": sample_log2_spread_for_record(record),
+                    "sample_chromaticity_spread": sample_chroma_spread_for_record(record),
                     "is_hero_camera": is_hero_camera,
                 }
             )
@@ -621,15 +839,15 @@ def _build_strategy_payloads(
                     "target_saturation_fraction": target_saturation,
                     "saturation_source": str(color_solution["saturation_source"]),
                     "saturation_supported": saturation_supported,
-                    "confidence": float(record.get("confidence", 0.0)),
-                    "flags": list(record.get("flags", [])),
+                    "confidence": confidence_for_record(record),
+                    "flags": merged_flags_for_record(record),
                     "calibration_roi": measured.get("calibration_roi"),
                     "measurement_mode": measured.get("calibration_measurement_mode"),
                     "exposure_measurement_domain": resolved_matching_domain,
                     "color_measurement_domain": resolved_matching_domain,
                     "neutral_sample_count": int(measured.get("neutral_sample_count", 0) or 0),
-                    "neutral_sample_log2_spread": float(measured.get("neutral_sample_log2_spread", 0.0) or 0.0),
-                    "neutral_sample_chromaticity_spread": float(measured.get("neutral_sample_chromaticity_spread", 0.0) or 0.0),
+                    "neutral_sample_log2_spread": sample_log2_spread_for_record(record),
+                    "neutral_sample_chromaticity_spread": sample_chroma_spread_for_record(record),
                     "neutral_samples": list(measured.get("neutral_samples", []) or []),
                     "is_hero_camera": is_hero_camera,
                 }
@@ -697,6 +915,7 @@ def _build_strategy_payloads(
                 "target_rgb_chromaticity": target_rgb,
                 "target_saturation_fraction": target_saturation,
                 "strategy_summary": strategy_summary,
+                "selection_diagnostics": selection_diagnostics,
                 "matching_domain": resolved_matching_domain,
                 "matching_domain_label": _matching_domain_label(resolved_matching_domain),
                 "white_balance_model": {
@@ -741,6 +960,10 @@ def _strategy_distribution_metrics(strategy_payload: Dict[str, object]) -> Dict[
         [max(0.0, 1.0 - float(clip.get("confidence", 0.0) or 0.0)) for clip in strategy_payload.get("clips", [])],
         dtype=np.float32,
     )
+    confidence_values = np.array(
+        [float(clip.get("confidence", 0.0) or 0.0) for clip in strategy_payload.get("clips", [])],
+        dtype=np.float32,
+    )
     if offsets.size == 0:
         return {
             "mean_abs_offset": 0.0,
@@ -750,6 +973,7 @@ def _strategy_distribution_metrics(strategy_payload: Dict[str, object]) -> Dict[
             "mean_color_residual": 0.0,
             "max_color_residual": 0.0,
             "mean_confidence_penalty": 0.0,
+            "mean_confidence": 0.0,
         }
     return {
         "mean_abs_offset": float(np.mean(offsets)),
@@ -759,6 +983,7 @@ def _strategy_distribution_metrics(strategy_payload: Dict[str, object]) -> Dict[
         "mean_color_residual": float(np.mean(color_residuals)) if color_residuals.size else 0.0,
         "max_color_residual": float(np.max(color_residuals)) if color_residuals.size else 0.0,
         "mean_confidence_penalty": float(np.mean(confidence_penalty)) if confidence_penalty.size else 0.0,
+        "mean_confidence": float(np.mean(confidence_values)) if confidence_values.size else 0.0,
     }
 
 
@@ -871,32 +1096,157 @@ def _exposure_summary(clips: List[Dict[str, object]]) -> Dict[str, object]:
     }
 
 
-def _build_exposure_plot_svg(clips: List[Dict[str, object]]) -> str:
+def _primary_exposure_cluster(exposures: np.ndarray, *, gap_threshold: float) -> Dict[str, object]:
+    values = np.asarray(exposures, dtype=np.float32).reshape(-1)
+    if values.size == 0:
+        return {"indices": [], "groups": [], "gap_threshold": float(gap_threshold)}
+    ordered = sorted(enumerate(float(item) for item in values.tolist()), key=lambda item: item[1])
+    groups: List[List[tuple[int, float]]] = []
+    current: List[tuple[int, float]] = [ordered[0]]
+    for previous, current_item in zip(ordered, ordered[1:]):
+        if abs(float(current_item[1]) - float(previous[1])) > float(gap_threshold):
+            groups.append(current)
+            current = [current_item]
+        else:
+            current.append(current_item)
+    groups.append(current)
+    median_value = float(np.median(values))
+    largest_group_size = max((len(group) for group in groups), default=0)
+    if len(groups) <= 1 or largest_group_size < 2:
+        return {
+            "indices": [int(index) for index, _value in ordered],
+            "groups": [
+                {
+                    "indices": [int(index) for index, _value in group],
+                    "minimum": float(min(value for _, value in group)),
+                    "maximum": float(max(value for _, value in group)),
+                    "size": len(group),
+                }
+                for group in groups
+            ],
+            "gap_threshold": float(gap_threshold),
+        }
+    primary_group = max(
+        groups,
+        key=lambda group: (
+            len(group),
+            -min(abs(float(value) - median_value) for _, value in group),
+        ),
+    )
+    return {
+        "indices": [int(index) for index, _value in primary_group],
+        "groups": [
+            {
+                "indices": [int(index) for index, _value in group],
+                "minimum": float(min(value for _, value in group)),
+                "maximum": float(max(value for _, value in group)),
+                "size": len(group),
+            }
+            for group in groups
+        ],
+        "gap_threshold": float(gap_threshold),
+    }
+
+
+def _svg_truncate(text: str, limit: int) -> str:
+    cleaned = " ".join(str(text).split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: max(limit - 1, 1)].rstrip() + "…"
+
+
+def _svg_wrapped_text(
+    text: str,
+    *,
+    x: float,
+    y: float,
+    width_chars: int,
+    max_lines: int,
+    font_size: int = 11,
+    fill: str = "#64748b",
+    anchor: str = "start",
+    line_height: int = 14,
+) -> str:
+    words = " ".join(str(text).split()).split()
+    if not words:
+        return ""
+    lines: List[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if len(candidate) <= width_chars or not current:
+            current = candidate
+            continue
+        lines.append(current)
+        current = word
+        if len(lines) >= max_lines - 1:
+            break
+    if current and len(lines) < max_lines:
+        lines.append(current)
+    remaining_words = words[len(" ".join(lines).split()):]
+    if remaining_words and lines:
+        lines[-1] = _svg_truncate(lines[-1], max(width_chars - 1, 1))
+    tspans = []
+    for index, line in enumerate(lines[:max_lines]):
+        tspans.append(
+            f"<tspan x=\"{x:.1f}\" dy=\"{0 if index == 0 else line_height}\" text-anchor=\"{anchor}\">{html.escape(line)}</tspan>"
+        )
+    return f"<text x=\"{x:.1f}\" y=\"{y:.1f}\" font-size=\"{font_size}\" fill=\"{fill}\">{''.join(tspans)}</text>"
+
+
+def _build_exposure_plot_svg(
+    clips: List[Dict[str, object]],
+    *,
+    target_log2: Optional[float] = None,
+    reference_clip_id: Optional[str] = None,
+    outlier_threshold: Optional[float] = None,
+) -> str:
     if not clips:
         return ""
-    ordered = sorted(clips, key=lambda clip: float(clip.get("measured_log2_luminance_monitoring", 0.0) or 0.0))
+    ordered = sorted(clips, key=lambda clip: float(clip.get("measured_log2_luminance_monitoring", 0.0) or 0.0), reverse=True)
     values = [float(clip.get("measured_log2_luminance_monitoring", 0.0) or 0.0) for clip in ordered]
     minimum = min(values)
     maximum = max(values)
-    width = 920
-    height = 220
-    pad_left = 80
-    pad_right = 36
-    pad_top = 28
-    pad_bottom = 54
+    median_value = float(np.median(np.asarray(values, dtype=np.float32)))
+    threshold = float(outlier_threshold or max(0.35, float(np.median(np.abs(np.asarray(values, dtype=np.float32) - median_value))) * 2.0))
+    lower_cluster = median_value - threshold
+    upper_cluster = median_value + threshold
+    width = 1180
+    height = 500
+    pad_left = 96
+    pad_right = 68
+    pad_top = 42
+    pad_bottom = 96
     inner_width = width - pad_left - pad_right
     inner_height = height - pad_top - pad_bottom
     scale = (maximum - minimum) or 1.0
     step = inner_width / max(len(ordered) - 1, 1)
+    def y_for(value: float) -> float:
+        return pad_top + inner_height - ((value - minimum) / scale) * inner_height
+
     points: List[str] = []
     labels: List[str] = []
+    stems: List[str] = []
     for index, clip in enumerate(ordered):
         x = pad_left + step * index
         value = float(clip.get("measured_log2_luminance_monitoring", 0.0) or 0.0)
-        y = pad_top + inner_height - ((value - minimum) / scale) * inner_height
+        y = y_for(value)
         points.append(f"{x:.1f},{y:.1f}")
+        if target_log2 is not None:
+            target_y = y_for(float(target_log2))
+            stems.append(f"<line x1=\"{x:.1f}\" y1=\"{y:.1f}\" x2=\"{x:.1f}\" y2=\"{target_y:.1f}\" stroke=\"#cbd5e1\" stroke-width=\"2\" stroke-dasharray=\"4 4\"/>")
         labels.append(
-            f"<text x=\"{x:.1f}\" y=\"{height - 20}\" text-anchor=\"middle\" font-size=\"11\" fill=\"#64748b\">{html.escape(_camera_label_for_reporting(str(clip['clip_id'])))}</text>"
+            _svg_wrapped_text(
+                _camera_label_for_reporting(str(clip["clip_id"])),
+                x=x,
+                y=height - 44,
+                width_chars=12,
+                max_lines=2,
+                font_size=11,
+                fill="#475569",
+                anchor="middle",
+                line_height=13,
+            )
         )
     polyline = " ".join(points)
     grid_lines = []
@@ -905,13 +1255,43 @@ def _build_exposure_plot_svg(clips: List[Dict[str, object]]) -> str:
         value = maximum - ((maximum - minimum) / 3.0) * tick
         grid_lines.append(f"<line x1=\"{pad_left}\" y1=\"{y:.1f}\" x2=\"{width - pad_right}\" y2=\"{y:.1f}\" stroke=\"#e2e8f0\" stroke-width=\"1\"/>")
         grid_lines.append(f"<text x=\"{pad_left - 12}\" y=\"{y + 4:.1f}\" text-anchor=\"end\" font-size=\"11\" fill=\"#64748b\">{value:.2f}</text>")
+    cluster_band = (
+        f"<rect x=\"{pad_left}\" y=\"{y_for(upper_cluster):.1f}\" width=\"{inner_width:.1f}\" height=\"{max(y_for(lower_cluster) - y_for(upper_cluster), 6):.1f}\" fill=\"#dbeafe\" opacity=\"0.45\" rx=\"14\"/>"
+    )
+    cluster_line = f"<line x1=\"{pad_left}\" y1=\"{y_for(median_value):.1f}\" x2=\"{width - pad_right}\" y2=\"{y_for(median_value):.1f}\" stroke=\"#1d4ed8\" stroke-width=\"2\" stroke-dasharray=\"6 5\"/>"
+    target_line = (
+        f"<line x1=\"{pad_left}\" y1=\"{y_for(float(target_log2)):.1f}\" x2=\"{width - pad_right}\" y2=\"{y_for(float(target_log2)):.1f}\" stroke=\"#0f766e\" stroke-width=\"2\"/>"
+        if target_log2 is not None
+        else ""
+    )
+    legend = (
+        f"<text x=\"{pad_left}\" y=\"24\" font-size=\"13\" font-weight=\"700\" fill=\"#1d4ed8\">Blue band: stable cluster</text>"
+        f"<text x=\"{pad_left + 210}\" y=\"24\" font-size=\"13\" font-weight=\"700\" fill=\"#0f766e\">Green line: target</text>"
+        f"<text x=\"{pad_left + 390}\" y=\"24\" font-size=\"13\" font-weight=\"700\" fill=\"#dc2626\">Red point: outlier</text>"
+        f"<text x=\"{pad_left}\" y=\"{max(y_for(median_value) - 10, 40):.1f}\" font-size=\"11\" fill=\"#1d4ed8\">stable cluster band</text>"
+        + (
+            f"<text x=\"{width - pad_right - 110}\" y=\"{max(y_for(float(target_log2)) - 10, 40):.1f}\" font-size=\"11\" fill=\"#0f766e\">target exposure</text>"
+            if target_log2 is not None
+            else ""
+        )
+    )
     circles = []
-    for point in points:
+    for clip, point in zip(ordered, points):
         x, y = point.split(",")
-        circles.append(f"<circle cx=\"{x}\" cy=\"{y}\" r=\"5\" fill=\"#0f172a\"/>")
+        value = float(clip.get("measured_log2_luminance_monitoring", 0.0) or 0.0)
+        is_outlier = abs(value - median_value) > threshold
+        is_anchor = reference_clip_id and str(clip.get("clip_id")) == str(reference_clip_id)
+        fill = "#f59e0b" if is_anchor else "#dc2626" if is_outlier else "#0f172a"
+        radius = 6 if is_anchor else 5
+        circles.append(f"<circle cx=\"{x}\" cy=\"{y}\" r=\"{radius}\" fill=\"{fill}\" stroke=\"#ffffff\" stroke-width=\"2\"/>")
     return (
         f"<svg viewBox=\"0 0 {width} {height}\" role=\"img\" aria-label=\"Per-camera exposure plot\">"
         f"{''.join(grid_lines)}"
+        f"{cluster_band}"
+        f"{cluster_line}"
+        f"{target_line}"
+        f"{legend}"
+        f"{''.join(stems)}"
         f"<polyline fill=\"none\" stroke=\"#2563eb\" stroke-width=\"3\" points=\"{polyline}\"/>"
         f"{''.join(circles)}"
         f"{''.join(labels)}"
@@ -919,24 +1299,486 @@ def _build_exposure_plot_svg(clips: List[Dict[str, object]]) -> str:
     )
 
 
+def _build_before_after_exposure_svg(clips: List[Dict[str, object]], *, target_log2: float) -> str:
+    if not clips:
+        return ""
+    ordered = sorted(clips, key=lambda clip: float(abs(clip.get("exposure_offset_stops", 0.0) or 0.0)), reverse=True)
+    values = [float(clip.get("measured_log2_luminance_monitoring", 0.0) or 0.0) for clip in ordered] + [float(target_log2)]
+    minimum = min(values)
+    maximum = max(values)
+    width = 1180
+    row_height = 54
+    height = 130 + row_height * len(ordered)
+    pad_left = 176
+    pad_right = 76
+    pad_top = 40
+    inner_width = width - pad_left - pad_right
+    scale = (maximum - minimum) or 1.0
+
+    def x_for(value: float) -> float:
+        return pad_left + ((value - minimum) / scale) * inner_width
+
+    rows: List[str] = []
+    for index, clip in enumerate(ordered):
+        y = pad_top + index * row_height + 12
+        measured = float(clip.get("measured_log2_luminance_monitoring", 0.0) or 0.0)
+        measured_x = x_for(measured)
+        target_x = x_for(float(target_log2))
+        rows.append(
+            _svg_wrapped_text(
+                _camera_label_for_reporting(str(clip["clip_id"])),
+                x=pad_left - 14,
+                y=y - 6,
+                width_chars=18,
+                max_lines=2,
+                font_size=11,
+                fill="#475569",
+                anchor="end",
+                line_height=13,
+            )
+            +
+            f"<line x1=\"{measured_x:.1f}\" y1=\"{y:.1f}\" x2=\"{target_x:.1f}\" y2=\"{y:.1f}\" stroke=\"#94a3b8\" stroke-width=\"3\"/>"
+            f"<circle cx=\"{measured_x:.1f}\" cy=\"{y:.1f}\" r=\"5\" fill=\"#2563eb\"/>"
+            f"<circle cx=\"{target_x:.1f}\" cy=\"{y:.1f}\" r=\"5\" fill=\"#0f766e\"/>"
+        )
+    axis = []
+    for tick in range(4):
+        value = minimum + ((maximum - minimum) / 3.0) * tick
+        x = x_for(value)
+        axis.append(f"<line x1=\"{x:.1f}\" y1=\"{pad_top - 10}\" x2=\"{x:.1f}\" y2=\"{height - 18}\" stroke=\"#e2e8f0\" stroke-width=\"1\"/>")
+        axis.append(f"<text x=\"{x:.1f}\" y=\"{height - 4}\" text-anchor=\"middle\" font-size=\"11\" fill=\"#64748b\">{value:.2f}</text>")
+    legend = (
+        f"<text x=\"{pad_left}\" y=\"24\" font-size=\"13\" font-weight=\"700\" fill=\"#2563eb\">Blue dot: measured</text>"
+        f"<text x=\"{pad_left + 176}\" y=\"24\" font-size=\"13\" font-weight=\"700\" fill=\"#0f766e\">Green dot: target</text>"
+    )
+    return f"<svg viewBox=\"0 0 {width} {height}\" role=\"img\" aria-label=\"Before and after exposure correction chart\">{legend}{''.join(axis)}{''.join(rows)}</svg>"
+
+
+def _build_confidence_chart_svg(clips: List[Dict[str, object]]) -> str:
+    if not clips:
+        return ""
+    ordered = sorted(clips, key=lambda clip: str(clip.get("clip_id") or ""))
+    width = 1180
+    height = 500
+    pad_left = 74
+    pad_right = 36
+    pad_top = 32
+    pad_bottom = 92
+    inner_width = width - pad_left - pad_right
+    inner_height = height - pad_top - pad_bottom
+    step = inner_width / max(len(ordered), 1)
+    bars: List[str] = []
+    labels: List[str] = []
+    guides: List[str] = []
+    for value, label, color in [(0.75, "trusted", "#94a3b8"), (0.5, "review", "#cbd5e1"), (0.35, "minimum", "#dc2626")]:
+        y = pad_top + inner_height - (inner_height * value)
+        stroke_width = "2" if value == 0.35 else "1"
+        guides.append(f"<line x1=\"{pad_left}\" y1=\"{y:.1f}\" x2=\"{width - pad_right}\" y2=\"{y:.1f}\" stroke=\"{color}\" stroke-width=\"{stroke_width}\" stroke-dasharray=\"6 4\"/>")
+        guides.append(f"<text x=\"{width - pad_right}\" y=\"{y - 6:.1f}\" text-anchor=\"end\" font-size=\"11\" fill=\"{color}\">{label} {value:.2f}</text>")
+    for index, clip in enumerate(ordered):
+        x = pad_left + index * step + step * 0.15
+        bar_width = step * 0.7
+        confidence = max(0.0, min(1.0, float(clip.get("confidence", 0.0) or 0.0)))
+        bar_height = inner_height * confidence
+        y = pad_top + inner_height - bar_height
+        fill = "#16a34a" if confidence >= 0.75 else "#f59e0b" if confidence >= 0.5 else "#dc2626"
+        labels.append(
+            _svg_wrapped_text(
+                _camera_label_for_reporting(str(clip["clip_id"])),
+                x=x + bar_width / 2,
+                y=height - 46,
+                width_chars=12,
+                max_lines=2,
+                font_size=11,
+                fill="#475569",
+                anchor="middle",
+                line_height=13,
+            )
+            +
+            f"<text x=\"{x + bar_width / 2:.1f}\" y=\"{y - 6:.1f}\" text-anchor=\"middle\" font-size=\"10\" fill=\"#475569\">{confidence:.2f}</text>"
+        )
+        bars.append(f"<rect x=\"{x:.1f}\" y=\"{y:.1f}\" width=\"{bar_width:.1f}\" height=\"{max(bar_height, 4):.1f}\" rx=\"8\" fill=\"{fill}\"/>")
+    baseline = f"<line x1=\"{pad_left}\" y1=\"{pad_top + inner_height:.1f}\" x2=\"{width - pad_right}\" y2=\"{pad_top + inner_height:.1f}\" stroke=\"#cbd5e1\" stroke-width=\"1\"/>"
+    return f"<svg viewBox=\"0 0 {width} {height}\" role=\"img\" aria-label=\"Per-camera confidence chart\">{baseline}{''.join(guides)}{''.join(bars)}{''.join(labels)}</svg>"
+
+
 def _build_strategy_chart_svg(strategy_summaries: List[Dict[str, object]]) -> str:
     if not strategy_summaries:
         return ""
-    width = 680
-    row_height = 42
-    height = 70 + row_height * len(strategy_summaries)
+    width = 1180
+    row_height = 86
+    height = 92 + row_height * len(strategy_summaries)
     max_value = max(float(item["correction_metrics"]["max_abs_offset"]) for item in strategy_summaries) or 1.0
     bars: List[str] = []
     for index, item in enumerate(strategy_summaries):
         y = 32 + index * row_height
-        width_value = 420 * (float(item["correction_metrics"]["mean_abs_offset"]) / max_value)
+        width_value = 520 * (float(item["correction_metrics"]["mean_abs_offset"]) / max_value)
+        confidence_text = float(item["correction_metrics"].get("mean_confidence", 0.0) or 0.0)
+        anchor_reason = str(((item.get("selection_diagnostics") or {}).get("anchor_reason")) or "")
+        strategy_role = "stability anchor" if str(item.get("strategy_key") or "") == "median" else "gray-match anchor" if str(item.get("strategy_key") or "") == "optimal_exposure" else "review anchor"
+        recommended_fill = "#0f766e" if item.get("recommended") else "#2563eb"
         bars.append(
-            f"<text x=\"24\" y=\"{y + 16}\" font-size=\"13\" fill=\"#0f172a\">{html.escape(str(item['strategy_label']))}</text>"
-            f"<rect x=\"190\" y=\"{y}\" width=\"420\" height=\"16\" rx=\"8\" fill=\"#e2e8f0\"/>"
-            f"<rect x=\"190\" y=\"{y}\" width=\"{max(width_value, 4):.1f}\" height=\"16\" rx=\"8\" fill=\"#2563eb\"/>"
-            f"<text x=\"624\" y=\"{y + 13}\" font-size=\"12\" fill=\"#475569\">mean {float(item['correction_metrics']['mean_abs_offset']):.2f} / max {float(item['correction_metrics']['max_abs_offset']):.2f}</text>"
+            _svg_wrapped_text(
+                str(item["strategy_label"]),
+                x=28,
+                y=y + 10,
+                width_chars=18,
+                max_lines=2,
+                font_size=13,
+                fill="#0f172a",
+                anchor="start",
+                line_height=14,
+            )
+            +
+            f"<rect x=\"280\" y=\"{y}\" width=\"560\" height=\"22\" rx=\"10\" fill=\"#e2e8f0\"/>"
+            f"<rect x=\"280\" y=\"{y}\" width=\"{max(width_value, 4):.1f}\" height=\"22\" rx=\"10\" fill=\"{recommended_fill}\"/>"
+            f"<text x=\"860\" y=\"{y + 16}\" font-size=\"12\" fill=\"#475569\">mean {float(item['correction_metrics']['mean_abs_offset']):.2f} / max {float(item['correction_metrics']['max_abs_offset']):.2f} | trust {confidence_text:.2f}</text>"
+            f"<text x=\"280\" y=\"{y + 48}\" font-size=\"11\" fill=\"#334155\">{html.escape(strategy_role)}</text>"
+            f"{_svg_wrapped_text(anchor_reason, x=400, y=y + 48, width_chars=66, max_lines=2, font_size=11, fill='#64748b', anchor='start', line_height=13)}"
         )
     return f"<svg viewBox=\"0 0 {width} {height}\" role=\"img\" aria-label=\"Strategy correction spread chart\">{''.join(bars)}</svg>"
+
+
+def _trust_tone_for_class(trust_class: str) -> str:
+    normalized = str(trust_class or "").strip().upper()
+    if normalized == "TRUSTED":
+        return "#16a34a"
+    if normalized == "USE_WITH_CAUTION":
+        return "#f59e0b"
+    if normalized == "UNTRUSTED":
+        return "#ef4444"
+    if normalized == "EXCLUDED":
+        return "#7c2d12"
+    return "#64748b"
+
+
+def _camera_trust_details(
+    *,
+    clip_id: str,
+    confidence: float,
+    sample_log2_spread: float,
+    sample_chroma_spread: float,
+    measured_log2: float,
+    final_offset: float,
+    exposure_summary: Dict[str, object],
+    in_primary_cluster: bool,
+    screened_reasons: List[str],
+) -> Dict[str, object]:
+    median_value = float(exposure_summary.get("median", measured_log2) or measured_log2)
+    outlier_threshold = float(exposure_summary.get("outlier_threshold", 0.35) or 0.35)
+    outside_central_cluster = abs(measured_log2 - median_value) > outlier_threshold
+    low_confidence = confidence < OPTIMAL_EXPOSURE_MIN_CONFIDENCE
+    caution_confidence = confidence < CAMERA_TRUST_CAUTION_CONFIDENCE
+    unstable_log2 = sample_log2_spread > OPTIMAL_EXPOSURE_MAX_SAMPLE_LOG2_SPREAD
+    unstable_chroma = sample_chroma_spread > OPTIMAL_EXPOSURE_MAX_SAMPLE_CHROMA_SPREAD
+    elevated_log2 = sample_log2_spread > CAMERA_TRUST_CAUTION_LOG2_SPREAD
+    elevated_chroma = sample_chroma_spread > CAMERA_TRUST_CAUTION_CHROMA_SPREAD
+    large_correction = abs(final_offset) >= CAMERA_TRUST_LARGE_CORRECTION
+    extreme_correction = abs(final_offset) >= CAMERA_TRUST_EXTREME_CORRECTION
+
+    reasons: List[str] = []
+    if not in_primary_cluster:
+        reasons.append("Outside primary exposure group")
+    if outside_central_cluster and "Outside primary exposure group" not in reasons:
+        reasons.append("Outside stable exposure cluster")
+    if unstable_log2:
+        reasons.append("Unstable gray sample")
+    elif elevated_log2:
+        reasons.append("Gray sample spread is elevated")
+    if unstable_chroma:
+        reasons.append("Neutral color sample is unstable")
+    elif elevated_chroma:
+        reasons.append("Neutral color spread is elevated")
+    if low_confidence:
+        reasons.append("Low confidence")
+    elif caution_confidence:
+        reasons.append("Confidence is moderate")
+    if extreme_correction:
+        reasons.append("Large correction needed")
+    elif large_correction:
+        reasons.append("Correction is larger than the main cluster")
+    for reason in screened_reasons:
+        normalized_reason = str(reason).strip()
+        if normalized_reason and normalized_reason not in reasons:
+            reasons.append(normalized_reason)
+
+    trust_penalty = max(0.0, 1.0 - confidence) * 0.45
+    trust_penalty += min(sample_log2_spread / OPTIMAL_EXPOSURE_MAX_SAMPLE_LOG2_SPREAD, 2.0) * 0.22
+    trust_penalty += min(sample_chroma_spread / OPTIMAL_EXPOSURE_MAX_SAMPLE_CHROMA_SPREAD, 2.0) * 0.14
+    trust_penalty += min(abs(final_offset) / 1.25, 1.5) * 0.12
+    if not in_primary_cluster:
+        trust_penalty += 0.22
+    if outside_central_cluster:
+        trust_penalty += 0.14
+    trust_score = max(0.0, min(1.0, 1.0 - trust_penalty))
+
+    if (
+        (not in_primary_cluster)
+        or outside_central_cluster
+        or (extreme_correction and (low_confidence or unstable_log2 or unstable_chroma))
+    ):
+        trust_class = "EXCLUDED"
+    elif low_confidence or unstable_log2 or unstable_chroma or extreme_correction:
+        trust_class = "UNTRUSTED"
+    elif caution_confidence or elevated_log2 or elevated_chroma or large_correction:
+        trust_class = "USE_WITH_CAUTION"
+    else:
+        trust_class = "TRUSTED"
+
+    if trust_class == "TRUSTED":
+        trust_reason = "Stable gray sample"
+        stability_label = "Stable gray sample"
+        correction_confidence = "HIGH"
+    elif trust_class == "USE_WITH_CAUTION":
+        trust_reason = reasons[0] if reasons else "Use with caution"
+        stability_label = "Slightly unstable reading"
+        correction_confidence = "MEDIUM"
+    elif trust_class == "UNTRUSTED":
+        trust_reason = reasons[0] if reasons else "Unstable reading"
+        stability_label = "Unstable reading"
+        correction_confidence = "LOW"
+    else:
+        trust_reason = reasons[0] if reasons else "Excluded due to inconsistent measurement"
+        stability_label = "Excluded from reference"
+        correction_confidence = "LOW"
+
+    return {
+        "trust_class": trust_class,
+        "trust_score": round(trust_score, 4),
+        "trust_reason": trust_reason,
+        "stability_label": stability_label,
+        "correction_confidence": correction_confidence,
+        "reference_use": "Excluded" if trust_class == "EXCLUDED" else "Included",
+        "screened_reasons": reasons,
+        "outside_central_cluster": outside_central_cluster,
+        "outside_primary_cluster": not in_primary_cluster,
+    }
+
+
+def _build_trust_chart_svg(rows: List[Dict[str, object]]) -> str:
+    if not rows:
+        return ""
+    ordered = sorted(rows, key=lambda item: (str(item.get("trust_class") or ""), -float(item.get("trust_score", 0.0) or 0.0), str(item.get("camera_label") or "")))
+    width = 1180
+    height = 500
+    pad_left = 74
+    pad_right = 36
+    pad_top = 34
+    pad_bottom = 96
+    inner_width = width - pad_left - pad_right
+    inner_height = height - pad_top - pad_bottom
+    step = inner_width / max(len(ordered), 1)
+    bars: List[str] = []
+    labels: List[str] = []
+    guides: List[str] = []
+    for value, label, color in [(0.75, "trusted", "#16a34a"), (0.5, "caution", "#f59e0b"), (0.35, "review", "#dc2626")]:
+        y = pad_top + inner_height - (inner_height * value)
+        guides.append(f"<line x1=\"{pad_left}\" y1=\"{y:.1f}\" x2=\"{width - pad_right}\" y2=\"{y:.1f}\" stroke=\"{color}\" stroke-width=\"1\" stroke-dasharray=\"6 4\"/>")
+        guides.append(f"<text x=\"{width - pad_right}\" y=\"{y - 6:.1f}\" text-anchor=\"end\" font-size=\"11\" fill=\"{color}\">{label} {value:.2f}</text>")
+    for index, row in enumerate(ordered):
+        x = pad_left + index * step + step * 0.15
+        bar_width = step * 0.7
+        trust_score = max(0.0, min(1.0, float(row.get("trust_score", 0.0) or 0.0)))
+        bar_height = inner_height * trust_score
+        y = pad_top + inner_height - bar_height
+        fill = _trust_tone_for_class(str(row.get("trust_class") or ""))
+        labels.append(
+            _svg_wrapped_text(
+                str(row.get("camera_label") or row.get("clip_id") or ""),
+                x=x + bar_width / 2,
+                y=height - 50,
+                width_chars=12,
+                max_lines=2,
+                font_size=11,
+                fill="#475569",
+                anchor="middle",
+                line_height=13,
+            )
+            + f"<text x=\"{x + bar_width / 2:.1f}\" y=\"{y - 8:.1f}\" text-anchor=\"middle\" font-size=\"10\" fill=\"#334155\">{html.escape(str(row.get('trust_class') or ''))}</text>"
+        )
+        bars.append(f"<rect x=\"{x:.1f}\" y=\"{y:.1f}\" width=\"{bar_width:.1f}\" height=\"{max(bar_height, 4):.1f}\" rx=\"8\" fill=\"{fill}\"/>")
+    baseline = f"<line x1=\"{pad_left}\" y1=\"{pad_top + inner_height:.1f}\" x2=\"{width - pad_right}\" y2=\"{pad_top + inner_height:.1f}\" stroke=\"#cbd5e1\" stroke-width=\"1\"/>"
+    return f"<svg viewBox=\"0 0 {width} {height}\" role=\"img\" aria-label=\"Per-camera trust chart\">{baseline}{''.join(guides)}{''.join(bars)}{''.join(labels)}</svg>"
+
+
+def _build_stability_chart_svg(rows: List[Dict[str, object]]) -> str:
+    if not rows:
+        return ""
+    ordered = sorted(
+        rows,
+        key=lambda item: (
+            float(item.get("neutral_sample_log2_spread", 0.0) or 0.0),
+            float(item.get("neutral_sample_chromaticity_spread", 0.0) or 0.0),
+            -float(item.get("confidence", 0.0) or 0.0),
+        ),
+    )
+    width = 1180
+    row_height = 62
+    height = 94 + row_height * len(ordered)
+    max_value = max(float(item.get("neutral_sample_log2_spread", 0.0) or 0.0) for item in ordered) or OPTIMAL_EXPOSURE_MAX_SAMPLE_LOG2_SPREAD
+    rows_svg: List[str] = []
+    threshold_x = 280 + 520 * min(OPTIMAL_EXPOSURE_MAX_SAMPLE_LOG2_SPREAD / max_value, 1.0)
+    rows_svg.append(f"<line x1=\"{threshold_x:.1f}\" y1=\"22\" x2=\"{threshold_x:.1f}\" y2=\"{height - 20}\" stroke=\"#dc2626\" stroke-width=\"2\" stroke-dasharray=\"6 4\"/>")
+    rows_svg.append(f"<text x=\"{threshold_x + 8:.1f}\" y=\"24\" font-size=\"11\" fill=\"#dc2626\">stability threshold</text>")
+    for index, item in enumerate(ordered):
+        y = 40 + index * row_height
+        spread = float(item.get("neutral_sample_log2_spread", 0.0) or 0.0)
+        width_value = 520 * min(spread / max_value, 1.0)
+        fill = _trust_tone_for_class(str(item.get("trust_class") or ""))
+        rows_svg.append(
+            _svg_wrapped_text(
+                str(item.get("camera_label") or item.get("clip_id") or ""),
+                x=28,
+                y=y + 8,
+                width_chars=18,
+                max_lines=2,
+                font_size=13,
+                fill="#0f172a",
+                anchor="start",
+                line_height=14,
+            )
+            + f"<rect x=\"280\" y=\"{y}\" width=\"560\" height=\"20\" rx=\"10\" fill=\"#e2e8f0\"/>"
+            + f"<rect x=\"280\" y=\"{y}\" width=\"{max(width_value, 4):.1f}\" height=\"20\" rx=\"10\" fill=\"{fill}\"/>"
+            + f"<text x=\"860\" y=\"{y + 14}\" font-size=\"12\" fill=\"#475569\">spread {spread:.3f} | {html.escape(str(item.get('stability_label') or ''))}</text>"
+        )
+    return f"<svg viewBox=\"0 0 {width} {height}\" role=\"img\" aria-label=\"Per-camera stability ranking chart\">{''.join(rows_svg)}</svg>"
+
+
+def _build_run_assessment(
+    *,
+    per_camera_rows: List[Dict[str, object]],
+    recommended_payload: Dict[str, object],
+    strategy_summaries: List[Dict[str, object]],
+    exposure_summary: Dict[str, object],
+) -> Dict[str, object]:
+    total = len(per_camera_rows)
+    trusted = [row for row in per_camera_rows if str(row.get("trust_class") or "") == "TRUSTED"]
+    caution = [row for row in per_camera_rows if str(row.get("trust_class") or "") == "USE_WITH_CAUTION"]
+    untrusted = [row for row in per_camera_rows if str(row.get("trust_class") or "") == "UNTRUSTED"]
+    excluded = [row for row in per_camera_rows if str(row.get("trust_class") or "") == "EXCLUDED"]
+    reference_eligible = trusted + caution
+    trusted_count = len(trusted)
+    excluded_count = len(excluded)
+    reference_eligible_count = len(reference_eligible)
+    average_trust_score = round(
+        float(np.mean([float(row.get("trust_score", 0.0) or 0.0) for row in per_camera_rows])) if per_camera_rows else 0.0,
+        4,
+    )
+    minimum_reference_count = max(3 if total >= 3 else total, int(np.ceil(total * 0.5)) if total >= 6 else 2 if total >= 2 else total)
+    recommended_key = str(recommended_payload.get("strategy_key") or "")
+    anchor_clip_id = str(recommended_payload.get("reference_clip_id") or "")
+    anchor_row = next((row for row in per_camera_rows if str(row.get("clip_id") or "") == anchor_clip_id), None)
+    anchor_trust_class = str(anchor_row.get("trust_class") or "") if anchor_row else "DERIVED_CLUSTER_TARGET"
+    fragmented = bool(int(exposure_summary.get("outlier_count", 0) or 0) > max(1, total // 4))
+    gating_reasons: List[str] = []
+    if reference_eligible_count < minimum_reference_count:
+        gating_reasons.append("Too few cameras are trustworthy enough to represent the set.")
+    if anchor_row and anchor_trust_class in {"UNTRUSTED", "EXCLUDED"}:
+        gating_reasons.append("The chosen anchor does not meet the trust requirements.")
+    if excluded_count > max(1, total // 4):
+        gating_reasons.append("Too many cameras fell outside the safe reference group.")
+    if fragmented:
+        gating_reasons.append("The exposure set is fragmented into a stable cluster plus outliers.")
+    if average_trust_score < 0.5:
+        gating_reasons.append("Overall measurement quality is weak across the set.")
+
+    if reference_eligible_count < minimum_reference_count or (anchor_row and anchor_trust_class in {"UNTRUSTED", "EXCLUDED"}):
+        run_status = "DO_NOT_PUSH"
+        recommendation_strength = "LOW_CONFIDENCE"
+    elif trusted_count < max(2, min(total, 3)) or fragmented or average_trust_score < 0.58:
+        run_status = "REVIEW_REQUIRED"
+        recommendation_strength = "LOW_CONFIDENCE"
+    elif caution or untrusted or excluded or average_trust_score < 0.8:
+        run_status = "READY_WITH_WARNINGS"
+        recommendation_strength = "MEDIUM_CONFIDENCE"
+    else:
+        run_status = "READY"
+        recommendation_strength = "HIGH_CONFIDENCE"
+
+    if recommended_key == "median":
+        anchor_summary = "Median used the center of the trusted camera group instead of a single-camera anchor."
+    else:
+        selected_strategy_summary = next(
+            (item for item in strategy_summaries if str(item.get("strategy_key") or "") == recommended_key),
+            {},
+        )
+        selected_strategy_diagnostics = dict((selected_strategy_summary or {}).get("selection_diagnostics") or {})
+        anchor_summary = str(selected_strategy_diagnostics.get("anchor_reason") or "A single trustworthy camera anchored the group.")
+
+    if run_status == "READY":
+        operator_note = "This run is strong enough to trust later for push if the camera readback still matches."
+    elif run_status == "READY_WITH_WARNINGS":
+        operator_note = "This run is usable, but at least one camera should be reviewed before any later push."
+    elif run_status == "REVIEW_REQUIRED":
+        operator_note = "Review is required before trusting this run for later camera push."
+    else:
+        operator_note = "Do not push these corrections later without remeasuring the set."
+
+    return {
+        "status": run_status,
+        "recommendation_strength": recommendation_strength,
+        "safe_to_push_later": run_status in {"READY", "READY_WITH_WARNINGS"},
+        "trusted_camera_count": trusted_count,
+        "caution_camera_count": len(caution),
+        "untrusted_camera_count": len(untrusted),
+        "excluded_camera_count": excluded_count,
+        "reference_eligible_count": reference_eligible_count,
+        "camera_count": total,
+        "average_trust_score": average_trust_score,
+        "anchor_camera": anchor_clip_id or None,
+        "anchor_trust_class": anchor_trust_class,
+        "anchor_summary": anchor_summary,
+        "gating_reasons": gating_reasons,
+        "operator_note": operator_note,
+    }
+
+
+def _lightweight_summary_sentence(
+    *,
+    exposure_summary: Dict[str, object],
+    recommended_strategy: Dict[str, object],
+) -> str:
+    outlier_count = int(exposure_summary.get("outlier_count", 0) or 0)
+    strategy_label = str(recommended_strategy.get("strategy_label") or "Pending")
+    if outlier_count <= 0:
+        return f"Most cameras are consistent, and {strategy_label} keeps the array balanced."
+    if outlier_count == 1:
+        return "Most cameras are consistent. 1 camera is significantly out of family and should be reviewed separately."
+    return f"Most cameras are consistent, but {outlier_count} cameras sit outside the stable cluster and need review."
+
+
+def _lightweight_summary_points(
+    *,
+    exposure_summary: Dict[str, object],
+    recommended_strategy: Dict[str, object],
+    strategy_summaries: List[Dict[str, object]],
+) -> List[str]:
+    outlier_count = int(exposure_summary.get("outlier_count", 0) or 0)
+    points = [
+        f"Core cluster spread: {float(exposure_summary['spread']):.2f} across the measured gray-target brightness range.",
+        (
+            f"Outlier deviation: {outlier_count} camera requires separate review."
+            if outlier_count == 1
+            else f"Outlier deviation: {outlier_count} cameras require separate review."
+            if outlier_count > 1
+            else "Outlier deviation: no cameras currently sit outside the stable cluster."
+        ),
+        f"Chosen strategy: {str(recommended_strategy['strategy_label'])}.",
+        str(recommended_strategy.get("reason") or ""),
+    ]
+    optimal_summary = next((item for item in strategy_summaries if str(item.get("strategy_key") or "") == "optimal_exposure"), None)
+    if str(recommended_strategy.get("strategy_key") or "") == "median":
+        optimal_reason = str(((optimal_summary or {}).get("selection_diagnostics") or {}).get("anchor_reason") or "")
+        points.append(
+            "Median was chosen as a fallback because no single camera was trustworthy enough to anchor the array."
+            if "fell back" in optimal_reason.lower()
+            else "Median was chosen because it keeps the group stable instead of hinging the solve on one camera."
+        )
+        if optimal_summary:
+            points.append(
+                f"Optimal Exposure checked {str(optimal_summary.get('reference_clip_id') or 'the closest gray-match camera')}, but it was rejected because {optimal_reason.lower() or 'it would have increased corrections across the group'}."
+            )
+    return [item for item in points if str(item).strip()]
 
 
 def _build_lightweight_synopsis(
@@ -946,23 +1788,44 @@ def _build_lightweight_synopsis(
     recommended_strategy: Dict[str, object],
     hero_summary: Dict[str, object],
 ) -> str:
+    summary_sentence = _lightweight_summary_sentence(
+        exposure_summary=exposure_summary,
+        recommended_strategy=recommended_strategy,
+    )
     spread = float(exposure_summary["spread"])
     minimum = float(exposure_summary["minimum"])
     maximum = float(exposure_summary["maximum"])
     synopsis = [
-        f"Cameras were measured across a {spread:.2f} stop exposure span, from {minimum:.2f} to {maximum:.2f} log2 stops.",
+        summary_sentence,
+        f"Core cluster spread was {spread:.2f} in the derived gray-target brightness metric, from {minimum:.2f} to {maximum:.2f}.",
     ]
     if strategy_summaries:
         median_summary = next((item for item in strategy_summaries if item["strategy_key"] == "median"), None)
-        brightest_summary = next((item for item in strategy_summaries if item["strategy_key"] == "brightest_valid"), None)
+        optimal_summary = next((item for item in strategy_summaries if item["strategy_key"] == "optimal_exposure"), None)
         if median_summary:
             synopsis.append(
-                f"The median strategy would center the array with an average absolute correction of {float(median_summary['correction_metrics']['mean_abs_offset']):.2f} stops."
+                f"The median strategy would center the array with an average exposure correction of {float(median_summary['correction_metrics']['mean_abs_offset']):.2f}."
             )
-        if brightest_summary:
-            synopsis.append(
-                f"Brightest-valid would anchor to {brightest_summary.get('reference_clip_id') or 'the brightest valid clip'}, increasing the maximum correction to {float(brightest_summary['correction_metrics']['max_abs_offset']):.2f} stops."
-            )
+        if optimal_summary:
+            optimal_diagnostics = dict(optimal_summary.get("selection_diagnostics") or {})
+            screened_candidates = list(optimal_diagnostics.get("screened_candidates") or [])
+            if str(optimal_diagnostics.get("fallback_mode")) == "median_fallback":
+                synopsis.append(
+                    f"Optimal Exposure could not find a trustworthy single-camera anchor, so it fell back to the most central camera {optimal_summary.get('reference_clip_id') or 'in the set'}."
+                )
+            else:
+                synopsis.append(
+                    f"Optimal Exposure would anchor to {optimal_summary.get('reference_clip_id') or 'the best gray-match camera'}, asking for at most {float(optimal_summary['correction_metrics']['max_abs_offset']):.2f} of exposure correction."
+                )
+            if screened_candidates:
+                screened_names = ", ".join(str(item.get("clip_id") or "") for item in screened_candidates[:3] if str(item.get("clip_id") or "").strip())
+                synopsis.append(
+                    f"{len(screened_candidates)} camera(s) such as {screened_names} were screened out because they did not meet the stability and trust requirements for an anchor."
+                )
+            if recommended_strategy.get("strategy_key") != "optimal_exposure":
+                synopsis.append(
+                    f"A single camera was closest to correct gray, but using it as the anchor would require larger corrections across the group than the chosen {recommended_strategy['strategy_label']} strategy."
+                )
     synopsis.append(recommended_strategy["reason"])
     if hero_summary.get("candidate_clip_id"):
         synopsis.append(f"{hero_summary['candidate_clip_id']} appears to be the strongest hero candidate. {hero_summary['reason']}")
@@ -971,40 +1834,297 @@ def _build_lightweight_synopsis(
     return " ".join(synopsis)
 
 
+def _camera_id_from_clip_id(clip_id: str) -> str:
+    parts = str(clip_id).split("_")
+    return "_".join(parts[:2]) if len(parts) >= 2 else str(clip_id)
+
+
+def _roi_overlay_svg(
+    *,
+    clip_id: str,
+    calibration_roi: Optional[Dict[str, float]],
+    sample_sets: List[Dict[str, object]],
+) -> str:
+    width = 960
+    height = 540
+    roi = dict(calibration_roi or {"x": 0.3, "y": 0.3, "w": 0.4, "h": 0.4})
+    roi_x = float(roi.get("x", 0.0) or 0.0) * width
+    roi_y = float(roi.get("y", 0.0) or 0.0) * height
+    roi_w = float(roi.get("w", 1.0) or 1.0) * width
+    roi_h = float(roi.get("h", 1.0) or 1.0) * height
+    sample_boxes: List[str] = []
+    colors = {"left": "#22c55e", "center": "#f59e0b", "right": "#ef4444"}
+    for sample in sample_sets:
+        bounds = dict((sample.get("bounds") or {}).get("normalized_within_roi") or {})
+        sample_x = roi_x + float(bounds.get("x", 0.0) or 0.0) * roi_w
+        sample_y = roi_y + float(bounds.get("y", 0.0) or 0.0) * roi_h
+        sample_w = float(bounds.get("w", 0.0) or 0.0) * roi_w
+        sample_h = float(bounds.get("h", 0.0) or 0.0) * roi_h
+        label = str(sample.get("label") or "")
+        stroke = colors.get(label, "#38bdf8")
+        sample_boxes.append(
+            f"<rect x=\"{sample_x:.1f}\" y=\"{sample_y:.1f}\" width=\"{sample_w:.1f}\" height=\"{sample_h:.1f}\" "
+            f"fill=\"none\" stroke=\"{stroke}\" stroke-width=\"4\" rx=\"10\"/>"
+            f"<text x=\"{sample_x + 8:.1f}\" y=\"{sample_y + 22:.1f}\" font-size=\"16\" fill=\"{stroke}\">{html.escape(label.title())}</text>"
+        )
+    return (
+        f"<svg viewBox=\"0 0 {width} {height}\" role=\"img\" aria-label=\"ROI overlay for {html.escape(str(clip_id))}\">"
+        f"<rect x=\"0\" y=\"0\" width=\"{width}\" height=\"{height}\" fill=\"#0f172a\"/>"
+        f"<rect x=\"18\" y=\"18\" width=\"{width - 36}\" height=\"{height - 36}\" fill=\"#111827\" stroke=\"#334155\" stroke-width=\"2\" rx=\"20\"/>"
+        f"<text x=\"28\" y=\"42\" font-size=\"20\" fill=\"#e2e8f0\">{html.escape(str(clip_id))}</text>"
+        f"<text x=\"28\" y=\"68\" font-size=\"14\" fill=\"#94a3b8\">Shared ROI and neutral-sample windows</text>"
+        f"<rect x=\"{roi_x:.1f}\" y=\"{roi_y:.1f}\" width=\"{roi_w:.1f}\" height=\"{roi_h:.1f}\" fill=\"#38bdf8\" fill-opacity=\"0.08\" stroke=\"#38bdf8\" stroke-width=\"5\" rx=\"16\"/>"
+        f"<text x=\"{roi_x + 10:.1f}\" y=\"{max(roi_y - 12, 22):.1f}\" font-size=\"16\" fill=\"#38bdf8\">Calibration ROI</text>"
+        f"{''.join(sample_boxes)}"
+        "</svg>"
+    )
+
+
+def _build_exposure_trace_artifacts(
+    *,
+    analysis_records: List[Dict[str, object]],
+    recommended_payload: Dict[str, object],
+    strategy_summaries: List[Dict[str, object]],
+    exposure_summary: Dict[str, object],
+    out_root: Path,
+) -> Dict[str, object]:
+    debug_root = out_root / "debug_exposure_trace"
+    overlay_root = debug_root / "roi_overlays"
+    debug_root.mkdir(parents=True, exist_ok=True)
+    overlay_root.mkdir(parents=True, exist_ok=True)
+    recommended_by_clip = {str(item.get("clip_id") or ""): dict(item) for item in (recommended_payload.get("clips") or [])}
+    optimal_summary = next(
+        (item for item in strategy_summaries if str(item.get("strategy_key") or "") == "optimal_exposure"),
+        None,
+    )
+    optimal_diag = dict((optimal_summary or {}).get("selection_diagnostics") or {})
+    trusted_candidates = {
+        str(item.get("clip_id") or ""): dict(item)
+        for item in (optimal_diag.get("scored_candidates") or [])
+        if str(item.get("clip_id") or "").strip()
+    }
+    screened_candidates = {
+        str(item.get("clip_id") or ""): dict(item)
+        for item in (optimal_diag.get("screened_candidates") or [])
+        if str(item.get("clip_id") or "").strip()
+    }
+
+    rows: List[Dict[str, object]] = []
+    for record in analysis_records:
+        clip_id = str(record.get("clip_id") or "")
+        strategy_clip = recommended_by_clip.get(clip_id) or {}
+        diagnostics = dict(record.get("diagnostics") or {})
+        confidence = float(strategy_clip.get("confidence", record.get("confidence", 0.0)) or 0.0)
+        sample_spread = float(strategy_clip.get("neutral_sample_log2_spread", diagnostics.get("neutral_sample_log2_spread", 0.0)) or 0.0)
+        sample_chroma_spread = float(
+            strategy_clip.get("neutral_sample_chromaticity_spread", diagnostics.get("neutral_sample_chromaticity_spread", 0.0)) or 0.0
+        )
+        measured_monitoring = float(strategy_clip.get("measured_log2_luminance_monitoring", diagnostics.get("measured_log2_luminance_monitoring", diagnostics.get("measured_log2_luminance", 0.0))) or 0.0)
+        measured_raw = float(strategy_clip.get("measured_log2_luminance_raw", diagnostics.get("measured_log2_luminance_raw", measured_monitoring)) or 0.0)
+        final_offset = float(strategy_clip.get("exposure_offset_stops", 0.0) or 0.0)
+        target_log2 = float(recommended_payload.get("target_log2_luminance", 0.0) or 0.0)
+        trusted_row = trusted_candidates.get(clip_id)
+        screened_row = screened_candidates.get(clip_id)
+        should_be_trusted = (
+            confidence >= OPTIMAL_EXPOSURE_MIN_CONFIDENCE
+            and sample_spread <= OPTIMAL_EXPOSURE_MAX_SAMPLE_LOG2_SPREAD
+            and sample_chroma_spread <= OPTIMAL_EXPOSURE_MAX_SAMPLE_CHROMA_SPREAD
+            and abs(measured_monitoring - float(exposure_summary.get("median", 0.0) or 0.0)) <= float(exposure_summary.get("outlier_threshold", 0.35) or 0.35)
+        )
+        trust_status = "trusted_candidate" if trusted_row else "screened_out" if screened_row else "not_evaluated"
+        directional_bias = "within_cluster"
+        if final_offset >= float(exposure_summary.get("outlier_threshold", 0.35) or 0.35):
+            directional_bias = "darker_than_cluster"
+        elif final_offset <= -float(exposure_summary.get("outlier_threshold", 0.35) or 0.35):
+            directional_bias = "brighter_than_cluster"
+        overlay_path = overlay_root / f"{_camera_id_from_clip_id(clip_id)}.svg"
+        overlay_path.write_text(
+            _roi_overlay_svg(
+                clip_id=clip_id,
+                calibration_roi=diagnostics.get("calibration_roi"),
+                sample_sets=[dict(item) for item in (diagnostics.get("neutral_samples") or [])],
+            ),
+            encoding="utf-8",
+        )
+        row = {
+            "camera_id": _camera_id_from_clip_id(clip_id),
+            "camera_label": _camera_label_for_reporting(clip_id),
+            "clip_id": clip_id,
+            "source_path": str(record.get("source_path") or ""),
+            "measurement_mode": str(diagnostics.get("calibration_measurement_mode") or ""),
+            "calibration_roi": dict(diagnostics.get("calibration_roi") or {}),
+            "final_gray_value_used": {
+                "monitoring_log2": measured_monitoring,
+                "raw_log2": measured_raw,
+                "target_log2": target_log2,
+            },
+            "correction": {
+                "exposure_adjust": final_offset,
+                "deviation_from_anchor": round(measured_monitoring - target_log2, 6),
+                "directional_bias": directional_bias,
+            },
+            "quality": {
+                "confidence": confidence,
+                "flags": [str(item) for item in (strategy_clip.get("flags") or []) if str(item).strip()],
+                "neutral_sample_log2_spread": sample_spread,
+                "neutral_sample_chromaticity_spread": sample_chroma_spread,
+            },
+            "trust": {
+                "status": trust_status,
+                "trusted_for_anchor_selection": bool(trusted_row),
+                "should_have_been_trusted": bool(should_be_trusted),
+                "screening_reasons": list((screened_row or {}).get("reasons") or []),
+            },
+            "sampling": {
+                "sampled_frames": int(diagnostics.get("sampled_frames", 0) or 0),
+                "accepted_frames": int(diagnostics.get("accepted_frames", 0) or 0),
+                "rejected_frame_count": max(
+                    int(diagnostics.get("sampled_frames", 0) or 0) - int(diagnostics.get("accepted_frames", 0) or 0),
+                    0,
+                ),
+                "neutral_samples_monitoring": [dict(item) for item in (diagnostics.get("neutral_samples") or [])],
+                "neutral_samples_raw": [dict(item) for item in (diagnostics.get("neutral_samples_raw") or [])],
+                "roi_overlay_path": str(overlay_path),
+            },
+            "failure_mode_flags": {
+                "high_variance_gray_samples": sample_spread > OPTIMAL_EXPOSURE_MAX_SAMPLE_LOG2_SPREAD,
+                "low_confidence_used": confidence < OPTIMAL_EXPOSURE_MIN_CONFIDENCE and abs(final_offset) > 0.0,
+                "anchor_chosen_from_unstable_camera": bool(clip_id == optimal_diag.get("anchor_clip_id") and screened_row),
+                "directional_bias": directional_bias,
+            },
+            "strategy_inclusion": {
+                "recommended_strategy": str(recommended_payload.get("strategy_key") or ""),
+                "optimal_exposure_reference": str((optimal_summary or {}).get("reference_clip_id") or ""),
+            },
+        }
+        rows.append(row)
+        (debug_root / f"{row['camera_id']}.json").write_text(json.dumps(row, indent=2), encoding="utf-8")
+
+    brightness_order = sorted(rows, key=lambda item: float(item["final_gray_value_used"]["monitoring_log2"]), reverse=True)
+    confidence_order = sorted(rows, key=lambda item: float(item["quality"]["confidence"]), reverse=True)
+    stability_order = sorted(
+        rows,
+        key=lambda item: (
+            float(item["quality"]["neutral_sample_log2_spread"]),
+            float(item["quality"]["neutral_sample_chromaticity_spread"]),
+        ),
+    )
+    for index, row in enumerate(brightness_order, start=1):
+        row.setdefault("rankings", {})["brightness_rank"] = index
+    for index, row in enumerate(confidence_order, start=1):
+        row.setdefault("rankings", {})["confidence_rank"] = index
+    for index, row in enumerate(stability_order, start=1):
+        row.setdefault("rankings", {})["stability_rank"] = index
+    for row in rows:
+        (debug_root / f"{row['camera_id']}.json").write_text(json.dumps(row, indent=2), encoding="utf-8")
+
+    summary = {
+        "schema_version": "r3dmatch_exposure_debug_trace_v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "recommended_strategy": str(recommended_payload.get("strategy_key") or ""),
+        "anchor_clip_id": str(recommended_payload.get("reference_clip_id") or ""),
+        "target_gray_log2": float(recommended_payload.get("target_log2_luminance", 0.0) or 0.0),
+        "exposure_summary": dict(exposure_summary),
+        "optimal_exposure_diagnostics": optimal_diag,
+        "roi_alignment": {
+            "measurement_modes": sorted({str(item.get("measurement_mode") or "") for item in rows}),
+            "shared_roi": len({json.dumps(item.get("calibration_roi") or {}, sort_keys=True) for item in rows}) <= 1,
+            "shared_sample_geometry": len(
+                {
+                    json.dumps(
+                        [sample.get("bounds") for sample in (item.get("sampling") or {}).get("neutral_samples_monitoring", [])],
+                        sort_keys=True,
+                    )
+                    for item in rows
+                }
+            )
+            <= 1,
+        },
+        "cameras": sorted(rows, key=lambda item: str(item["camera_id"])),
+    }
+    summary_path = debug_root / "summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return {
+        "directory": str(debug_root),
+        "summary_path": str(summary_path),
+        "camera_count": len(rows),
+    }
+
+
 def _render_lightweight_analysis_html(payload: Dict[str, object]) -> str:
     exposure_summary = payload["exposure_summary"]
     hero_summary = payload["hero_recommendation"]
+    run_assessment = dict(payload.get("run_assessment") or {})
+    readiness_label = {
+        "READY": "SAFE TO COMMIT",
+        "READY_WITH_WARNINGS": "COMMIT WITH WARNINGS",
+        "REVIEW_REQUIRED": "REVIEW REQUIRED",
+        "DO_NOT_PUSH": "DO NOT PUSH",
+    }.get(str(run_assessment.get("status") or ""), "COMMIT WITH WARNINGS")
+    readiness_tone = "success" if str(run_assessment.get("status") or "") == "READY" else "danger" if str(run_assessment.get("status") or "") == "DO_NOT_PUSH" else "warning"
+    summary_sentence = _lightweight_summary_sentence(
+        exposure_summary=exposure_summary,
+        recommended_strategy=payload["recommended_strategy"],
+    )
+    summary_points = _lightweight_summary_points(
+        exposure_summary=exposure_summary,
+        recommended_strategy=payload["recommended_strategy"],
+        strategy_summaries=payload["strategy_comparison"],
+    )
+    banner_subline = (
+        f"{int(exposure_summary.get('outlier_count', 0) or 0)} camera excluded from reference, corrections still applied."
+        if int(exposure_summary.get("outlier_count", 0) or 0) == 1
+        else f"{int(exposure_summary.get('outlier_count', 0) or 0)} cameras excluded from reference, corrections still applied."
+        if int(exposure_summary.get("outlier_count", 0) or 0) > 1
+        else "No cameras excluded from reference in this subset."
+    )
     strategy_cards = []
     for strategy in payload["strategy_comparison"]:
         recommended_badge = "<span class='recommended-badge'>Recommended</span>" if strategy.get("recommended") else ""
+        selection_diagnostics = dict(strategy.get("selection_diagnostics") or {})
+        strategy_role = "Stability anchor" if str(strategy.get("strategy_key") or "") == "median" else "Accuracy to gray" if str(strategy.get("strategy_key") or "") == "optimal_exposure" else "Reference anchor"
         strategy_cards.append(
             "<article class='strategy-card'>"
             f"<div class='strategy-card-top'><h3>{html.escape(str(strategy['strategy_label']))}</h3>{recommended_badge}</div>"
             f"<p>{html.escape(str(strategy['summary']))}</p>"
-            f"<dl class='metric-pairs'><div><dt>Target</dt><dd>{float(strategy['target_log2_luminance']):.2f} log2</dd></div>"
-            f"<div><dt>Mean | Max</dt><dd>{float(strategy['correction_metrics']['mean_abs_offset']):.2f} | {float(strategy['correction_metrics']['max_abs_offset']):.2f} stops</dd></div>"
+            f"<dl class='metric-pairs'><div><dt>Gray Target</dt><dd>{float(strategy['target_log2_luminance']):.2f} derived brightness</dd></div>"
+            f"<div><dt>Mean | Max Correction</dt><dd>{float(strategy['correction_metrics']['mean_abs_offset']):.2f} | {float(strategy['correction_metrics']['max_abs_offset']):.2f}</dd></div>"
+            f"<div><dt>Confidence</dt><dd>{float(strategy['correction_metrics'].get('mean_confidence', 0.0)):.2f}</dd></div>"
             f"<div><dt>Neutral Residual</dt><dd>{float(strategy['correction_metrics'].get('mean_color_residual', 0.0)):.4f}</dd></div>"
             f"<div><dt>WB Model</dt><dd>{html.escape(str((strategy.get('white_balance_model') or {}).get('model_label') or 'n/a'))}</dd></div>"
             f"<div><dt>Shared Kelvin</dt><dd>{html.escape(str((strategy.get('white_balance_model') or {}).get('shared_kelvin') or 'per-camera'))}</dd></div>"
             f"<div><dt>Reference</dt><dd>{html.escape(str(strategy.get('reference_clip_id') or 'Derived'))}</dd></div>"
             "</dl>"
+            f"<p class='subtle' style='margin-top: 10px;'><strong>Role:</strong> {html.escape(strategy_role)}</p>"
+            f"<p class='subtle' style='margin-top: 10px;'><strong>Anchor guard:</strong> {html.escape(str(selection_diagnostics.get('anchor_reason') or 'Derived target.'))}</p>"
             "</article>"
         )
+    def severity_key(row: Dict[str, object]) -> tuple[int, float, float]:
+        trust_order = {"EXCLUDED": 0, "UNTRUSTED": 1, "USE_WITH_CAUTION": 2, "TRUSTED": 3}
+        return (
+            trust_order.get(str(row.get("trust_class") or ""), 4),
+            float(row.get("trust_score", 0.0) or 0.0),
+            -abs(float(row.get("final_offset_stops", 0.0) or 0.0)),
+        )
+
     table_rows = []
-    for row in payload["per_camera_analysis"]:
+    for row in sorted(payload["per_camera_analysis"], key=severity_key):
         outlier_badge = "<span class='outlier-pill'>Outlier</span>" if row.get("is_outlier") else ""
         hero_badge = "<span class='hero-pill'>Hero</span>" if row.get("is_hero_camera") else ""
+        status_label = str(row.get("trust_class") or "TRUSTED").replace("_", " ")
+        status_class = "outlier-pill" if status_label == "EXCLUDED" else "warning-pill" if status_label in {"UNTRUSTED", "USE WITH CAUTION"} else "good-pill"
+        reason_label = str(row.get("trust_reason") or "Stable gray sample")
         table_rows.append(
             "<tr>"
-            f"<td><div class='camera-cell'><strong>{html.escape(str(row['camera_label']))}</strong><span>{html.escape(str(row['clip_id']))}</span></div></td>"
+            f"<td><div class='camera-cell'><span class='{status_class}'>{html.escape(status_label)}</span><strong>{html.escape(str(row['camera_label']))}</strong><span>{html.escape(str(row['clip_id']))}</span><span>{html.escape(reason_label)}</span></div></td>"
             f"<td>{float(row['measured_log2_luminance']):.2f}</td>"
             f"<td>{float(row['raw_offset_stops']):.2f}</td>"
             f"<td>{float(row['final_offset_stops']):.2f}</td>"
             f"<td>{int(row['commit_values'].get('kelvin', 5600))} / {float(row['commit_values'].get('tint', 0.0)):.1f}</td>"
             f"<td>{float(row['pre_color_residual']):.4f}</td>"
             f"<td>{float(row['confidence']):.2f}<div class='subtle'>dL {float(row['neutral_sample_log2_spread']):.3f} | dC {float(row['neutral_sample_chromaticity_spread']):.4f}</div></td>"
-            f"<td>{outlier_badge}{hero_badge}</td>"
-            f"<td>{html.escape(str(row['note']))}</td>"
+            f"<td>{html.escape(str(row.get('reference_use') or 'Included'))}<div class='subtle'>{html.escape(str(row.get('correction_confidence') or ''))} correction confidence</div></td>"
+            f"<td>{outlier_badge}{hero_badge}<div class='subtle'>{html.escape(str(row['note']))}</div></td>"
             "</tr>"
         )
     color_preview_line = (
@@ -1012,6 +2132,14 @@ def _render_lightweight_analysis_html(payload: Dict[str, object]) -> str:
         if payload.get("color_preview_note")
         else f"Color preview: {html.escape(str(payload.get('color_preview_status') or 'unknown'))}"
     )
+    def chart_frame(title: str, svg: str) -> str:
+        return (
+            f"<div class='chart-launch' role='button' tabindex='0' data-chart-title='{html.escape(title)}'>"
+            f"<div class='chart-frame'>{svg}</div>"
+            "<span class='chart-hint'>Click to enlarge</span>"
+            "</div>"
+        )
+
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1020,13 +2148,22 @@ def _render_lightweight_analysis_html(payload: Dict[str, object]) -> str:
   <title>R3DMatch Lightweight Analysis</title>
   <style>
     body {{ margin: 0; background: #edf2f7; color: #0f172a; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
-    .page {{ max-width: 1180px; margin: 0 auto; padding: 28px; }}
+    .page {{ max-width: 1320px; margin: 0 auto; padding: 32px; }}
     .hero {{ background: linear-gradient(135deg, rgba(255,255,255,0.98) 0%, rgba(241,245,249,0.98) 100%); border: 1px solid #dbe4ef; border-radius: 24px; padding: 28px; box-shadow: 0 24px 60px rgba(15,23,42,0.08); }}
+    .decision-banner {{ margin-top: 22px; border-radius: 22px; padding: 24px; color: white; box-shadow: 0 18px 40px rgba(15,23,42,0.16); }}
+    .decision-banner.success {{ background: linear-gradient(135deg, #14532d 0%, #166534 100%); }}
+    .decision-banner.warning {{ background: linear-gradient(135deg, #92400e 0%, #b45309 100%); }}
+    .decision-banner.danger {{ background: linear-gradient(135deg, #7f1d1d 0%, #b91c1c 100%); }}
+    .decision-banner-kicker {{ font-size: 12px; font-weight: 800; letter-spacing: 0.12em; text-transform: uppercase; opacity: 0.88; }}
+    .decision-banner-title {{ margin: 8px 0 6px 0; font-size: 38px; line-height: 1.02; font-weight: 900; letter-spacing: -0.03em; }}
+    .decision-banner-copy {{ margin: 0; font-size: 17px; line-height: 1.7; color: rgba(255,255,255,0.92); max-width: 72ch; }}
+    .decision-metrics {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-top: 16px; }}
+    .decision-metrics > div {{ padding: 12px 14px; border-radius: 14px; background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.18); }}
     .hero-top {{ display: flex; align-items: flex-start; gap: 18px; }}
     .hero-top img {{ width: 150px; max-width: 30vw; object-fit: contain; }}
-    h1 {{ font-size: 32px; line-height: 1.1; margin: 0; }}
+    h1 {{ font-size: 38px; line-height: 1.08; margin: 0; }}
     .eyebrow {{ font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #475569; font-weight: 700; }}
-    .synopsis {{ margin-top: 18px; font-size: 17px; line-height: 1.7; color: #1e293b; max-width: 82ch; }}
+    .synopsis {{ margin-top: 18px; font-size: 19px; line-height: 1.8; color: #1e293b; max-width: 82ch; }}
     .meta-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-top: 20px; }}
     .meta-card, .section {{ background: rgba(255,255,255,0.96); border: 1px solid #d9e1ec; border-radius: 20px; box-shadow: 0 16px 36px rgba(15,23,42,0.05); }}
     .meta-card {{ padding: 14px 16px; }}
@@ -1034,9 +2171,9 @@ def _render_lightweight_analysis_html(payload: Dict[str, object]) -> str:
     .meta-card dd {{ margin: 8px 0 0 0; font-size: 16px; font-weight: 700; }}
     .grid {{ display: grid; gap: 18px; margin-top: 18px; }}
     .two-up {{ grid-template-columns: 1.3fr 1fr; }}
-    .section {{ padding: 22px; }}
-    .section h2 {{ margin: 0 0 10px 0; font-size: 22px; }}
-    .section p.lead {{ margin: 0 0 12px 0; color: #475569; line-height: 1.6; }}
+    .section {{ padding: 24px; }}
+    .section h2 {{ margin: 0 0 10px 0; font-size: 26px; }}
+    .section p.lead {{ margin: 0 0 12px 0; color: #475569; line-height: 1.75; font-size: 17px; }}
     .stats {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }}
     .stat {{ padding: 14px; border-radius: 16px; background: #f8fafc; border: 1px solid #e2e8f0; }}
     .stat .label {{ font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; font-weight: 700; }}
@@ -1044,22 +2181,36 @@ def _render_lightweight_analysis_html(payload: Dict[str, object]) -> str:
     .strategy-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }}
     .strategy-card {{ padding: 16px; border-radius: 18px; background: #f8fafc; border: 1px solid #dbe4ef; }}
     .strategy-card-top {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; }}
-    .strategy-card h3 {{ margin: 0; font-size: 18px; }}
-    .recommended-badge, .hero-pill, .outlier-pill {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 4px 8px; font-size: 11px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; }}
+    .strategy-card h3 {{ margin: 0; font-size: 20px; }}
+    .recommended-badge, .hero-pill, .outlier-pill, .warning-pill, .good-pill {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 4px 8px; font-size: 11px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; }}
     .recommended-badge {{ background: #dbeafe; color: #1d4ed8; }}
     .hero-pill {{ background: #dcfce7; color: #166534; margin-left: 6px; }}
     .outlier-pill {{ background: #fee2e2; color: #991b1b; margin-right: 6px; }}
+    .warning-pill {{ background: #fef3c7; color: #92400e; margin-right: 6px; }}
+    .good-pill {{ background: #dcfce7; color: #166534; margin-right: 6px; }}
     .metric-pairs {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }}
     .metric-pairs dt {{ font-size: 11px; text-transform: uppercase; color: #64748b; font-weight: 700; }}
-    .metric-pairs dd {{ margin: 6px 0 0 0; font-size: 14px; font-weight: 700; }}
-    .chart-frame {{ padding: 12px; border-radius: 18px; background: #f8fafc; border: 1px solid #dbe4ef; }}
+    .metric-pairs dd {{ margin: 6px 0 0 0; font-size: 15px; font-weight: 700; }}
+    .chart-frame {{ padding: 22px; border-radius: 18px; background: #f8fafc; border: 1px solid #dbe4ef; overflow: auto; }}
+    .chart-frame svg {{ display: block; width: 100%; height: auto; min-height: 560px; }}
+    .chart-launch {{ display: block; width: 100%; border: 0; padding: 0; background: transparent; text-align: left; cursor: zoom-in; }}
+    .chart-launch:hover .chart-frame {{ border-color: #94a3b8; box-shadow: 0 10px 20px rgba(15,23,42,0.08); }}
+    .chart-hint {{ display: inline-flex; margin-top: 10px; font-size: 13px; font-weight: 700; color: #475569; }}
+    .chart-modal[hidden] {{ display: none; }}
+    .chart-modal {{ position: fixed; inset: 0; background: rgba(15, 23, 42, 0.7); z-index: 999; display: flex; align-items: center; justify-content: center; padding: 16px; }}
+    .chart-modal-card {{ width: min(1440px, 98vw); max-height: 96vh; overflow: auto; background: white; border-radius: 20px; padding: 24px; box-shadow: 0 24px 60px rgba(15,23,42,0.28); }}
+    .chart-modal-top {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }}
+    .chart-modal-top h3 {{ margin: 0; font-size: 20px; }}
+    .chart-modal-close {{ border: 0; border-radius: 10px; background: #0f172a; color: white; padding: 8px 12px; cursor: pointer; }}
+    .chart-modal-body .chart-frame svg {{ min-height: 980px; }}
     table {{ width: 100%; border-collapse: collapse; margin-top: 14px; }}
-    th, td {{ padding: 12px 10px; border-bottom: 1px solid #e2e8f0; vertical-align: top; font-size: 14px; }}
+    th, td {{ padding: 14px 12px; border-bottom: 1px solid #e2e8f0; vertical-align: top; font-size: 15px; }}
     th {{ text-align: left; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b; }}
     .camera-cell {{ display: flex; flex-direction: column; gap: 4px; }}
     .camera-cell span {{ color: #64748b; font-size: 12px; }}
-    .recommendation {{ font-size: 17px; line-height: 1.7; }}
-    .subtle {{ color: #64748b; font-size: 13px; line-height: 1.6; }}
+    .recommendation {{ font-size: 20px; line-height: 1.8; }}
+    .subtle {{ color: #64748b; font-size: 14px; line-height: 1.7; }}
+    .bullet-list {{ margin: 0; padding-left: 20px; color: #334155; font-size: 15px; line-height: 1.8; }}
     @media (max-width: 920px) {{ .two-up {{ grid-template-columns: 1fr; }} .stats {{ grid-template-columns: repeat(2, minmax(0,1fr)); }} }}
   </style>
 </head>
@@ -1074,7 +2225,19 @@ def _render_lightweight_analysis_html(payload: Dict[str, object]) -> str:
           <p class="subtle">Run label: {html.escape(str(payload['run_label']))} | Review mode: {html.escape(str(payload['review_mode_label']))}</p>
         </div>
       </div>
-      <p class="synopsis">{html.escape(str(payload['executive_synopsis']))}</p>
+      <p class="synopsis">{html.escape(summary_sentence)}</p>
+      <div class="decision-banner {readiness_tone}">
+        <div class="decision-banner-kicker">Calibration Decision</div>
+        <div class="decision-banner-title">{html.escape(readiness_label)}</div>
+        <p class="decision-banner-copy">{html.escape(str(payload['operator_recommendation']))}</p>
+        <p class="decision-banner-copy" style="margin-top:8px;font-size:15px;font-weight:700;">{html.escape(banner_subline)}</p>
+        <div class="decision-metrics">
+          <div><div class="eyebrow">Strategy</div><div class="recommendation">{html.escape(str(payload['recommended_strategy']['strategy_label']))}</div></div>
+          <div><div class="eyebrow">Outliers</div><div class="recommendation">{int(exposure_summary['outlier_count'])}</div></div>
+          <div><div class="eyebrow">Trusted Cameras</div><div class="recommendation">{int(run_assessment.get('trusted_camera_count', 0) or 0)}</div></div>
+          <div><div class="eyebrow">Recommendation Strength</div><div class="recommendation">{html.escape(str(run_assessment.get('recommendation_strength') or 'MEDIUM_CONFIDENCE').replace('_', ' '))}</div></div>
+        </div>
+      </div>
       <dl class="meta-grid">
           <div class="meta-card"><dt>Created</dt><dd>{html.escape(str(payload['created_at']))}</dd></div>
           <div class="meta-card"><dt>Source Mode</dt><dd>{html.escape(str(payload['source_mode_label']))}</dd></div>
@@ -1083,6 +2246,7 @@ def _render_lightweight_analysis_html(payload: Dict[str, object]) -> str:
         <div class="meta-card"><dt>Strategies</dt><dd>{html.escape(str(payload['selected_strategy_labels']))}</dd></div>
         <div class="meta-card"><dt>Subset</dt><dd>{html.escape(str(payload['subset_label']))}</dd></div>
         <div class="meta-card"><dt>Recommendation</dt><dd>{html.escape(str(payload['recommended_strategy']['strategy_label']))}</dd></div>
+        <div class="meta-card"><dt>Run Status</dt><dd>{html.escape(str(run_assessment.get('status') or 'READY_WITH_WARNINGS').replace('_', ' '))}</dd></div>
         <div class="meta-card"><dt>WB Model</dt><dd>{html.escape(str((payload.get('white_balance_model') or {}).get('model_label') or 'n/a'))}</dd></div>
         <div class="meta-card"><dt>Shared Kelvin</dt><dd>{html.escape(str((payload.get('white_balance_model') or {}).get('shared_kelvin') or 'per-camera'))}</dd></div>
       </dl>
@@ -1098,45 +2262,133 @@ def _render_lightweight_analysis_html(payload: Dict[str, object]) -> str:
           <div class="stat"><div class="label">Min / Max</div><div class="value">{float(exposure_summary['minimum']):.2f} / {float(exposure_summary['maximum']):.2f}</div></div>
           <div class="stat"><div class="label">Outliers</div><div class="value">{int(exposure_summary['outlier_count'])}</div></div>
         </div>
-        <div class="chart-frame" style="margin-top:16px;">{payload['visuals']['exposure_plot_svg']}</div>
+        <div style="margin-top:16px;">{chart_frame('Exposure Spread', payload['visuals']['exposure_plot_svg'])}</div>
       </section>
       <section class="section">
         <h2>Recommendation</h2>
-        <p class="recommendation"><strong>{html.escape(str(payload['recommended_strategy']['strategy_label']))}</strong> is the preferred strategy for this run.</p>
-        <p class="lead">{html.escape(str(payload['recommended_strategy']['reason']))}</p>
-        <div class="chart-frame">{payload['visuals']['strategy_chart_svg']}</div>
+        <p class="eyebrow">At A Glance</p>
+        <p class="recommendation"><strong>{html.escape(summary_sentence)}</strong></p>
+        <p class="eyebrow">Why This Was Chosen</p>
+        <ul class="bullet-list">
+          {''.join(f"<li>{html.escape(point)}</li>" for point in summary_points)}
+        </ul>
+        <div>{chart_frame('Strategy Comparison', payload['visuals']['strategy_chart_svg'])}</div>
         <p class="subtle" style="margin-top:12px;"><strong>Hero recommendation:</strong> {html.escape(str(hero_summary['candidate_clip_id'] or 'No clear hero'))}. {html.escape(str(hero_summary['reason']))}</p>
-        <p class="subtle"><strong>Next step:</strong> {html.escape(str(payload['operator_recommendation']))}</p>
+      </section>
+    </div>
+
+    <div class="grid two-up">
+      <section class="section">
+        <h2>Should I Trust This Run?</h2>
+        <p class="lead">{html.escape(str(run_assessment.get('operator_note') or 'Review the trusted camera group before any later push.'))}</p>
+        <ul class="bullet-list">
+          <li>{html.escape(str(run_assessment.get('anchor_summary') or 'No anchor summary available.'))}</li>
+          <li>{html.escape(f"Trusted cameras: {int(run_assessment.get('trusted_camera_count', 0) or 0)} / {int(run_assessment.get('camera_count', 0) or 0)}")}</li>
+          <li>{html.escape(f"Excluded cameras: {int(run_assessment.get('excluded_camera_count', 0) or 0)}")}</li>
+          <li>{html.escape('Safe to push later: yes' if bool(run_assessment.get('safe_to_push_later')) else 'Safe to push later: no')}</li>
+          {''.join(f"<li>{html.escape(str(reason))}</li>" for reason in list(run_assessment.get('gating_reasons') or []))}
+        </ul>
+      </section>
+      <section class="section">
+        <h2>Trust & Eligibility</h2>
+        <p class="lead">Trust classes summarize confidence, stability, cluster membership, and correction size using the current measured signals.</p>
+        <div>{chart_frame('Camera Trust', payload['visuals']['trust_chart_svg'])}</div>
+      </section>
+    </div>
+
+    <div class="grid two-up">
+      <section class="section">
+        <h2>Before / After Exposure</h2>
+        <p class="lead">Each line shows where a camera measured before correction and where the chosen strategy aims to land it.</p>
+        <div>{chart_frame('Before / After Exposure', payload['visuals']['before_after_exposure_svg'])}</div>
+      </section>
+      <section class="section">
+        <h2>Confidence / Reliability</h2>
+        <p class="lead">Higher bars indicate cameras with steadier neutral samples and more trustworthy measurements.</p>
+        <div>{chart_frame('Confidence / Reliability', payload['visuals']['confidence_chart_svg'])}</div>
       </section>
     </div>
 
     <section class="section" style="margin-top:18px;">
+      <h2>Sample Stability Ranking</h2>
+      <p class="lead">Lower spread means a steadier gray reading. Cameras to the right of the threshold need more caution.</p>
+      <div>{chart_frame('Sample Stability Ranking', payload['visuals']['stability_chart_svg'])}</div>
+    </section>
+
+    <section class="section" style="margin-top:18px;">
       <h2>Strategy Comparison</h2>
-      <p class="lead">Strategies are ranked by how much correction they ask the operator to apply across the set.</p>
+      <p class="lead">Strategies are ranked by correction size, anchor trustworthiness, and how safely they keep the array together.</p>
       <div class="strategy-grid">{''.join(strategy_cards)}</div>
     </section>
 
     <section class="section" style="margin-top:18px;">
       <h2>Per-Camera Analysis</h2>
-      <p class="lead">Rows are anchored to the recommended strategy so the operator can see practical offsets at a glance.</p>
+      <p class="lead">Rows are sorted by severity so the riskiest cameras appear first.</p>
       <table>
         <thead>
           <tr>
-            <th>Camera / Clip</th>
+            <th>Status / Camera / Clip</th>
             <th>Measured</th>
             <th>Raw Offset</th>
             <th>Recommended Offset</th>
             <th>Commit (K / Tint)</th>
             <th>Neutral Residual</th>
             <th>Confidence / Spread</th>
-            <th>Flags</th>
-            <th>Note</th>
+            <th>Reference Use</th>
+            <th>Summary</th>
           </tr>
         </thead>
         <tbody>{''.join(table_rows)}</tbody>
       </table>
     </section>
   </div>
+  <div id="chart-modal" class="chart-modal" hidden>
+    <div class="chart-modal-card">
+      <div class="chart-modal-top">
+        <h3 id="chart-modal-title">Chart</h3>
+        <button type="button" class="chart-modal-close" id="chart-modal-close">Close</button>
+      </div>
+      <div class="chart-modal-body" id="chart-modal-body"></div>
+    </div>
+  </div>
+  <script>
+    (function() {{
+      const modal = document.getElementById('chart-modal');
+      const body = document.getElementById('chart-modal-body');
+      const title = document.getElementById('chart-modal-title');
+      const close = document.getElementById('chart-modal-close');
+      if (!modal || !body || !title || !close) return;
+      document.addEventListener('click', (event) => {{
+        const trigger = event.target.closest('.chart-launch');
+        if (trigger) {{
+          const frame = trigger.querySelector('.chart-frame');
+          title.textContent = trigger.dataset.chartTitle || 'Chart';
+          body.innerHTML = frame ? frame.outerHTML : '';
+          modal.hidden = false;
+          return;
+        }}
+        if (event.target === modal || event.target === close) {{
+          modal.hidden = true;
+          body.innerHTML = '';
+        }}
+      }});
+      document.addEventListener('keydown', (event) => {{
+        const trigger = event.target.closest ? event.target.closest('.chart-launch') : null;
+        if (trigger && (event.key === 'Enter' || event.key === ' ')) {{
+          event.preventDefault();
+          const frame = trigger.querySelector('.chart-frame');
+          title.textContent = trigger.dataset.chartTitle || 'Chart';
+          body.innerHTML = frame ? frame.outerHTML : '';
+          modal.hidden = false;
+          return;
+        }}
+        if (event.key === 'Escape') {{
+          modal.hidden = true;
+          body.innerHTML = '';
+        }}
+      }});
+    }})();
+  </script>
 </body>
 </html>"""
 
@@ -1175,6 +2427,8 @@ def build_lightweight_analysis_report(
     resolved_run_label = run_label or root.name or "review"
     monitoring_measurements_by_clip: Dict[str, Dict[str, object]] = {}
     measurement_preview_rendered = 0
+    array_calibration_payload = _load_array_calibration_payload(str(root))
+    quality_by_clip = _quality_by_clip(array_calibration_payload)
     if resolved_matching_domain == "perceptual":
         measurement_preview_settings = _measurement_preview_settings_for_domain(resolved_matching_domain)
         redline_executable = _resolve_redline_executable()
@@ -1205,15 +2459,9 @@ def build_lightweight_analysis_report(
         target_type=target_type,
         monitoring_measurements_by_clip=monitoring_measurements_by_clip,
         matching_domain=resolved_matching_domain,
+        quality_by_clip=quality_by_clip,
+        anchor_target_log2=_anchor_target_log2_from_array_payload(array_calibration_payload),
     )
-    array_calibration_payload = _load_array_calibration_payload(str(root))
-    quality_by_clip: Dict[str, Dict[str, object]] = {}
-    if array_calibration_payload:
-        for camera in array_calibration_payload.get("cameras", []):
-            clip_id = str(camera.get("clip_id") or "").strip()
-            if not clip_id:
-                continue
-            quality_by_clip[clip_id] = dict(camera.get("quality", {}) or {})
     if quality_by_clip:
         for payload in strategy_payloads:
             for clip in payload.get("clips", []):
@@ -1248,12 +2496,31 @@ def build_lightweight_analysis_report(
     exposure_summary = _exposure_summary(recommended_payload["clips"])
     hero_summary = _hero_candidate_summary(strategy_payloads)
     outlier_threshold = float(exposure_summary.get("outlier_threshold", 0.35))
+    optimal_payload_for_rows = next((item for item in strategy_payloads if str(item.get("strategy_key") or "") == "optimal_exposure"), None)
+    optimal_diag_for_rows = dict((optimal_payload_for_rows or {}).get("selection_diagnostics") or {})
+    primary_cluster_indices = {int(index) for index in ((optimal_diag_for_rows.get("primary_cluster") or {}).get("indices") or [])}
+    screened_candidates_by_clip = {
+        str(item.get("clip_id") or ""): dict(item)
+        for item in list(optimal_diag_for_rows.get("screened_candidates") or [])
+        if str(item.get("clip_id") or "").strip()
+    }
     per_camera_rows = []
-    for record in analysis_records:
+    for index, record in enumerate(analysis_records):
         clip_id = str(record["clip_id"])
         strategy_clip = next(item for item in recommended_payload["clips"] if item["clip_id"] == clip_id)
         measured_log2 = float(strategy_clip["measured_log2_luminance"])
         is_outlier = abs(measured_log2 - float(exposure_summary["median"])) > outlier_threshold
+        trust_details = _camera_trust_details(
+            clip_id=clip_id,
+            confidence=float(strategy_clip.get("confidence", 0.0) or 0.0),
+            sample_log2_spread=float(strategy_clip.get("neutral_sample_log2_spread", 0.0) or 0.0),
+            sample_chroma_spread=float(strategy_clip.get("neutral_sample_chromaticity_spread", 0.0) or 0.0),
+            measured_log2=measured_log2,
+            final_offset=float(strategy_clip["exposure_offset_stops"]),
+            exposure_summary=exposure_summary,
+            in_primary_cluster=(not primary_cluster_indices or index in primary_cluster_indices),
+            screened_reasons=[str(item) for item in (screened_candidates_by_clip.get(clip_id, {}) or {}).get("reasons", []) if str(item).strip()],
+        )
         note_bits: List[str] = []
         if is_outlier:
             note_bits.append("Exposure outlier against the central cluster.")
@@ -1283,6 +2550,17 @@ def build_lightweight_analysis_report(
                 "neutral_sample_chromaticity_spread": float(strategy_clip.get("neutral_sample_chromaticity_spread", 0.0) or 0.0),
                 "is_outlier": is_outlier,
                 "is_hero_camera": bool(strategy_clip.get("is_hero_camera")),
+                "trust_class": str(trust_details["trust_class"]),
+                "trust_score": float(trust_details["trust_score"]),
+                "trust_reason": str(trust_details["trust_reason"]),
+                "stability_label": str(trust_details["stability_label"]),
+                "correction_confidence": str(trust_details["correction_confidence"]),
+                "reference_use": str(trust_details["reference_use"]),
+                "screening_reasons": list(trust_details.get("screened_reasons") or []),
+                "operator_summary": (
+                    f"{str(trust_details['trust_class']).replace('_', ' ')} / {str(trust_details['reference_use'])} / "
+                    f"{str(trust_details['trust_reason'])}. Exposure correction {float(strategy_clip['exposure_offset_stops']):+.2f}."
+                ),
                 "note": " ".join(note_bits),
             }
         )
@@ -1297,11 +2575,18 @@ def build_lightweight_analysis_report(
                 "hero_clip_id": payload.get("hero_clip_id"),
                 "target_log2_luminance": float(payload["target_log2_luminance"]),
                 "summary": payload.get("strategy_summary"),
+                "selection_diagnostics": dict(payload.get("selection_diagnostics") or {}),
                 "white_balance_model": payload.get("white_balance_model"),
                 "correction_metrics": metrics,
                 "recommended": payload["strategy_key"] == recommended_strategy["strategy_key"],
             }
         )
+    run_assessment = _build_run_assessment(
+        per_camera_rows=per_camera_rows,
+        recommended_payload=recommended_payload,
+        strategy_summaries=strategy_summaries,
+        exposure_summary=exposure_summary,
+    )
     subset_bits = []
     if selected_clip_groups:
         subset_bits.append(f"groups {', '.join(str(item) for item in selected_clip_groups)}")
@@ -1314,12 +2599,7 @@ def build_lightweight_analysis_report(
         recommended_strategy=recommended_strategy,
         hero_summary=hero_summary,
     )
-    operator_recommendation = (
-        "Proceed with the recommended strategy and export approval if the customer only needs exposure consistency confirmation. "
-        "Generate the full contact-sheet mode only when visual per-camera still comparison is needed."
-        if float(exposure_summary["outlier_count"]) <= 1
-        else "Inspect the identified outliers before approval. A full contact-sheet review is warranted for visual confirmation."
-    )
+    operator_recommendation = str(run_assessment.get("operator_note") or "")
     payload = {
         "report_kind": "lightweight_analysis",
         "review_mode": "lightweight_analysis",
@@ -1351,6 +2631,7 @@ def build_lightweight_analysis_report(
         "strategy_comparison": strategy_summaries,
         "white_balance_model": dict(recommended_payload.get("white_balance_model", {})),
         "recommended_strategy": recommended_strategy,
+        "run_assessment": run_assessment,
         "hero_recommendation": hero_summary,
         "operator_recommendation": operator_recommendation,
         "per_camera_analysis": per_camera_rows,
@@ -1358,10 +2639,29 @@ def build_lightweight_analysis_report(
         "shared_originals": [],
         "strategies": [],
         "visuals": {
-            "exposure_plot_svg": _build_exposure_plot_svg(recommended_payload["clips"]),
+            "exposure_plot_svg": _build_exposure_plot_svg(
+                recommended_payload["clips"],
+                target_log2=float(recommended_payload["target_log2_luminance"]),
+                reference_clip_id=str(recommended_payload.get("reference_clip_id") or ""),
+                outlier_threshold=float(exposure_summary.get("outlier_threshold", 0.35) or 0.35),
+            ),
+            "before_after_exposure_svg": _build_before_after_exposure_svg(
+                recommended_payload["clips"],
+                target_log2=float(recommended_payload["target_log2_luminance"]),
+            ),
+            "confidence_chart_svg": _build_confidence_chart_svg(recommended_payload["clips"]),
             "strategy_chart_svg": _build_strategy_chart_svg(strategy_summaries),
+            "trust_chart_svg": _build_trust_chart_svg(per_camera_rows),
+            "stability_chart_svg": _build_stability_chart_svg(per_camera_rows),
         },
     }
+    payload["debug_exposure_trace"] = _build_exposure_trace_artifacts(
+        analysis_records=analysis_records,
+        recommended_payload=recommended_payload,
+        strategy_summaries=strategy_summaries,
+        exposure_summary=exposure_summary,
+        out_root=out_root,
+    )
     report_json_path = out_root / "contact_sheet.json"
     report_html_path = out_root / "contact_sheet.html"
     review_manifest_path = out_root / "review_manifest.json"
@@ -2047,11 +3347,11 @@ def generate_preview_stills(
                 diff_metrics = _compute_image_difference_metrics(original_path, preview_path)
                 mean_diff = diff_metrics["mean_absolute_difference"]
                 correction_payload_identity = bool(
-                    abs(float(variant_settings["exposure"])) <= 1e-9
+                    abs(float(variant_settings["exposure"])) <= 1e-6
                     and _is_identity_rgb_gains(variant_settings["gains"])
                     and _is_identity_cdl_payload(color_cdl)
                 )
-                requires_change = abs(float(variant_settings["exposure"])) > 1e-9 or (
+                requires_change = abs(float(variant_settings["exposure"])) > 1e-6 or (
                     variant_settings["gains"] is not None
                     and any(abs(float(value) - 1.0) > 1e-6 for value in variant_settings["gains"])
                 )
@@ -2061,6 +3361,11 @@ def generate_preview_stills(
                     print(
                         f"[r3dmatch] ERROR: {error_message} clip={clip_id} strategy={strategy_key} "
                         f"variant={variant} command={shlex.join(corrected_render['command']) if corrected_render else 'preview-copy'}"
+                    )
+                    raise RuntimeError(
+                        f"Corrected preview render did not visibly change pixels for {clip_id} "
+                        f"({strategy_key}/{variant}) even though non-identity corrections were requested. "
+                        f"Command: {shlex.join(corrected_render['command']) if corrected_render else 'preview-copy'}"
                     )
                 if color_preview_disabled:
                     error_message = None
@@ -2215,6 +3520,8 @@ def build_contact_sheet_report(
     color = load_color_calibration(color_calibration_path) if color_calibration_path else None
     exposure_by_group = {entry.group_key: entry for entry in exposure.cameras} if exposure else {}
     color_by_group = {entry.group_key: entry for entry in color.cameras} if color else {}
+    array_calibration_payload = _load_array_calibration_payload(str(root))
+    quality_by_clip = _quality_by_clip(array_calibration_payload)
     monitoring_measurements_by_clip = {}
     if resolved_matching_domain == "perceptual":
         measurement_preview_paths = generate_preview_stills(
@@ -2243,6 +3550,8 @@ def build_contact_sheet_report(
         target_type=target_type,
         monitoring_measurements_by_clip=monitoring_measurements_by_clip,
         matching_domain=resolved_matching_domain,
+        quality_by_clip=quality_by_clip,
+        anchor_target_log2=_anchor_target_log2_from_array_payload(array_calibration_payload),
     )
     preview_paths = generate_preview_stills(
         input_path,
@@ -2255,6 +3564,16 @@ def build_contact_sheet_report(
         strategy_rmd_root=str(root / "review_rmd" / "strategies"),
         render_originals=True,
     )
+    preview_manifest_payload = json.loads((root / "previews" / "preview_commands.json").read_text(encoding="utf-8"))
+    preview_command_lookup = {
+        (
+            str(item.get("clip_id") or ""),
+            str(item.get("strategy") or ""),
+            str(item.get("variant") or ""),
+        ): item
+        for item in list(preview_manifest_payload.get("commands") or [])
+        if isinstance(item, dict)
+    }
 
     shared_originals = []
     for record in analysis_records:
@@ -2306,6 +3625,9 @@ def build_contact_sheet_report(
                         "color": preview_paths.get(clip_id, {}).get("strategies", {}).get(strategy_payload["strategy_key"], {}).get("color"),
                         "both": preview_paths.get(clip_id, {}).get("strategies", {}).get(strategy_payload["strategy_key"], {}).get("both"),
                     },
+                    "render_validation": dict(
+                        preview_command_lookup.get((clip_id, str(strategy_payload["strategy_key"]), "both")) or {}
+                    ),
                     "calibration_roi": strategy_clip["calibration_roi"],
                     "is_hero_camera": strategy_clip["is_hero_camera"],
                     "metrics": {
@@ -2369,6 +3691,21 @@ def build_contact_sheet_report(
                 "clips": strategy_clips,
             }
         )
+    corrected_validation_rows = [
+        item
+        for item in list(preview_manifest_payload.get("commands") or [])
+        if isinstance(item, dict) and str(item.get("mode") or "") == "corrected" and str(item.get("variant") or "") == "both"
+    ]
+    payload_render_truth = {
+        "corrected_render_count": len(corrected_validation_rows),
+        "changed_render_count": sum(1 for item in corrected_validation_rows if bool(item.get("pixel_output_changed"))),
+        "unchanged_non_identity_count": sum(
+            1
+            for item in corrected_validation_rows
+            if not bool(item.get("pixel_output_changed")) and not bool(item.get("correction_payload_identity"))
+        ),
+        "color_preview_policy": preview_manifest_payload.get("color_preview_policy"),
+    }
 
     payload = {
         "report_kind": "full_contact_sheet",
@@ -2414,6 +3751,7 @@ def build_contact_sheet_report(
         "strategies": strategies,
         "clips": strategies[0]["clips"] if strategies else [],
         "strategy_review_rmd_root": str((root / "review_rmd" / "strategies").resolve()),
+        "render_truth_summary": payload_render_truth,
     }
     strategy_summaries = [
         {
@@ -2435,6 +3773,17 @@ def build_contact_sheet_report(
         "exposure_plot_svg": _build_exposure_plot_svg(strategies[0]["clips"] if strategies else []),
         "strategy_chart_svg": _build_strategy_chart_svg(strategy_summaries),
     }
+    if strategy_payloads:
+        recommended_payload = next(
+            item for item in strategy_payloads if str(item.get("strategy_key") or "") == str((payload["recommended_strategy"] or {}).get("strategy_key") or "")
+        )
+        payload["debug_exposure_trace"] = _build_exposure_trace_artifacts(
+            analysis_records=analysis_records,
+            recommended_payload=recommended_payload,
+            strategy_summaries=strategy_summaries,
+            exposure_summary=payload["exposure_summary"],
+            out_root=out_root,
+        )
     payload["executive_synopsis"] = _build_lightweight_synopsis(
         exposure_summary=payload["exposure_summary"],
         strategy_summaries=strategy_summaries,
@@ -2689,11 +4038,11 @@ def render_contact_sheet_pdf(
         except OSError:
             return ImageFont.load_default()
 
-    title_font = load_font(30, bold=True)
-    section_font = load_font(20, bold=True)
-    clip_font = load_font(15, bold=True)
-    body_font = load_font(13, bold=False)
-    caption_font = load_font(12, bold=False)
+    title_font = load_font(38, bold=True)
+    section_font = load_font(24, bold=True)
+    clip_font = load_font(18, bold=True)
+    body_font = load_font(15, bold=False)
+    caption_font = load_font(13, bold=False)
     pages = []
     page_width = 1700
     page_height = 2200
@@ -2703,8 +4052,8 @@ def render_contact_sheet_pdf(
     logo_max_height = 84
     tile_gap_x = 20
     tile_gap_y = 36
-    metadata_line_height = 18
-    section_gap = 30
+    metadata_line_height = 22
+    section_gap = 38
 
     logo_image = None
     if LOGO_PATH.exists():
@@ -2775,7 +4124,7 @@ def render_contact_sheet_pdf(
         tile_width = int((page_width - (2 * margin_x) - (tile_gap_x * (columns - 1))) / max(columns, 1))
         tile_width = max(180, tile_width)
         image_height = max(120, int(tile_width * 0.62))
-        metadata_block_height = 88
+        metadata_block_height = 128
         tile_block_height = image_height + metadata_block_height
         tiles_per_page = _report_tiles_per_page(columns)
         paged_tiles = _chunk_tiles(tiles, tiles_per_page)
@@ -2813,9 +4162,14 @@ def render_contact_sheet_pdf(
                     draw.text((tile_x + 12, tile_y + 12), "No preview", fill="#666666", font=body_font)
                 meta_y = tile_y + image_height + 8
                 draw.text((tile_x, meta_y), str(tile.get("clip_id", "")), fill="black", font=clip_font)
-                draw.text((tile_x, meta_y + metadata_line_height), f"Exposure: {tile.get('exposure_offset_stops', 'n/a')}", fill="black", font=body_font)
-                draw.text((tile_x, meta_y + metadata_line_height * 2), f"CDL gain/sat: {tile.get('rgb_gains_text', 'n/a')}", fill="black", font=body_font)
-                draw.text((tile_x, meta_y + metadata_line_height * 3), f"Confidence: {tile.get('confidence', 'n/a')} | log2: {tile.get('raw_log2', 'n/a')}", fill="black", font=caption_font)
+                correction_text = str(tile.get("correction_text", "Exposure: n/a"))
+                correction_fill = {"lift": "#15803d", "lower": "#b91c1c", "neutral": "#475569"}.get(str(tile.get("correction_tone") or ""), "#475569")
+                draw.text((tile_x, meta_y + metadata_line_height), correction_text, fill=correction_fill, font=body_font)
+                draw.text((tile_x, meta_y + metadata_line_height * 2), f"Commit: {tile.get('rgb_gains_text', 'n/a')}", fill="black", font=body_font)
+                draw.text((tile_x, meta_y + metadata_line_height * 3), f"Confidence: {tile.get('confidence', 'n/a')} | log2: {tile.get('raw_log2', 'n/a')}", fill="#475569", font=caption_font)
+                render_note = str(tile.get("render_truth_note") or "")
+                if render_note:
+                    draw.text((tile_x, meta_y + metadata_line_height * 4), render_note, fill="#1e293b", font=caption_font)
             y += needed_height + section_gap
             if page_index < len(paged_tiles) - 1:
                 pages.append(page)
@@ -2832,6 +4186,8 @@ def render_contact_sheet_pdf(
             "rgb_gains_text": "original",
             "confidence": clip.get("confidence"),
             "raw_log2": clip.get("measured_log2_luminance_raw"),
+            "correction_text": "Exposure: original",
+            "correction_tone": "neutral",
         }
         for clip in payload.get("shared_originals", [])
     ]
@@ -2846,14 +4202,24 @@ def render_contact_sheet_pdf(
         tiles = []
         for clip in strategy.get("clips", []):
             gains_text = _format_cdl_gain_saturation(clip["metrics"]["color"])
+            exposure_present = _exposure_correction_presentation(float(clip["metrics"]["exposure"]["final_offset_stops"]))
+            render_validation = dict(clip.get("render_validation") or {})
+            render_note = (
+                f"Render proof: changed pixels ({float(render_validation.get('pixel_diff_from_baseline', 0.0) or 0.0):.2f} mean delta)"
+                if render_validation.get("pixel_output_changed")
+                else "Render proof: no visible change expected"
+            )
             tiles.append(
                 {
                     "clip_id": f"{clip['clip_id']} [HERO]" if clip.get("is_hero_camera") else clip["clip_id"],
                     "image_path": clip.get("both_corrected"),
                     "exposure_offset_stops": clip["metrics"]["exposure"]["final_offset_stops"],
-                    "rgb_gains_text": gains_text,
+                    "rgb_gains_text": f"K {int((clip['metrics'].get('commit_values') or {}).get('kelvin', 5600) or 5600)} | Tint {float((clip['metrics'].get('commit_values') or {}).get('tint', 0.0) or 0.0):.1f}",
                     "confidence": clip["metrics"]["confidence"],
                     "raw_log2": clip["metrics"]["exposure"]["measured_log2_luminance_raw"],
+                    "correction_text": exposure_present["label"],
+                    "correction_tone": exposure_present["tone"],
+                    "render_truth_note": render_note,
                 }
             )
         section_meta = [
@@ -2895,6 +4261,27 @@ def build_ui_calibration_table(input_path: str, *, out_dir: str) -> Dict[str, ob
     path = out_root / "ui_calibration_table.json"
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return {"table_json": str(path), "row_count": len(rows)}
+
+
+def _exposure_correction_presentation(offset_stops: float) -> Dict[str, str]:
+    offset = float(offset_stops or 0.0)
+    if offset >= 0.05:
+        return {
+            "label": f"Exposure Correction: +{offset:.2f}",
+            "tone": "lift",
+            "short_reason": "Lifted",
+        }
+    if offset <= -0.05:
+        return {
+            "label": f"Exposure Correction: {offset:.2f}",
+            "tone": "lower",
+            "short_reason": "Lowered",
+        }
+    return {
+        "label": f"Exposure Correction: {offset:.2f}",
+        "tone": "neutral",
+        "short_reason": "Near neutral",
+    }
 
 
 def render_contact_sheet_html(payload: Dict[str, object]) -> str:
@@ -2942,6 +4329,7 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
             f"<td>{html.escape(flags or 'Normal')}</td>"
             "</tr>"
         )
+    render_truth_summary = dict(payload.get("render_truth_summary") or {})
     total_originals = len(payload.get("shared_originals", []))
     original_columns = _report_grid_columns(total_originals)
     original_cards = []
@@ -2969,6 +4357,8 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
         for clip in strategy["clips"]:
             metrics = clip["metrics"]
             image_path = clip.get("both_corrected")
+            render_validation = dict(clip.get("render_validation") or {})
+            exposure_present = _exposure_correction_presentation(float((metrics.get("exposure") or {}).get("final_offset_stops", 0.0) or 0.0))
             hero_badge_html = "<div class='hero-badge'>Hero Camera</div>" if clip.get("is_hero_camera") else ""
             preview_note_html = (
                 f"<div class='clip-meta subtle'>Preview note: {html.escape(str(metrics.get('color_preview_note')))}</div>"
@@ -2985,9 +4375,15 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
                 f"{hero_badge_html}"
                 f"<div class='thumb-single'>{thumbs_html}</div>"
                 f"<div class='clip-label'>{clip['clip_id']}</div>"
-                f"<div class='clip-meta'>Commit: exp {float(commit_values.get('exposureAdjust', 0.0) or 0.0):.3f} | K {int(commit_values.get('kelvin', 5600) or 5600)} | tint {float(commit_values.get('tint', 0.0) or 0.0):.1f}</div>"
+                f"<div class='correction-cue {html.escape(exposure_present['tone'])}'>{html.escape(exposure_present['short_reason'])}</div>"
+                f"<div class='clip-meta'><strong>{html.escape(exposure_present['label'])}</strong></div>"
+                f"<div class='clip-meta'>Commit: K {int(commit_values.get('kelvin', 5600) or 5600)} | Tint {float(commit_values.get('tint', 0.0) or 0.0):.1f}</div>"
                 f"<div class='clip-meta'>Confidence: {float(metrics.get('confidence', 0.0) or 0.0):.2f} | sample spread {float(metrics['exposure'].get('neutral_sample_log2_spread', 0.0) or 0.0):.3f}</div>"
-                f"<div class='clip-meta subtle'>CDL gain/sat: {html.escape(_format_cdl_gain_saturation(metrics['color']))}</div>"
+                f"<div class='clip-meta advanced subtle'>CDL gain/sat: {html.escape(_format_cdl_gain_saturation(metrics['color']))}</div>"
+                f"<div class='render-proof'><strong>Render proof:</strong> "
+                f"{'Corrected preview changed pixels relative to the original.' if render_validation.get('pixel_output_changed') else 'No visible pixel change was expected.'} "
+                f"Mean delta: {float(render_validation.get('pixel_diff_from_baseline', 0.0) or 0.0):.2f}. "
+                f"Asset: {html.escape(Path(str(image_path)).name if image_path else 'n/a')}</div>"
                 f"{preview_note_html}"
                 "</article>"
             )
@@ -3009,25 +4405,25 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
   <title>R3DMatch Review Contact Sheet</title>
   <style>
     body {{ margin: 0; background: #eef2f7; color: #111827; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
-    .page {{ max-width: 1440px; margin: 0 auto; padding: 28px; }}
+    .page {{ max-width: 1560px; margin: 0 auto; padding: 34px; }}
     .shell {{ display: grid; gap: 20px; }}
     .hero, .panel, .report-section {{ background: rgba(255,255,255,0.98); border: 1px solid #d8dee8; border-radius: 24px; box-shadow: 0 18px 44px rgba(15,23,42,0.06); }}
-    .hero {{ padding: 28px; }}
+    .hero {{ padding: 34px; }}
     .hero-top {{ display: flex; align-items: flex-start; gap: 20px; }}
     .brand-logo {{ width: 150px; height: auto; object-fit: contain; }}
     .brand-logo-text {{ font-size:30px; font-weight: 800; }}
     .eyebrow {{ font-size: 12px; font-weight: 800; letter-spacing: 0.12em; text-transform: uppercase; color: #64748b; }}
     h1 {{ margin: 6px 0 10px 0; font-size: 38px; line-height: 1.05; }}
-    .hero-subtitle {{ margin: 0; font-size: 18px; color: #334155; }}
-    .synopsis {{ margin-top: 18px; font-size: 18px; line-height: 1.8; color: #1e293b; max-width: 86ch; }}
+    .hero-subtitle {{ margin: 0; font-size: 20px; color: #334155; }}
+    .synopsis {{ margin-top: 20px; font-size: 22px; line-height: 1.7; color: #1e293b; max-width: 74ch; font-weight: 700; }}
     .meta-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 22px; }}
     .meta-card {{ background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 18px; padding: 16px; }}
     .meta-card dt {{ font-size: 11px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b; }}
     .meta-card dd {{ margin: 8px 0 0 0; font-size: 17px; font-weight: 800; }}
     .two-up {{ display: grid; grid-template-columns: 1.25fr 1fr; gap: 20px; }}
     .panel {{ padding: 22px; }}
-    .panel h2, .report-section h2 {{ margin: 0 0 10px 0; font-size: 26px; line-height: 1.1; }}
-    .panel p.lead, .section-meta {{ margin: 0 0 14px 0; color: #475569; font-size: 16px; line-height: 1.7; }}
+    .panel h2, .report-section h2 {{ margin: 0 0 10px 0; font-size: 30px; line-height: 1.08; }}
+    .panel p.lead, .section-meta {{ margin: 0 0 16px 0; color: #475569; font-size: 18px; line-height: 1.75; }}
     .stats {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px; }}
     .stat {{ border-radius: 18px; background: #f8fafc; border: 1px solid #e2e8f0; padding: 16px; }}
     .stat .label {{ font-size: 11px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b; }}
@@ -3038,9 +4434,10 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
     .strategy-card h3 {{ margin: 0; font-size:20px; }}
     .strategy-metrics {{ font-size: 15px; margin-top: 8px; color: #1e293b; }}
     .recommended-badge {{ display: inline-flex; align-items: center; padding: 4px 8px; border-radius: 999px; background: #dbeafe; color: #1d4ed8; font-size: 11px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; }}
-    .chart-frame {{ border-radius: 18px; background: #f8fafc; border: 1px solid #dbe3ee; padding: 12px; margin-top: 12px; }}
+    .chart-frame {{ border-radius: 18px; background: #f8fafc; border: 1px solid #dbe3ee; padding: 18px; margin-top: 16px; overflow: auto; }}
+    .chart-frame svg {{ display: block; width: 100%; height: auto; min-height: 520px; }}
     table {{ width: 100%; border-collapse: collapse; margin-top: 14px; }}
-    th, td {{ padding: 14px 10px; border-bottom: 1px solid #e5e7eb; text-align: left; vertical-align: top; font-size: 15px; }}
+    th, td {{ padding: 16px 12px; border-bottom: 1px solid #e5e7eb; text-align: left; vertical-align: top; font-size: 16px; }}
     th {{ font-size: 12px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b; }}
     .camera-cell {{ display: flex; flex-direction: column; gap: 4px; }}
     .camera-cell span {{ font-size: 12px; color: #64748b; }}
@@ -3051,14 +4448,23 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
     .grid.cols-4 {{ grid-template-columns: repeat(4, minmax(0,1fr)); }}
     .grid.cols-6 {{ grid-template-columns: repeat(6, minmax(0,1fr)); }}
     .grid.cols-8 {{ grid-template-columns: repeat(8, minmax(0,1fr)); }}
-    .clip-card {{ background: white; border-radius: 18px; padding: 14px; border: 1px solid #e2e8f0; }}
+    .clip-card {{ background: white; border-radius: 20px; padding: 18px; border: 1px solid #e2e8f0; }}
     .clip-card.hero {{ border: 2px solid #b91c1c; }}
     .hero-badge {{ display: inline-flex; align-items: center; padding: 5px 9px; border-radius: 999px; background: #b91c1c; color: white; font-size: 11px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 10px; }}
     .thumb-single figure, figure {{ margin: 0; }}
     .thumb-single img, figure img {{ width: 100%; display: block; border-radius: 12px; background: #d7dce4; aspect-ratio: 16 / 10; object-fit: cover; }}
     figcaption {{ margin-top: 8px; font-size: 13px; color: #64748b; }}
-    .clip-label {{ font-size: 18px; font-weight: 800; margin-top: 12px; }}
-    .clip-meta {{ font-size: 14px; line-height: 1.55; margin-top: 6px; }}
+    .clip-label {{ font-size: 20px; font-weight: 800; margin-top: 14px; line-height: 1.2; }}
+    .clip-meta {{ font-size: 15px; line-height: 1.65; margin-top: 8px; }}
+    .clip-meta.advanced {{ font-size: 13px; }}
+    .correction-cue {{ margin-top: 10px; display: inline-flex; align-items: center; padding: 6px 10px; border-radius: 999px; font-size: 13px; font-weight: 800; letter-spacing: 0.05em; text-transform: uppercase; }}
+    .correction-cue.lift {{ background: #dcfce7; color: #166534; }}
+    .correction-cue.lower {{ background: #fee2e2; color: #991b1b; }}
+    .correction-cue.neutral {{ background: #e2e8f0; color: #475569; }}
+    .render-proof {{ margin-top: 10px; padding-top: 10px; border-top: 1px solid #e2e8f0; font-size: 13px; line-height: 1.6; color: #334155; }}
+    .truth-panel {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 18px; }}
+    .truth-card {{ background: #f8fafc; border: 1px solid #dbe3ee; border-radius: 16px; padding: 14px 16px; }}
+    .truth-card strong {{ display: block; font-size: 24px; margin-top: 6px; }}
     .subtle {{ color: #64748b; }}
     @media (max-width: 980px) {{ .two-up {{ grid-template-columns: 1fr; }} .stats {{ grid-template-columns: repeat(2, minmax(0,1fr)); }} }}
     @media print {{ body {{ background: white; }} .page {{ padding: 12px; }} .hero, .panel, .report-section {{ box-shadow: none; }} }}
@@ -3078,6 +4484,11 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
           </div>
         </div>
         <p class="synopsis">{html.escape(str(payload.get('executive_synopsis') or ''))}</p>
+        <div class="truth-panel">
+          <div class="truth-card"><div class="eyebrow">Corrected Renders</div><strong>{int(render_truth_summary.get('corrected_render_count', 0) or 0)}</strong></div>
+          <div class="truth-card"><div class="eyebrow">Changed Pixels</div><strong>{int(render_truth_summary.get('changed_render_count', 0) or 0)}</strong></div>
+          <div class="truth-card"><div class="eyebrow">Unexpected No-Change</div><strong>{int(render_truth_summary.get('unchanged_non_identity_count', 0) or 0)}</strong></div>
+        </div>
         <dl class="meta-grid">
           <div class="meta-card"><dt>Run Label</dt><dd>{html.escape(str(payload.get('run_label')))}</dd></div>
           <div class="meta-card"><dt>Source Mode</dt><dd>{html.escape(str(payload.get('source_mode_label')))}</dd></div>
@@ -3132,7 +4543,7 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
       </section>
 
       <section class="report-section">
-        <div class="section-top"><h2>Visual Confirmation Stills</h2><p class="section-meta">Original stills remain in the report as the confirmation layer, not the only decision input.</p></div>
+        <div class="section-top"><h2>Visual Confirmation Stills</h2><p class="section-meta">Original frames are shown once as the baseline reference. The strategy sections below use strategy-specific corrected assets.</p></div>
         <div class="grid cols-{original_columns}">{''.join(original_cards)}</div>
       </section>
 

@@ -1,317 +1,344 @@
 # R3DMatch
 
-Mac-first internal prototype for automatic exposure matching of RED R3D clips prior to transcoding.
+R3DMatch is a RED multi-camera calibration and review workflow for matching exposure correction, color temperature, and tint across a camera array.
 
-## Prototype status
+The project is built around an analysis-first, push-later model:
 
-Current prototype capabilities:
+- measure a neutral target from a shared ROI
+- compare strategies such as `median` and `optimal-exposure`
+- generate operator-facing reports and trust diagnostics
+- gate weak runs before any later camera writeback
+- support read-only RCP2 camera inspection and verification over WebSocket JSON
 
-- defines a dedicated `r3dmatch` CLI
-- supports `scene` and `view` analysis modes
-- preserves monitoring/LUT context in emitted manifests
-- computes deterministic stop offsets from sampled frames
-- supports `full_frame`, `center_crop`, and detected ROI sampling for calibration work
-- writes independent exposure and color calibration JSONs for later RMD-side integration
-- writes per-clip analysis manifests and structured sidecars
-- writes a first supported subset of per-clip `.RMD` files from those sidecars
-- emits REDLine command plans for validation workflows
-- scaffolds contact-sheet report metadata and HTML output from analysis results
+The current product state is no longer a small prototype. R3DMatch now includes structured run gating, per-camera trust classes, lightweight and full review outputs, debug exposure traces, and read-only verification flows for connected RED cameras.
 
-Current prototype limitations:
+## What R3DMatch Does
 
-- the RED SDK bridge currently implements the first decode milestone only: metadata plus single-frame half-res decode
-- the bundled backend is a deterministic mock decoder for fast CLI validation
-- REDLine flag mapping is left as a wrapper-owned integration point
+- analyzes RED clip sets using shared neutral-target sampling
+- computes exposure correction plus Kelvin / tint recommendations
+- generates full contact-sheet or lightweight review packages
+- explains trust with per-camera classifications, stability diagnostics, and run-level gating
+- emits commit payloads for later camera writeback workflows
+- supports RED RCP2 WebSocket read / verify flows for connected cameras
 
-## CLI
+## Current Capabilities
+
+### Analysis and Sampling
+
+- `analyze` for lower-level scene/view clip analysis
+- `review-calibration` for the full operator workflow
+- shared ROI support for gray cards and gray spheres
+- per-camera debug exposure traces, ROI overlays, and sampling summaries
+- strategy comparison for:
+  - `median`
+  - `optimal-exposure`
+  - `manual`
+  - `hero-camera`
+
+### Reporting
+
+- full contact-sheet HTML output
+- lightweight analysis output for faster operator review
+- trust and stability charts
+- per-camera trust summaries
+- explicit run assessment and recommendation strength
+
+### Trust and Gating
+
+- per-camera trust classes:
+  - `TRUSTED`
+  - `USE_WITH_CAUTION`
+  - `UNTRUSTED`
+  - `EXCLUDED`
+- run statuses:
+  - `READY`
+  - `READY_WITH_WARNINGS`
+  - `REVIEW_REQUIRED`
+  - `DO_NOT_PUSH`
+- recommendation strength:
+  - `HIGH_CONFIDENCE`
+  - `MEDIUM_CONFIDENCE`
+  - `LOW_CONFIDENCE`
+
+### Verification
+
+- simulated verification of intended camera targets
+- comparison against saved read-only camera state reports
+- live read-only verification against connected RED cameras
+- explicit verification levels:
+  - `VERIFIED`
+  - `WITHIN_TOLERANCE`
+  - `MISMATCH`
+  - `NOT_AVAILABLE`
+
+### RED Camera Integration
+
+- documented RCP2 WebSocket JSON transport on port `9998`
+- read current camera state with `read-camera-state`
+- compare payload expectations to live camera state with `verify-camera-state --live-read`
+- optional live apply commands remain available, but they are intentionally separate from review and should only be used in controlled operator workflows
+
+## Current Limitations
+
+- R3DMatch does not claim that every run is safe to push. `DO_NOT_PUSH` and `REVIEW_REQUIRED` are deliberate guardrails.
+- Read-only verification is production-ready; automatic unattended camera pushes are not treated as universally safe.
+- Exact replay of historical problem footage is only possible when that source footage is present in the workspace used for analysis.
+- Periodic/subscription RCP2 support is scaffolded for future use, but not enabled as the default state manager.
+- The RED decode backend still depends on a local RED SDK bridge build when `--backend red` is used.
+- Preview generation depends on REDLine availability for real preview renders.
+
+## Installation
+
+### Required
 
 ```bash
-r3dmatch analyze /path/to/clip.R3D --mode scene --out ./out
-r3dmatch analyze /path/to/folder --mode view --lut ./show.cube --out ./out
-r3dmatch calibrate-exposure /path/to/folder --target-log2 -2.0 --sampling-mode center_crop --out ./cal/exposure
-r3dmatch calibrate-color /path/to/folder --sampling-mode detected_roi --out ./cal/color
-r3dmatch validate-pipeline /path/to/folder --analysis-dir ./out --out ./validation
-r3dmatch report-contact-sheet ./out --out ./report
-r3dmatch review-calibration /path/to/folder --out ./review --target-type gray_sphere --processing-mode both --backend red --roi-x 0.25 --roi-y 0.25 --roi-w 0.5 --roi-h 0.5
-r3dmatch approve-master-rmd ./review
-r3dmatch clear-preview-cache ./review
-r3dmatch write-rmd /path/to/folder --analysis-dir ./out
-r3dmatch transcode /path/to/clip.R3D --analysis-dir ./out --use-generated-sidecar --out ./renders
-r3dmatch transcode /path/to/clip.R3D --analysis-dir ./out --use-generated-rmd --out ./renders
-streamlit run src/r3dmatch/ui.py -- --output-folder ./out
+cd /path/to/R3DMatch
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
 ```
 
-## Layout
+### Optional: RED Decode Backend
 
-```text
-R3DMatch/
-├── README.md
-├── docs/
-├── scripts/
-├── src/r3dmatch/
-└── tests/
-```
-
-## RED Bridge
-
-The RED SDK integration is isolated behind the Python backend layer in `src/r3dmatch/sdk.py`.
-The native bridge lives in `src/r3dmatch/native/` and only exposes low-level metadata/decode calls.
-
-Build note:
+Use this only when you need real RED decoding with `--backend red`.
 
 ```bash
 export RED_SDK_ROOT=/path/to/RED_SDK
 ./scripts/build_red_sdk_bridge.sh
 ```
 
-Expected native contract:
+Notes:
 
-- `read_metadata(path)` returns a metadata dict only
-- `decode_frame(path, ...)` returns an `HxWx3` `float32` image array
+- if `RED_SDK_ROOT` is unset, the project still installs and works with the deterministic mock backend
+- the native bridge is required for `--backend red`
+- the WebSocket RCP2 read / verify path does not depend on the legacy raw SDK transport
 
-If `RED_SDK_ROOT` is unset, the bridge still builds as a stub, but `--backend red` will raise a clear runtime error.
-If `RED_SDK_ROOT` is set, the first supported decode path is frame 0 at half resolution with `REDWideGamutRGB` and `Log3G10`.
-Set `R3DMATCH_RED_DEBUG=1` to print native decode checkpoints and SDK status codes to stderr while debugging bridge failures.
+### Optional: REDLine Preview Rendering
 
-Why isolated:
-
-- clip identity and grouping must stay in Python
-- calibration and luminance logic must stay in Python
-- the native layer should only read metadata and decode frames
-
-## Calibration Notes
-
-Edge exclusion matters because lens shading, vignetting, rigs, matte boxes, and partial occlusions can contaminate full-frame statistics.
-`center_crop` and detected ROI sampling keep calibration focused on the most stable neutral region instead of averaging edge behavior into the solve.
-
-Exposure and color are separate passes on purpose:
-
-- exposure calibration solves per-group stop offsets from robust log-luminance statistics
-- color calibration solves per-group neutral RGB gains from trimmed channel medians
-
-Color matching cannot rely on Kelvin metadata alone. A camera can report the same white-balance metadata while still rendering different neutral-channel balance because of sensor, lens, filtration, flare, or pipeline differences.
-
-The generated `exposure_calibration.json` and `color_calibration.json` files are intended to feed a later RMD-generation step independently:
-
-- exposure only
-- color only
-- or both together
-
-## Sidecars, RMDs, And REDLine
-
-The current sidecar format is an exact per-clip intermediate JSON named from `clip_id` only:
-
-- `G007_D060_0324M6_001.sidecar.json`
-- generated RMD name: `G007_D060_0324M6_001.RMD`
-
-The sidecar remains the canonical intermediate contract. The current RMD writer generates an initial supported subset from it, using exact `clip_id` naming only:
-
-- exposure offsets and applied baseline state
-- color gains as pending/applied metadata
-- calibration provenance paths
-- exact clip identity for downstream REDLine/RMD mapping
-
-The current `.RMD` subset writes:
-
-- exposure offset from `final_offset_stops`
-- exposure calibration-loaded state
-- applied exposure baseline
-- optional neutral RGB gains
-- color gain state and basic provenance
-
-This is intentionally not a full camera-metadata round trip yet.
-
-Generate `.RMD` files directly from an analysis folder with:
+If `REDLine` is not already on `PATH`, point R3DMatch at it explicitly:
 
 ```bash
-r3dmatch write-rmd /path/to/folder --analysis-dir ./out
+export R3DMATCH_REDLINE_EXECUTABLE=/path/to/REDLine
 ```
 
-REDLine planning can use either generated sidecars or generated `.RMD` files and keeps the exact clip-to-metadata pairing deterministic:
+## Quick Start
 
-- original
-- exposure
-- color
-- both
-
-Use generated `.RMD` files in planning with:
+### 1. Run a Review
 
 ```bash
-r3dmatch transcode /path/to/folder --analysis-dir ./out --use-generated-rmd --out ./renders
+r3dmatch review-calibration /path/to/calibration_r3ds \
+  --out ./runs/review_demo \
+  --target-type gray_sphere \
+  --processing-mode both \
+  --backend mock \
+  --matching-domain scene \
+  --review-mode lightweight_analysis \
+  --preview-mode calibration \
+  --roi-x 0.20 --roi-y 0.20 --roi-w 0.40 --roi-h 0.40 \
+  --clip-group 064 \
+  --target-strategy median \
+  --target-strategy optimal-exposure
 ```
 
-Use sidecars instead with:
+This produces a run folder such as:
 
-```bash
-r3dmatch transcode /path/to/folder --analysis-dir ./out --use-generated-sidecar --out ./renders
+```text
+./runs/review_demo/subset_064/
 ```
 
-## Review UI
-
-The fastest local review app is a small Streamlit page that reads one analyze output folder directly.
-
-It expects:
+Key files:
 
 - `summary.json`
-- `array_calibration.json`
-- `analysis/*.analysis.json`
-- `sidecars/*.sidecar.json`
-- optional generated previews under `previews/`
-
-Generate previews plus a real contact-sheet package from an analyze output folder with:
-
-```bash
-r3dmatch report-contact-sheet ./out --out ./out/report --preview-mode calibration
-```
-
-This writes:
-
-- `./out/previews/<clip_id>.original.review.jpg`
-- `./out/previews/<clip_id>.exposure.review.jpg`
-- `./out/previews/<clip_id>.color.review.jpg`
-- `./out/previews/<clip_id>.both.review.jpg`
-- `./out/report/contact_sheet.json`
-- `./out/report/preview_contact_sheet.pdf`
-- `./out/report/contact_sheet.html`
-- `./out/report/review_manifest.json`
-
-Preview rendering now uses `REDLine` and exposes two review modes:
-
-- `calibration` (default): calibration-safe preview using `REDWideGamutRGB / Log3G10 / Medium / Medium`
-- `monitoring`: optional operator-facing monitoring preview, with optional `--preview-lut /path/to/show.cube`
-
-The authoritative exposure solve still uses the calibration preview path, even if monitoring previews are requested for the visible review package.
-
-The four preview variants remain:
-
-- `original`
-- `exposure`
-- `color`
-- `both`
-
-`report-contact-sheet` writes those previews under `previews/` and then builds both `preview_contact_sheet.pdf` and `contact_sheet.html`. The preview PDF is now the preferred review artifact for operators because it does not depend on browser rendering. Set `R3DMATCH_REDLINE_EXECUTABLE` if `REDLine` is not on `PATH`.
-
-Each review package also records the detected REDLine capabilities and the exact preview settings used, including whether LUT support was available and whether the chosen preview-space arguments were applied.
-
-## Operator Workflow
-
-1. Run review:
-
-```bash
-r3dmatch review-calibration /path/to/calibration_r3ds --out ./review --target-type gray_sphere --processing-mode both --backend red --roi-x 0.25 --roi-y 0.25 --roi-w 0.5 --roi-h 0.5 --target-strategy median --target-strategy brightest-valid --target-strategy manual --reference-clip-id G007_D060_0324M6_001 --preview-mode calibration --preview-output-space REDWideGamutRGB --preview-output-gamma Log3G10 --preview-highlight-rolloff medium --preview-shadow-rolloff medium
-```
-
-This generates:
-
-- analysis outputs
-- `array_calibration.json`
-- temporary review RMDs under `review_rmd/`
-- REDLine review previews under `previews/`
+- `report/review_validation.json`
 - `report/contact_sheet.json`
 - `report/contact_sheet.html`
-- `report/preview_contact_sheet.pdf`
+- `report/debug_exposure_trace/summary.json`
 
-Original previews are rendered once as shared references, and each requested target strategy gets its own corrected preview set:
+### 2. Inspect the Trust Result
 
-- `<clip_id>.original.review.<run_id>.jpg`
-- `<clip_id>.exposure.review.<strategy>.<run_id>.jpg`
-- `<clip_id>.color.review.<strategy>.<run_id>.jpg`
-- `<clip_id>.both.review.<strategy>.<run_id>.jpg`
+Look at:
 
-For gray-card and gray-sphere review, the preferred path is to provide a shared normalized ROI with `--roi-x/--roi-y/--roi-w/--roi-h`. When present, the calibration solve uses only that ROI for luminance, chromaticity, and confidence measurements. If no ROI is provided, the workflow falls back to the broader center-region measurement path.
+- `report/review_validation.json` for machine-readable status
+- `report/contact_sheet.html` for operator review
+- `report/debug_exposure_trace/summary.json` for measurement diagnostics
 
-Exposure matching in the review workflow is now evaluated primarily in monitoring conditions rather than raw-domain luminance alone. The primary exposure metric is the ROI luminance after a shared rendered-preview measurement pass aligned to the calibration preview assumptions:
+### 3. Read Current Camera State
 
-- REDWideGamutRGB output space
-- Log3G10 gamma
-- Medium tone map
-- Medium highlight roll-off
-- Medium shadow roll-off
-
-Raw-domain ROI luminance is still retained in the analysis and report outputs as diagnostics:
-
-- `measured_log2_luminance_monitoring`: primary solve value
-- `measured_log2_luminance_raw`: diagnostic only
-
-This keeps the operator-facing exposure solve closer to the same conditions used to judge the preview PDF and review stills, while preserving raw-domain visibility for engineering/debug work.
-
-`--target-strategy` can be repeated to compare multiple array targets in one review package:
-
-- `median`
-- `brightest-valid`
-- `manual` (requires `--reference-clip-id`)
-
-2. Inspect `report/preview_contact_sheet.pdf` as the primary review artifact, then optionally use `report/contact_sheet.html` or the Streamlit UI for secondary inspection.
-
-3. If the result is not acceptable, rerun or clear disposable review renders safely:
+Read-only RCP2 camera query:
 
 ```bash
-r3dmatch clear-preview-cache ./review
+r3dmatch read-camera-state 10.20.61.191 --camera-label WIFI_RED
 ```
 
-This removes only preview/review artifacts such as review JPGs, preview command logs, and contact-sheet review files. It does not remove analysis JSON, calibration JSON, approved `Master_RMD`, or approval PDFs.
+### 4. Verify a Payload Against Live Camera State
 
-4. Approve the reviewed calibration and generate authoritative master outputs:
+This is read-only. It compares the payload to what the camera currently reports.
 
 ```bash
-r3dmatch approve-master-rmd ./review --target-strategy manual --reference-clip-id G007_D060_0324M6_001
+r3dmatch verify-camera-state /path/to/run/report/calibration_commit_payload.json \
+  --camera WIFI_RED \
+  --live-read
 ```
 
-This generates:
+## CLI Reference
 
-- `approval/Master_RMD/<clip_id>.RMD`
-- `approval/approval_manifest.json`
-- `approval/calibration_report.pdf`
+### Core Analysis
 
-Only the selected review strategy is promoted into `Master_RMD`.
+- `r3dmatch analyze`
+  - lower-level clip analysis
+- `r3dmatch review-calibration`
+  - main calibration review workflow
+- `r3dmatch report-contact-sheet`
+  - build operator review artifacts from an analysis directory
+- `r3dmatch clear-preview-cache`
+  - remove disposable preview artifacts only
 
-5. Archive `approval/calibration_report.pdf` and the approval manifest with the approved `Master_RMD` folder as the permanent record of the decision.
+### Calibration Utilities
 
-Launch it from the project root with:
+- `r3dmatch calibrate-sphere`
+- `r3dmatch calibrate-exposure`
+- `r3dmatch calibrate-color`
+- `r3dmatch calibrate-card`
 
-```bash
-streamlit run src/r3dmatch/ui.py -- --output-folder /path/to/out
-```
+### RMD / Preview / Validation
 
-If preview stills exist under `previews/` or `stills/` in that output folder, the app will show them automatically. If not, the UI still works without blocking.
+- `r3dmatch write-rmd`
+- `r3dmatch transcode`
+- `r3dmatch validate-pipeline`
+- `r3dmatch approve-master-rmd`
 
-For the preferred internal operator UI, launch the local web app:
+### Camera State and Verification
 
-```bash
-cd ~/Desktop/R3DMatch
-setenv PYTHONPATH "$PWD/src"
-python3 -m r3dmatch.web_app
-```
+- `r3dmatch read-camera-state`
+  - read-only current camera values and camera info
+- `r3dmatch verify-camera-state`
+  - compare expected payload values to simulated or live-read camera state
+- `r3dmatch apply-calibration`
+  - dry-run by default; `--live` enables real writeback
+- `r3dmatch apply-camera-values`
+  - intentionally live camera write command; use only in controlled workflows
+- `r3dmatch test-rcp2-write`
+  - smoke-test write/readback/restore; intentionally invasive and not part of the safe quick start
 
-This starts a local server at:
+### UI
 
-```bash
-http://127.0.0.1:5000
-```
+- `r3dmatch desktop-ui`
+  - launches the desktop wrapper around the operator interface
 
-The web UI is an internal-only Flask wrapper around the existing CLI/workflow. It uses text inputs for paths and server-side validation instead of OS file pickers. It lets an operator:
+## Workflow Examples
 
-- choose a calibration folder and scan it recursively for RED `.R3D` clips inside `.RDC` containers or plain folders
-- choose backend, target type, processing mode, ROI, strategies, and manual reference clip
-- choose `calibration` vs `monitoring` preview mode
-- optionally select a `.cube` monitoring LUT
-- run review calibration
-- inspect logs and the exact command being run
-- open the generated report/output folder
-- approve a selected strategy into `Master_RMD`
-- clear preview cache
+### Analyze, Review, and Decide
 
-The intended source-selection flow is folder-first: operators paste a calibration folder path, the web UI discovers RED clips automatically after scan, and the source summary panel shows clip count plus sample clip IDs before review is run.
+1. Run `review-calibration`
+2. Inspect:
+   - `report/contact_sheet.html`
+   - `report/review_validation.json`
+   - `report/debug_exposure_trace/summary.json`
+3. Check:
+   - per-camera trust classes
+   - overall run status
+   - recommendation strength
+4. Only plan writeback later if the run is strong enough
 
-Logo behavior:
+### Weak-Set Example
 
-- the bundled project logo at `src/r3dmatch/static/r3dmatch_logo.png` is served in the header when available
-- if the image cannot be loaded, the UI falls back to a text-only header and continues normally
+A weak set may produce:
 
-For a quick import check without starting the server:
+- `run_assessment.status = DO_NOT_PUSH`
+- `recommendation_strength = LOW_CONFIDENCE`
+- several cameras marked `UNTRUSTED`
 
-```bash
-cd ~/Desktop/R3DMatch
-setenv PYTHONPATH "$PWD/src"
-python3 -m r3dmatch.web_app --check
-```
+That means the analysis was useful, but the result is not safe to trust for later push without remeasurement.
+
+### Read-Only Verification Before a Later Push
+
+1. Generate or load a commit payload
+2. Read current camera state with `read-camera-state`
+3. Run `verify-camera-state --live-read`
+4. Review per-parameter comparison before any future live write
+
+## Output Artifacts
+
+Typical review output contains:
+
+- `summary.json`
+  - aggregate analysis summary
+- `array_calibration.json`
+  - solved array-level calibration result
+- `report/review_validation.json`
+  - final review contract and run assessment
+- `report/contact_sheet.json`
+  - report payload consumed by HTML / operator surfaces
+- `report/contact_sheet.html`
+  - human-readable report
+- `report/debug_exposure_trace/summary.json`
+  - aggregate measurement diagnostics
+- `report/debug_exposure_trace/<camera_id>.json`
+  - per-camera measurement trace
+- `report/debug_exposure_trace/<camera_id>.roi.svg`
+  - ROI/sample overlay preview
+- `report/calibration_commit_payload.json`
+  - camera-target payload for later writeback workflows
+- `report/rcp2_camera_state_report.json`
+  - saved read-only camera-state snapshot
+- `report/rcp2_verification_report.json`
+  - structured verification output
+- `report/post_apply_verification.json`
+  - before/after review comparison when available
+
+## Safety and Trust Model
+
+### Trust Classes
+
+- `TRUSTED`
+  - stable reading, reference-eligible
+- `USE_WITH_CAUTION`
+  - usable but not a strong anchor candidate
+- `UNTRUSTED`
+  - unstable or low-confidence reading
+- `EXCLUDED`
+  - intentionally removed from reference formation
+
+### Run Status
+
+- `READY`
+  - trustworthy enough to carry forward
+- `READY_WITH_WARNINGS`
+  - usable, but review the cautions before later push
+- `REVIEW_REQUIRED`
+  - analysis is informative, but operator judgment is required
+- `DO_NOT_PUSH`
+  - not safe to trust for later camera writeback
+
+### Recommendation Strength
+
+- `HIGH_CONFIDENCE`
+- `MEDIUM_CONFIDENCE`
+- `LOW_CONFIDENCE`
+
+### Verification Modes
+
+- `simulated_expected_state`
+  - confirms intended targets and tolerance model only
+- `camera_state_report_compare`
+  - compares against a previously saved read-only camera state report
+- `live_read_compare`
+  - performs read-only camera queries before comparing
+
+`DO_NOT_PUSH` exists to preserve operator trust. It is better for R3DMatch to say that a weak set is unsafe than to imply confidence it has not earned.
+
+## Supporting Docs
+
+- [Architecture](docs/architecture.md)
+- [Matching Domains](docs/matching-modes.md)
+- [Workflows](docs/workflows.md)
+- [Verification](docs/verification.md)
+- [RCP2 Transport](docs/rcp2.md)
+- [Validation Model](docs/validation-plan.md)
+
+## Development Notes
+
+- run `python -m r3dmatch.cli --help` for the authoritative command surface
+- use the mock backend for deterministic local testing when real RED decoding is not required
+- generated runs and debug artifacts belong under `runs/` and are ignored by git by default

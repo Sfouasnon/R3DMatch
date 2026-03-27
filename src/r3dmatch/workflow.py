@@ -15,8 +15,8 @@ from PIL import Image, UnidentifiedImageError
 from .color import is_identity_cdl_payload
 from .commit_values import build_commit_values
 from .execution import raise_if_cancelled
-from .ftps_ingest import ingest_ftps_batch, normalize_source_mode, source_mode_label
-from .identity import group_key_from_clip_id
+from .ftps_ingest import DEFAULT_CAMERA_IP_MAP, ingest_ftps_batch, normalize_source_mode, source_mode_label
+from .identity import group_key_from_clip_id, inventory_camera_label_from_clip_id, inventory_camera_label_from_source_path
 from .matching import analyze_path
 from .report import (
     build_contact_sheet_report,
@@ -48,6 +48,8 @@ PHYSICAL_TINT_VARIATION_THRESHOLD = 0.1
 PHYSICAL_LOG2_SPREAD_REFERENCE = 0.25
 PHYSICAL_CHROMA_SPREAD_REFERENCE = 0.01
 PHYSICAL_ROI_VARIANCE_REFERENCE = 0.001
+PHYSICAL_MAX_EXCLUDED_CAMERA_FRACTION = 0.25
+PHYSICAL_MIN_USABLE_CLUSTER_CAMERAS = 3
 
 
 def review_report_root(analysis_dir: str | Path) -> Path:
@@ -88,6 +90,10 @@ def review_commit_payload_path_for(analysis_dir: str | Path) -> Path:
 
 def review_commit_payloads_dir_for(analysis_dir: str | Path) -> Path:
     return review_report_root(analysis_dir) / "calibration_payloads"
+
+
+def post_apply_verification_path_for(analysis_dir: str | Path) -> Path:
+    return review_report_root(analysis_dir) / "post_apply_verification.json"
 
 
 def normalize_matching_domain(value: str) -> str:
@@ -261,6 +267,7 @@ def _build_physical_validation(analysis_root: Path) -> Dict[str, object]:
     neutrality_rows: List[Dict[str, object]] = []
     confidence_rows: List[Dict[str, object]] = []
     outliers: List[Dict[str, object]] = []
+    validation_warnings: List[str] = []
     kelvin_values: List[float] = []
     tint_values: List[float] = []
 
@@ -359,6 +366,25 @@ def _build_physical_validation(analysis_root: Path) -> Dict[str, object]:
     min_confidence = float(min((row["confidence"] for row in confidence_rows), default=1.0))
     kelvin_stddev = float(statistics.pstdev(kelvin_values)) if len(kelvin_values) > 1 else 0.0
     tint_stddev = float(statistics.pstdev(tint_values)) if len(tint_values) > 1 else 0.0
+    excluded_clip_ids = {str(item.get("clip_id") or "") for item in outliers}
+    included_confidence_rows = [row for row in confidence_rows if str(row.get("clip_id") or "") not in excluded_clip_ids]
+    included_camera_count = max(len(confidence_rows) - len(outliers), 0)
+    excluded_camera_count = len(outliers)
+    excluded_camera_fraction = (float(excluded_camera_count) / float(len(confidence_rows))) if confidence_rows else 0.0
+    cluster_mean_confidence = (
+        float(statistics.mean(row["confidence"] for row in included_confidence_rows))
+        if included_confidence_rows
+        else 0.0
+    )
+    cluster_min_confidence = (
+        float(min((row["confidence"] for row in included_confidence_rows), default=0.0))
+        if included_confidence_rows
+        else 0.0
+    )
+    cluster_is_usable_after_exclusions = (
+        included_camera_count >= PHYSICAL_MIN_USABLE_CLUSTER_CAMERAS
+        and excluded_camera_fraction <= PHYSICAL_MAX_EXCLUDED_CAMERA_FRACTION
+    )
 
     validation_errors: List[str] = []
     if mean_exposure_error >= PHYSICAL_MEAN_EXPOSURE_ERROR_THRESHOLD:
@@ -369,16 +395,21 @@ def _build_physical_validation(analysis_root: Path) -> Dict[str, object]:
         validation_errors.append(
             f"Physical neutrality validation failed: max post neutral error {max_post_neutral_error:.4f} exceeds threshold {PHYSICAL_MAX_NEUTRAL_ERROR_THRESHOLD:.4f}."
         )
-    if outliers:
+    if outliers and not cluster_is_usable_after_exclusions:
         validation_errors.append(f"Physical validation failed: {len(outliers)} extreme outlier camera(s) detected.")
+    elif outliers:
+        validation_warnings.append(
+            f"Excluded {len(outliers)} outlier camera(s) from commit readiness; the remaining {included_camera_count}-camera cluster is still usable."
+        )
     if kelvin_stddev > PHYSICAL_KELVIN_STDDEV_THRESHOLD:
         validation_errors.append(
             f"Physical Kelvin validation failed: Kelvin stddev {kelvin_stddev:.2f} exceeds threshold {PHYSICAL_KELVIN_STDDEV_THRESHOLD:.2f}."
         )
 
     return {
-        "status": "success" if not validation_errors else "failed",
+        "status": "failed" if validation_errors else ("warning" if validation_warnings else "success"),
         "errors": validation_errors,
+        "warnings": validation_warnings,
         "thresholds": {
             "expected_log3g10_gray": LOG3G10_MID_GRAY_CODE_VALUE,
             "mean_exposure_error_threshold": PHYSICAL_MEAN_EXPOSURE_ERROR_THRESHOLD,
@@ -387,6 +418,8 @@ def _build_physical_validation(analysis_root: Path) -> Dict[str, object]:
             "extreme_neutral_error_threshold": PHYSICAL_EXTREME_NEUTRAL_ERROR_THRESHOLD,
             "minimum_confidence_threshold": PHYSICAL_MIN_CONFIDENCE_THRESHOLD,
             "kelvin_stddev_threshold": PHYSICAL_KELVIN_STDDEV_THRESHOLD,
+            "max_excluded_camera_fraction": PHYSICAL_MAX_EXCLUDED_CAMERA_FRACTION,
+            "minimum_usable_cluster_cameras": PHYSICAL_MIN_USABLE_CLUSTER_CAMERAS,
         },
         "exposure": {
             "expected_log3g10_gray": LOG3G10_MID_GRAY_CODE_VALUE,
@@ -416,9 +449,24 @@ def _build_physical_validation(analysis_root: Path) -> Dict[str, object]:
         "confidence": {
             "mean_confidence": mean_confidence,
             "min_confidence": min_confidence,
+            "cluster_mean_confidence": cluster_mean_confidence,
+            "cluster_min_confidence": cluster_min_confidence,
             "per_camera": confidence_rows,
         },
         "outliers": outliers,
+        "excluded_cameras": [
+            {
+                "clip_id": str(item.get("clip_id") or ""),
+                "camera_id": str(item.get("camera_id") or ""),
+                "reasons": [str(reason) for reason in item.get("reasons", []) if str(reason).strip()],
+                "excluded_from_anchor_selection": True,
+                "excluded_from_commit": True,
+            }
+            for item in outliers
+        ],
+        "excluded_camera_count": excluded_camera_count,
+        "included_camera_count": included_camera_count,
+        "cluster_is_usable_after_exclusions": cluster_is_usable_after_exclusions,
     }
 
 
@@ -467,8 +515,10 @@ def _physical_validation_capability(
 def _strategy_label_from_key(value: str) -> str:
     mapping = {
         "median": "Median",
-        "brightest_valid": "Brightest Valid",
-        "brightest-valid": "Brightest Valid",
+        "optimal_exposure": "Optimal Exposure (Best Match to Gray)",
+        "optimal-exposure": "Optimal Exposure (Best Match to Gray)",
+        "brightest_valid": "Optimal Exposure (Best Match to Gray)",
+        "brightest-valid": "Optimal Exposure (Best Match to Gray)",
         "hero_camera": "Hero Camera",
         "hero-camera": "Hero Camera",
         "manual": "Manual Reference",
@@ -533,6 +583,18 @@ def _build_failure_modes(physical_validation: Dict[str, object]) -> List[Dict[st
                 ),
             }
         )
+    excluded_cameras = list(physical_validation.get("excluded_cameras") or [])
+    if excluded_cameras:
+        failure_modes.append(
+            {
+                "code": "excluded_cameras_present",
+                "severity": "warning",
+                "message": (
+                    f"{len(excluded_cameras)} camera(s) were excluded from anchor selection and safe commit export; "
+                    f"review them individually before applying calibration."
+                ),
+            }
+        )
     return failure_modes
 
 
@@ -540,21 +602,71 @@ def _camera_rows_for_commit_payload(
     *,
     report_payload: Dict[str, object],
     array_payload: Optional[Dict[str, object]],
+    physical_validation: Optional[Dict[str, object]] = None,
 ) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
+    array_by_clip_id: Dict[str, Dict[str, object]] = {}
+    excluded_by_clip_id: Dict[str, Dict[str, object]] = {}
+    for excluded in list((physical_validation or {}).get("excluded_cameras") or []):
+        clip_id = str(excluded.get("clip_id") or "").strip()
+        if clip_id:
+            excluded_by_clip_id[clip_id] = dict(excluded)
+    if isinstance(array_payload, dict):
+        for camera in array_payload.get("cameras", []):
+            clip_id = str(camera.get("clip_id") or "").strip()
+            if clip_id:
+                array_by_clip_id[clip_id] = dict(camera)
     for item in report_payload.get("per_camera_analysis", []):
         commit_values = dict(item.get("commit_values") or {})
         camera_id = str(item.get("camera_label") or item.get("camera_id") or item.get("clip_id") or "").strip()
+        clip_id = str(item.get("clip_id") or "").strip()
+        source_path = str((array_by_clip_id.get(clip_id) or {}).get("source_path") or "")
+        inventory_camera_label = (
+            inventory_camera_label_from_source_path(source_path)
+            or inventory_camera_label_from_clip_id(clip_id)
+            or inventory_camera_label_from_clip_id(camera_id)
+        )
         if not camera_id or not commit_values:
             continue
+        exclusion = excluded_by_clip_id.get(clip_id, {})
+        confidence = float(item.get("confidence", 0.0) or 0.0)
+        trust_class = str(item.get("trust_class") or "").strip()
+        if not trust_class:
+            if exclusion:
+                trust_class = "EXCLUDED"
+            elif confidence < PHYSICAL_MIN_CONFIDENCE_THRESHOLD:
+                trust_class = "UNTRUSTED"
+            else:
+                trust_class = "TRUSTED"
+        trust_reason = str(item.get("trust_reason") or "").strip()
+        if not trust_reason:
+            if exclusion:
+                trust_reason = ", ".join(str(reason) for reason in exclusion.get("reasons", []) if str(reason).strip()) or "Excluded due to inconsistent measurement"
+            elif confidence < PHYSICAL_MIN_CONFIDENCE_THRESHOLD:
+                trust_reason = "Low confidence"
+            else:
+                trust_reason = "Stable gray sample"
+        reference_use = str(item.get("reference_use") or "").strip() or ("Excluded" if exclusion else "Included")
+        correction_confidence = str(item.get("correction_confidence") or "").strip() or (
+            "LOW" if trust_class in {"UNTRUSTED", "EXCLUDED"} else "HIGH"
+        )
         rows.append(
             {
                 "camera_id": camera_id,
-                "clip_id": str(item.get("clip_id") or ""),
+                "clip_id": clip_id,
+                "inventory_camera_label": inventory_camera_label,
+                "inventory_camera_ip": DEFAULT_CAMERA_IP_MAP.get(str(inventory_camera_label or "").upper(), ""),
+                "source_path": source_path,
                 "commit_values": commit_values,
-                "confidence": float(item.get("confidence", 0.0) or 0.0),
+                "confidence": confidence,
                 "note": str(item.get("note") or ""),
+                "trust_class": trust_class,
+                "trust_reason": trust_reason,
+                "reference_use": reference_use,
+                "correction_confidence": correction_confidence,
                 "is_hero_camera": bool(item.get("is_hero_camera")),
+                "excluded_from_commit": bool(exclusion),
+                "exclusion_reasons": [str(reason) for reason in exclusion.get("reasons", []) if str(reason).strip()],
             }
         )
     if rows or not isinstance(array_payload, dict):
@@ -590,10 +702,25 @@ def _camera_rows_for_commit_payload(
             {
                 "camera_id": str(camera.get("camera_id") or camera.get("clip_id") or "").strip(),
                 "clip_id": str(camera.get("clip_id") or ""),
+                "inventory_camera_label": (
+                    inventory_camera_label_from_source_path(str(camera.get("source_path") or ""))
+                    or inventory_camera_label_from_clip_id(str(camera.get("clip_id") or ""))
+                ),
+                "inventory_camera_ip": DEFAULT_CAMERA_IP_MAP.get(
+                    str(
+                        inventory_camera_label_from_source_path(str(camera.get("source_path") or ""))
+                        or inventory_camera_label_from_clip_id(str(camera.get("clip_id") or ""))
+                        or ""
+                    ).upper(),
+                    "",
+                ),
+                "source_path": str(camera.get("source_path") or ""),
                 "commit_values": commit_values,
                 "confidence": float((camera.get("quality") or {}).get("confidence", 0.0) or 0.0),
                 "note": "",
                 "is_hero_camera": False,
+                "excluded_from_commit": False,
+                "exclusion_reasons": [],
             }
         )
     return rows
@@ -604,14 +731,20 @@ def _write_commit_payload_artifacts(
     analysis_root: Path,
     report_payload: Dict[str, object],
     array_payload: Optional[Dict[str, object]],
+    physical_validation: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
-    rows = _camera_rows_for_commit_payload(report_payload=report_payload, array_payload=array_payload)
+    rows = _camera_rows_for_commit_payload(
+        report_payload=report_payload,
+        array_payload=array_payload,
+        physical_validation=physical_validation,
+    )
     payload_dir = review_commit_payloads_dir_for(analysis_root)
     payload_dir.mkdir(parents=True, exist_ok=True)
     mapping: Dict[str, Dict[str, object]] = {}
     per_camera_paths: List[Dict[str, object]] = []
     for row in rows:
         camera_id = str(row["camera_id"])
+        inventory_camera_label = str(row.get("inventory_camera_label") or "").upper()
         commit_values = dict(row["commit_values"])
         calibration_values = {
             "exposureAdjust": float(commit_values.get("exposureAdjust", 0.0) or 0.0),
@@ -622,16 +755,40 @@ def _write_commit_payload_artifacts(
             "schema_version": "r3dmatch_rcp2_ready_v1",
             "camera_id": camera_id,
             "clip_id": row["clip_id"],
+            "inventory_camera_label": inventory_camera_label,
+            "inventory_camera_ip": str(row.get("inventory_camera_ip") or ""),
+            "source_path": str(row.get("source_path") or ""),
             "format": "rcp2_ready",
             "calibration": calibration_values,
             "confidence": float(row["confidence"]),
+            "trust_class": str(row.get("trust_class") or ""),
+            "trust_reason": str(row.get("trust_reason") or ""),
+            "reference_use": str(row.get("reference_use") or ""),
+            "correction_confidence": str(row.get("correction_confidence") or ""),
             "is_hero_camera": bool(row["is_hero_camera"]),
-            "notes": [str(row["note"])] if str(row["note"]).strip() else [],
+            "excluded_from_commit": bool(row.get("excluded_from_commit")),
+            "exclusion_reasons": [str(reason) for reason in row.get("exclusion_reasons", []) if str(reason).strip()],
+            "safe_to_commit": not bool(row.get("excluded_from_commit")),
+            "notes": [
+                *([str(row["note"])] if str(row["note"]).strip() else []),
+                *(
+                    [f"Excluded from safe commit set: {', '.join(str(reason) for reason in row.get('exclusion_reasons', []) if str(reason).strip())}"]
+                    if row.get("excluded_from_commit")
+                    else []
+                ),
+            ],
         }
         payload_path = payload_dir / f"{camera_id}.json"
         payload_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         mapping[camera_id] = calibration_values
-        per_camera_paths.append({"camera_id": camera_id, "path": str(payload_path)})
+        per_camera_paths.append(
+            {
+                "camera_id": camera_id,
+                "inventory_camera_label": inventory_camera_label,
+                "inventory_camera_ip": str(row.get("inventory_camera_ip") or ""),
+                "path": str(payload_path),
+            }
+        )
 
     aggregate = {
         "schema_version": "r3dmatch_calibration_commit_payload_v1",
@@ -640,6 +797,61 @@ def _write_commit_payload_artifacts(
         "recommended_strategy": ((report_payload.get("recommended_strategy") or {}).get("strategy_key")),
         "hero_camera": ((report_payload.get("hero_recommendation") or {}).get("candidate_clip_id")),
         "cameras": mapping,
+        "camera_targets": [
+            {
+                "camera_id": str(row["camera_id"]),
+                "clip_id": str(row["clip_id"]),
+                "inventory_camera_label": str(row.get("inventory_camera_label") or ""),
+                "inventory_camera_ip": str(row.get("inventory_camera_ip") or ""),
+                "calibration": {
+                    "exposureAdjust": float(dict(row["commit_values"]).get("exposureAdjust", 0.0) or 0.0),
+                    "kelvin": int(dict(row["commit_values"]).get("kelvin", 5600) or 5600),
+                    "tint": float(dict(row["commit_values"]).get("tint", 0.0) or 0.0),
+                },
+                "confidence": float(row["confidence"]),
+                "trust_class": str(row.get("trust_class") or ""),
+                "trust_reason": str(row.get("trust_reason") or ""),
+                "reference_use": str(row.get("reference_use") or ""),
+                "correction_confidence": str(row.get("correction_confidence") or ""),
+                "is_hero_camera": bool(row["is_hero_camera"]),
+                "excluded_from_commit": bool(row.get("excluded_from_commit")),
+                "exclusion_reasons": [str(reason) for reason in row.get("exclusion_reasons", []) if str(reason).strip()],
+            }
+            for row in rows
+        ],
+        "safe_camera_targets": [
+            {
+                "camera_id": str(row["camera_id"]),
+                "clip_id": str(row["clip_id"]),
+                "inventory_camera_label": str(row.get("inventory_camera_label") or ""),
+                "inventory_camera_ip": str(row.get("inventory_camera_ip") or ""),
+                "calibration": {
+                    "exposureAdjust": float(dict(row["commit_values"]).get("exposureAdjust", 0.0) or 0.0),
+                    "kelvin": int(dict(row["commit_values"]).get("kelvin", 5600) or 5600),
+                    "tint": float(dict(row["commit_values"]).get("tint", 0.0) or 0.0),
+                },
+                "confidence": float(row["confidence"]),
+                "trust_class": str(row.get("trust_class") or ""),
+                "trust_reason": str(row.get("trust_reason") or ""),
+                "reference_use": str(row.get("reference_use") or ""),
+                "correction_confidence": str(row.get("correction_confidence") or ""),
+                "is_hero_camera": bool(row["is_hero_camera"]),
+            }
+            for row in rows
+            if not bool(row.get("excluded_from_commit"))
+        ],
+        "excluded_cameras": [
+            {
+                "camera_id": str(row["camera_id"]),
+                "clip_id": str(row["clip_id"]),
+                "inventory_camera_label": str(row.get("inventory_camera_label") or ""),
+                "inventory_camera_ip": str(row.get("inventory_camera_ip") or ""),
+                "trust_class": str(row.get("trust_class") or ""),
+                "reasons": [str(reason) for reason in row.get("exclusion_reasons", []) if str(reason).strip()],
+            }
+            for row in rows
+            if bool(row.get("excluded_from_commit"))
+        ],
         "per_camera_payloads": per_camera_paths,
     }
     aggregate_path = review_commit_payload_path_for(analysis_root)
@@ -649,6 +861,8 @@ def _write_commit_payload_artifacts(
         "per_camera_dir": str(payload_dir),
         "camera_count": len(mapping),
         "mapping": mapping,
+        "safe_camera_targets": aggregate["safe_camera_targets"],
+        "excluded_cameras": aggregate["excluded_cameras"],
         "per_camera_payloads": per_camera_paths,
     }
 
@@ -674,6 +888,7 @@ def _build_recommendation_layer(
     operator_note = str(report_payload.get("operator_recommendation") or "").strip()
     if operator_note:
         notes.append(operator_note)
+    run_assessment = dict(report_payload.get("run_assessment") or {})
     return {
         "recommended_strategy": {
             "strategy_key": str(recommended.get("strategy_key") or ""),
@@ -684,7 +899,54 @@ def _build_recommendation_layer(
         "hero_camera": str(hero.get("candidate_clip_id") or "") or None,
         "hero_camera_confidence": str(hero.get("confidence") or "") or None,
         "confidence_score": confidence_score,
+        "recommendation_strength": str(run_assessment.get("recommendation_strength") or "MEDIUM_CONFIDENCE"),
+        "run_status": str(run_assessment.get("status") or ""),
         "summary_notes": notes,
+    }
+
+
+def _resolve_run_assessment(
+    *,
+    report_payload: Dict[str, object],
+    recommendation: Dict[str, object],
+    physical_validation: Dict[str, object],
+) -> Dict[str, object]:
+    payload_assessment = dict(report_payload.get("run_assessment") or {})
+    if str(payload_assessment.get("status") or "").strip():
+        return payload_assessment
+    excluded_camera_count = int(physical_validation.get("excluded_camera_count", 0) or 0)
+    camera_count = max(int(physical_validation.get("included_camera_count", 0) or 0) + excluded_camera_count, 0)
+    physical_status = str(physical_validation.get("status") or "")
+    confidence_score = float(recommendation.get("confidence_score", 0.0) or 0.0)
+    cluster_usable = bool(physical_validation.get("cluster_is_usable_after_exclusions"))
+    if physical_status == "failed" or not cluster_usable and excluded_camera_count:
+        status = "DO_NOT_PUSH"
+        recommendation_strength = "LOW_CONFIDENCE"
+        operator_note = "Do not push these corrections later without remeasuring the set."
+    elif excluded_camera_count or physical_status == "warning" or confidence_score < 0.7:
+        status = "READY_WITH_WARNINGS"
+        recommendation_strength = "MEDIUM_CONFIDENCE"
+        operator_note = "This run is usable, but at least one camera should be reviewed before any later push."
+    else:
+        status = "READY"
+        recommendation_strength = "HIGH_CONFIDENCE"
+        operator_note = "This run is strong enough to trust later for push if the camera readback still matches."
+    return {
+        "status": status,
+        "recommendation_strength": recommendation_strength,
+        "safe_to_push_later": status in {"READY", "READY_WITH_WARNINGS"},
+        "trusted_camera_count": max(int(physical_validation.get("included_camera_count", 0) or 0), 0),
+        "caution_camera_count": 0,
+        "untrusted_camera_count": 0,
+        "excluded_camera_count": excluded_camera_count,
+        "reference_eligible_count": max(int(physical_validation.get("included_camera_count", 0) or 0), 0),
+        "camera_count": camera_count,
+        "average_trust_score": confidence_score,
+        "anchor_camera": None,
+        "anchor_trust_class": "",
+        "anchor_summary": "Legacy report payload did not include anchor trust details.",
+        "gating_reasons": list(physical_validation.get("warnings") or []),
+        "operator_note": operator_note,
     }
 
 
@@ -694,10 +956,12 @@ def _build_human_summary(
     recommendation: Dict[str, object],
     physical_validation: Dict[str, object],
     failure_modes: List[Dict[str, object]],
+    run_assessment: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     recommended = recommendation.get("recommended_strategy") or {}
     exposure = physical_validation.get("exposure") or {}
     neutrality = physical_validation.get("neutrality") or {}
+    resolved_run_assessment = dict(run_assessment or report_payload.get("run_assessment") or {})
     exec_summary = str(report_payload.get("executive_synopsis") or "").strip()
     if not exec_summary:
         exec_summary = (
@@ -705,23 +969,37 @@ def _build_human_summary(
             f"Mean exposure error is {float(exposure.get('mean_exposure_error', 0.0) or 0.0):.4f} and "
             f"max post-neutral error is {float(neutrality.get('max_post_neutral_error', 0.0) or 0.0):.4f}."
         )
-    pass_fail = (
-        "Physical validation passed and the calibration recommendation is ready for commit export."
-        if physical_validation.get("status") == "success"
-        else "Physical validation did not fully pass; review the flagged failure modes before committing calibration values."
-    )
+    if physical_validation.get("status") == "success":
+        pass_fail = "Physical validation passed and the calibration recommendation is ready for commit export."
+    elif physical_validation.get("status") == "warning" and physical_validation.get("cluster_is_usable_after_exclusions"):
+        pass_fail = (
+            "The main camera cluster remains usable, but one or more cameras were excluded from the safe commit set. "
+            "Proceed only with the non-excluded cameras and review the flagged outliers separately."
+        )
+    else:
+        pass_fail = "Physical validation did not fully pass; review the flagged failure modes before committing calibration values."
     per_camera_summary = [
         {
             "camera_id": str(item.get("camera_label") or item.get("camera_id") or item.get("clip_id") or ""),
             "clip_id": str(item.get("clip_id") or ""),
-            "summary": str(item.get("note") or "No additional note."),
+            "summary": str(
+                item.get("operator_summary")
+                or item.get("trust_reason")
+                or item.get("note")
+                or "No additional note."
+            ),
             "confidence": float(item.get("confidence", 0.0) or 0.0),
+            "trust_class": str(item.get("trust_class") or ""),
+            "reference_use": str(item.get("reference_use") or ""),
         }
         for item in report_payload.get("per_camera_analysis", [])
     ]
     return {
         "executive_summary": exec_summary,
         "pass_fail_explanation": pass_fail,
+        "run_status": str(resolved_run_assessment.get("status") or ""),
+        "recommendation_strength": str(resolved_run_assessment.get("recommendation_strength") or ""),
+        "safe_to_push_later": bool(resolved_run_assessment.get("safe_to_push_later")),
         "failure_modes_explanation": [str(item.get("message") or "") for item in failure_modes],
         "per_camera_summary": per_camera_summary,
     }
@@ -789,6 +1067,104 @@ def _build_post_apply_validation(
         ],
         "per_camera": per_camera,
     }
+
+
+def _comparison_variance_from_validation(validation: Dict[str, object]) -> float:
+    physical = validation.get("physical_validation") or {}
+    exposure_rows = list(((physical.get("exposure") or {}).get("per_camera") or []))
+    neutrality_rows = list(((physical.get("neutrality") or {}).get("per_camera") or []))
+    neutrality_by_clip = {str(row.get("clip_id") or ""): row for row in neutrality_rows}
+    combined: List[float] = []
+    for exp_row in exposure_rows:
+        clip_id = str(exp_row.get("clip_id") or "")
+        neu_row = neutrality_by_clip.get(clip_id, {})
+        combined.append(
+            float(exp_row.get("exposure_error", 0.0) or 0.0)
+            + float(neu_row.get("post_neutral_error", 0.0) or 0.0)
+        )
+    if len(combined) <= 1:
+        return 0.0
+    return float(statistics.pvariance(combined))
+
+
+def build_post_apply_verification_from_reviews(
+    before_review_dir: str,
+    after_review_dir: str,
+    *,
+    out_path: Optional[str] = None,
+) -> Dict[str, object]:
+    before_root = Path(before_review_dir).expanduser().resolve()
+    after_root = Path(after_review_dir).expanduser().resolve()
+    before_validation_path = review_validation_path_for(before_root)
+    after_validation_path = review_validation_path_for(after_root)
+    if not before_validation_path.exists():
+        raise ReviewValidationError(f"Before-review validation is missing: {before_validation_path}")
+    if not after_validation_path.exists():
+        raise ReviewValidationError(f"After-review validation is missing: {after_validation_path}")
+
+    before_validation = json.loads(before_validation_path.read_text(encoding="utf-8"))
+    after_validation = json.loads(after_validation_path.read_text(encoding="utf-8"))
+
+    before_physical = dict(before_validation.get("physical_validation") or {})
+    after_physical = dict(after_validation.get("physical_validation") or {})
+    before_exposure = dict(before_physical.get("exposure") or {})
+    after_exposure = dict(after_physical.get("exposure") or {})
+    before_neutrality = dict(before_physical.get("neutrality") or {})
+    after_neutrality = dict(after_physical.get("neutrality") or {})
+
+    before_mean_exposure = float(before_exposure.get("mean_exposure_error", 0.0) or 0.0)
+    after_mean_exposure = float(after_exposure.get("mean_exposure_error", 0.0) or 0.0)
+    before_mean_neutral = float(before_neutrality.get("mean_post_neutral_error", 0.0) or 0.0)
+    after_mean_neutral = float(after_neutrality.get("mean_post_neutral_error", 0.0) or 0.0)
+    before_variance = _comparison_variance_from_validation(before_validation)
+    after_variance = _comparison_variance_from_validation(after_validation)
+
+    exposure_improved = after_mean_exposure <= before_mean_exposure
+    neutrality_improved = after_mean_neutral <= before_mean_neutral
+    variance_reduced = after_variance <= before_variance
+    improvement_count = sum(1 for flag in (exposure_improved, neutrality_improved, variance_reduced) if flag)
+
+    if after_validation.get("status") != "success" or after_physical.get("status") not in {"success", "warning"}:
+        status = "fail"
+    elif improvement_count == 3:
+        status = "success"
+    elif improvement_count >= 1:
+        status = "warning"
+    else:
+        status = "fail"
+
+    result = {
+        "schema_version": "r3dmatch_post_apply_verification_v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "before_review_dir": str(before_root),
+        "after_review_dir": str(after_root),
+        "before_validation_path": str(before_validation_path),
+        "after_validation_path": str(after_validation_path),
+        "before_strategy": ((before_validation.get("recommendation") or {}).get("recommended_strategy") or {}).get("strategy_key"),
+        "after_strategy": ((after_validation.get("recommendation") or {}).get("recommended_strategy") or {}).get("strategy_key"),
+        "status": status,
+        "summary": {
+            "before_mean_exposure_error": before_mean_exposure,
+            "after_mean_exposure_error": after_mean_exposure,
+            "before_mean_neutral_error": before_mean_neutral,
+            "after_mean_neutral_error": after_mean_neutral,
+            "before_combined_variance": before_variance,
+            "after_combined_variance": after_variance,
+            "exposure_improved": exposure_improved,
+            "neutrality_improved": neutrality_improved,
+            "variance_reduced": variance_reduced,
+        },
+        "notes": [
+            "This comparison uses the physical validation summaries from two completed review runs.",
+            "It does not automate clip reacquisition; it compares the before and after review artifacts you provide.",
+        ],
+    }
+    if out_path:
+        output_path = Path(out_path).expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        result["report_path"] = str(output_path)
+    return result
 
 
 def validate_review_run_contract(analysis_dir: str) -> Dict[str, object]:
@@ -930,16 +1306,23 @@ def validate_review_run_contract(analysis_dir: str) -> Dict[str, object]:
         report_payload=report_payload,
         physical_validation=physical_validation,
     )
+    run_assessment = _resolve_run_assessment(
+        report_payload=report_payload,
+        recommendation=recommendation,
+        physical_validation=physical_validation,
+    )
     human_summary = _build_human_summary(
         report_payload=report_payload,
         recommendation=recommendation,
         physical_validation=physical_validation,
         failure_modes=failure_modes,
+        run_assessment=run_assessment,
     )
     commit_payload = _write_commit_payload_artifacts(
         analysis_root=analysis_root,
         report_payload=report_payload,
         array_payload=array_payload,
+        physical_validation=physical_validation,
     )
     post_apply_validation = _build_post_apply_validation(
         report_payload=report_payload,
@@ -947,6 +1330,7 @@ def validate_review_run_contract(analysis_dir: str) -> Dict[str, object]:
         recommendation=recommendation,
     )
     result["recommendation"] = recommendation
+    result["run_assessment"] = run_assessment
     result["failure_modes"] = failure_modes
     result["human_summary"] = human_summary
     result["commit_payload"] = commit_payload
@@ -1577,6 +1961,8 @@ def approve_master_rmd(
                 "clip_id": item["clip_id"],
                 "correction_key": item["correction_key"],
                 "camera_group_key": item["camera_group_key"],
+                "inventory_camera_label": inventory_camera_label_from_clip_id(str(item["clip_id"])),
+                "inventory_camera_ip": DEFAULT_CAMERA_IP_MAP.get(str(inventory_camera_label_from_clip_id(str(item["clip_id"])) or "").upper(), ""),
                 "master_rmd_path": item["master_rmd_path"],
                 "commit_values": item.get("commit_values"),
                 "is_hero_camera": item.get("is_hero_camera"),

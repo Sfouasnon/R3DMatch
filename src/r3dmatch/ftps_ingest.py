@@ -305,6 +305,7 @@ def ingest_ftps_batch(
             "camera_label": camera_label,
             "host": host,
             "status": "failed",
+            "failure_code": "",
             "attempts": 0,
             "clips_found": 0,
             "bytes_pulled": 0,
@@ -328,6 +329,7 @@ def ingest_ftps_batch(
                     clip_numbers=plan["clip_numbers"],
                 )
                 if not remote_matches:
+                    camera_entry["failure_code"] = "no_matching_clips"
                     raise FileNotFoundError(
                         f"No matching R3D files found for reel {plan['reel_identifier']} camera {camera_label} clip(s) {plan['clip_spec']}."
                     )
@@ -346,12 +348,22 @@ def ingest_ftps_batch(
                     )
                 camera_entry["clips_found"] = len(remote_matches)
                 camera_entry["status"] = "success"
+                camera_entry["failure_code"] = ""
                 successful_cameras.append(camera_label)
                 clips_found += len(remote_matches)
                 break
+            except FileNotFoundError as exc:
+                camera_entry["errors"].append(str(exc))
+                if attempt > retries:
+                    camera_entry["status"] = "failed"
+                    camera_entry["failure_code"] = camera_entry.get("failure_code") or "no_matching_clips"
+                    failed_cameras.append(camera_label)
+                continue
             except (OSError, EOFError, ftplib.Error, socket.error) as exc:
                 camera_entry["errors"].append(str(exc))
                 if attempt > retries:
+                    camera_entry["status"] = "failed"
+                    camera_entry["failure_code"] = "connection_or_transfer_failed"
                     failed_cameras.append(camera_label)
                 continue
             finally:
@@ -376,6 +388,7 @@ def ingest_ftps_batch(
         "clips_requested": plan["clip_numbers"],
         "clip_spec": plan["clip_spec"],
         "requested_cameras": plan["requested_cameras"],
+        "requested_camera_ips": {camera: resolved_map[camera] for camera in plan["requested_cameras"]},
         "successful_cameras": successful_cameras,
         "failed_cameras": failed_cameras,
         "requested_camera_count": len(plan["requested_cameras"]),
@@ -385,9 +398,8 @@ def ingest_ftps_batch(
         "bytes_pulled": total_bytes,
         "per_camera_status": camera_results,
     }
-    manifest_path = ingest_root / "ingest_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    manifest["manifest_path"] = str(manifest_path)
     manifest["status"] = "success" if not failed_cameras else ("partial" if successful_cameras else "failed")
+    manifest_path = ingest_root / "ingest_manifest.json"
+    manifest["manifest_path"] = str(manifest_path)
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return manifest
-

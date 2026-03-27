@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Optional
 
 
 def clip_id_from_path(source_path: str) -> str:
@@ -32,3 +33,23 @@ def subset_key_from_clip_id(clip_id: str) -> str:
 
 def rmd_name_for_clip_id(clip_id: str) -> str:
     return f"{clip_id}.RMD"
+
+
+def inventory_camera_label_from_clip_id(clip_id: str) -> Optional[str]:
+    tokens = str(clip_id or "").split("_")
+    if len(tokens) < 2:
+        return None
+    first = re.sub(r"[^A-Za-z]+", "", tokens[0])
+    second = re.sub(r"[^A-Za-z]+", "", tokens[1])
+    if not first or not second:
+        return None
+    return f"{first[0]}{second[0]}".upper()
+
+
+def inventory_camera_label_from_source_path(source_path: str) -> Optional[str]:
+    path = Path(source_path)
+    for parent in [path.parent, *path.parents]:
+        name = parent.name.strip().upper()
+        if re.fullmatch(r"[A-Z]{2}", name):
+            return name
+    return inventory_camera_label_from_clip_id(path.stem)

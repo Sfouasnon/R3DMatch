@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import html
 import hashlib
 import json
+import logging
 import os
 import shlex
 import subprocess
@@ -11,6 +13,7 @@ import time
 import uuid
 import webbrowser
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -19,6 +22,14 @@ from flask import Flask, Response, jsonify, redirect, render_template_string, re
 from .ftps_ingest import normalize_source_mode, plan_ftps_request, source_mode_label
 from .identity import clip_id_from_path, subset_key_from_clip_id
 from .matching import discover_clips
+from .rcp2_apply import (
+    apply_calibration_payload,
+    build_camera_verification_report,
+    load_apply_targets,
+    operator_apply_tolerances,
+    read_camera_state,
+    summarize_apply_report,
+)
 from .execution import CANCEL_FILE_ENV, terminate_process_group
 from .report import (
     _build_redline_preview_command,
@@ -30,11 +41,15 @@ from .report import (
 )
 from .workflow import (
     matching_domain_label,
+    post_apply_verification_path_for,
     resolve_review_output_dir,
+    review_payload_path_for,
+    review_commit_payload_path_for,
     review_html_path_for,
     review_manifest_path_for,
     review_pdf_path_for,
     review_validation_path_for,
+    build_post_apply_verification_from_reviews,
 )
 
 
@@ -43,6 +58,7 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5000
 STALL_THRESHOLD_SECONDS = 20.0
 ARTIFACT_FRESHNESS_TOLERANCE_SECONDS = 1.0
+LOGGER = logging.getLogger(__name__)
 
 
 PAGE_TEMPLATE = """
@@ -62,7 +78,8 @@ PAGE_TEMPLATE = """
     .subtitle { font-size: 14px; color: #475569; margin: 4px 0 0 0; text-transform: uppercase; letter-spacing: 0.08em; }
     .instructions { margin-top: 12px; font-size: 16px; color: #334155; max-width: 720px; }
     .card { background: rgba(255,255,255,0.96); border: 1px solid #d3d9e4; border-radius: 18px; padding: 20px; margin-bottom: 16px; box-shadow: 0 12px 28px rgba(15, 23, 42, 0.05); }
-    .section-title { font-size: 20px; font-weight: 700; margin: 0 0 12px 0; }
+    .section-title { font-size: 22px; font-weight: 800; margin: 0 0 14px 0; letter-spacing: -0.01em; }
+    .section-subtitle { margin: -6px 0 14px 0; font-size: 14px; color: #475569; line-height: 1.6; }
     .field { margin-bottom: 12px; min-width: 0; }
     .field label { display: block; font-weight: 700; margin-bottom: 6px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: #475569; }
     .field input[type="text"], .field select { width: 100%; box-sizing: border-box; padding: 12px 14px; border: 1px solid #c7ccd4; border-radius: 12px; background: white; color: #0f172a; }
@@ -82,16 +99,77 @@ PAGE_TEMPLATE = """
     .selector-item { display: flex; align-items: center; gap: 8px; font-size: 14px; }
     pre.log { background: #0f172a; color: #e5e7eb; border-radius: 8px; padding: 14px; min-height: 220px; overflow: auto; white-space: pre-wrap; }
     .meta { color: #64748b; font-size: 13px; line-height: 1.5; margin-top: 8px; }
-    .roi-preview-wrap { margin-top: 12px; }
-    .roi-preview-stage { position: relative; display: inline-block; max-width: 100%; border: 1px solid #d1d5db; border-radius: 8px; overflow: hidden; background: #000; }
-    .roi-preview-stage img { display: block; max-width: 100%; height: auto; }
-    .roi-overlay { position: absolute; border: 2px solid #2563eb; background: rgba(37,99,235,0.12); pointer-events: none; display: none; }
+    .roi-preview-wrap { margin-top: 14px; }
+    .roi-preview-guidance { margin: 0 0 10px 0; font-size: 14px; font-weight: 700; color: #334155; }
+    .roi-preview-note { margin-top: 10px; font-size: 13px; color: #64748b; line-height: 1.6; }
+    .roi-preview-stage { position: relative; display: inline-block; max-width: 100%; border: 1px solid #cbd5e1; border-radius: 12px; overflow: hidden; background: linear-gradient(180deg, #020617 0%, #111827 100%); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.06); }
+    .roi-preview-stage::after { content: "Draw region around gray target"; position: absolute; left: 12px; top: 12px; z-index: 4; padding: 6px 10px; border-radius: 999px; background: rgba(15,23,42,0.72); color: #f8fafc; font-size: 12px; font-weight: 800; letter-spacing: 0.04em; pointer-events: none; box-shadow: 0 4px 14px rgba(15,23,42,0.22); }
+    .roi-preview-stage img { display: block; max-width: 100%; height: auto; filter: brightness(1.12) contrast(1.08) saturate(1.02); }
+    .roi-overlay { position: absolute; border: 3px solid #f8fafc; box-shadow: 0 0 0 2px rgba(37,99,235,0.95), 0 0 0 9999px rgba(15,23,42,0.14); background: rgba(37,99,235,0.12); pointer-events: none; display: none; }
     .roi-canvas { position: absolute; inset: 0; cursor: crosshair; }
     .progress-track { background: #e5e7eb; height: 14px; border-radius: 999px; overflow: hidden; margin: 10px 0; }
     .progress-fill { background: #2563eb; height: 100%; width: 0%; transition: width 0.2s ease; }
     .stage-list { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 12px 0; padding: 0; list-style: none; }
     .stage-pill { padding: 6px 10px; border-radius: 999px; background: #e5e7eb; color: #374151; font-size: 13px; }
     .stage-pill.active { background: #2563eb; color: white; }
+    .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+    .summary-panel { border: 1px solid #e2e8f0; border-radius: 14px; padding: 16px; background: #f8fafc; }
+    .push-card { border: 1px solid #c7d2fe; background: linear-gradient(180deg, #f8fbff 0%, #eef4ff 100%); box-shadow: 0 14px 30px rgba(37, 99, 235, 0.08); }
+    .push-callout { padding: 14px 16px; border-radius: 14px; background: rgba(37, 99, 235, 0.08); border: 1px solid rgba(37, 99, 235, 0.14); color: #1e3a8a; font-size: 14px; line-height: 1.7; margin-bottom: 14px; }
+    .compact-summary-list { display: grid; gap: 8px; margin: 0 0 12px 0; padding: 0; list-style: none; }
+    .compact-summary-list li { padding: 10px 12px; border-radius: 12px; background: white; border: 1px solid #dbe4ef; font-size: 14px; color: #334155; }
+    .delta-positive { color: #166534; font-weight: 800; }
+    .delta-negative { color: #b91c1c; font-weight: 800; }
+    .delta-neutral { color: #475569; font-weight: 700; }
+    .decision-banner { border-radius: 20px; padding: 22px; margin-bottom: 18px; color: white; box-shadow: 0 18px 36px rgba(15, 23, 42, 0.16); }
+    .decision-banner.success { background: linear-gradient(135deg, #14532d 0%, #166534 100%); }
+    .decision-banner.warning { background: linear-gradient(135deg, #92400e 0%, #b45309 100%); }
+    .decision-banner.danger { background: linear-gradient(135deg, #7f1d1d 0%, #b91c1c 100%); }
+    .decision-banner.pending { background: linear-gradient(135deg, #1d4ed8 0%, #2563eb 100%); }
+    .decision-banner-kicker { font-size: 12px; font-weight: 800; letter-spacing: 0.12em; text-transform: uppercase; opacity: 0.88; }
+    .decision-banner-title { margin: 8px 0 6px 0; font-size: 36px; line-height: 1.02; font-weight: 900; letter-spacing: -0.03em; }
+    .decision-banner-subtitle { margin: 0; font-size: 16px; line-height: 1.6; max-width: 72ch; color: rgba(255,255,255,0.92); }
+    .decision-banner-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-top: 16px; }
+    .decision-banner-metrics > div { padding: 12px 14px; border-radius: 14px; background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.18); }
+    .decision-banner .metric-label { color: rgba(255,255,255,0.75); }
+    .decision-banner .metric-value { color: white; font-size: 22px; }
+    .surface-heading-row { display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+    .surface-heading-row h3 { margin: 0; font-size: 22px; }
+    .surface-badge { display: inline-flex; align-items: center; padding: 6px 10px; border-radius: 999px; font-size: 12px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; }
+    .surface-badge.success { background: #dcfce7; color: #166534; }
+    .surface-badge.warning { background: #fef3c7; color: #92400e; }
+    .surface-badge.danger { background: #fee2e2; color: #991b1b; }
+    .surface-badge.pending, .surface-badge.info { background: #dbeafe; color: #1d4ed8; }
+    .surface-kicker { font-size: 12px; font-weight: 800; letter-spacing: 0.12em; text-transform: uppercase; color: #64748b; margin: 0 0 8px 0; }
+    .surface-lead { font-size: 20px; line-height: 1.55; margin: 0 0 10px 0; font-weight: 700; }
+    .surface-copy, .surface-note { font-size: 16px; line-height: 1.7; color: #475569; margin: 0 0 12px 0; }
+    .surface-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin: 12px 0; }
+    .surface-metrics > div { background: white; border: 1px solid #e2e8f0; border-radius: 12px; padding: 10px 12px; }
+    .metric-label { display: block; font-size: 11px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b; margin-bottom: 4px; }
+    .metric-value { display: block; font-size: 18px; font-weight: 800; color: #0f172a; }
+    .surface-list { margin: 0; padding-left: 20px; color: #334155; font-size: 15px; line-height: 1.8; }
+    .chart-launch { display: block; width: 100%; padding: 0; border: 0; background: transparent; text-align: left; cursor: zoom-in; box-shadow: none; }
+    .chart-launch:hover .chart-frame { border-color: #94a3b8; box-shadow: 0 10px 22px rgba(15, 23, 42, 0.08); }
+    .chart-launch-hint { display: inline-flex; margin-top: 12px; font-size: 13px; font-weight: 700; color: #475569; }
+    .chart-frame { padding: 22px; border-radius: 18px; border: 1px solid #dbe4ef; background: white; overflow: auto; }
+    .chart-frame svg { display: block; width: 100%; height: auto; min-height: 560px; }
+    .chart-modal[hidden] { display: none; }
+    .chart-modal { position: fixed; inset: 0; z-index: 999; background: rgba(15, 23, 42, 0.72); display: flex; align-items: center; justify-content: center; padding: 16px; }
+    .chart-modal-card { width: min(1440px, 98vw); max-height: 96vh; overflow: auto; background: #ffffff; border-radius: 18px; padding: 24px; box-shadow: 0 24px 60px rgba(15, 23, 42, 0.3); }
+    .chart-modal-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .chart-modal-top h3 { margin: 0; font-size: 20px; }
+    .chart-modal-close { background: #0f172a; color: white; border: 0; border-radius: 10px; padding: 8px 12px; cursor: pointer; }
+    .chart-modal-body .chart-frame { padding: 22px; }
+    .chart-modal-body .chart-frame svg { min-height: 980px; }
+    .table-wrap { overflow: auto; border: 1px solid #e2e8f0; border-radius: 14px; background: white; }
+    .data-table { width: 100%; border-collapse: collapse; font-size: 15px; }
+    .data-table th, .data-table td { padding: 14px 16px; border-bottom: 1px solid #e2e8f0; text-align: left; vertical-align: top; }
+    .data-table thead th { background: #f8fafc; font-size: 12px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: #475569; position: sticky; top: 0; }
+    .table-status { display: inline-flex; align-items: center; gap: 6px; }
+    .status-dot { width: 10px; height: 10px; border-radius: 999px; display: inline-block; }
+    .status-dot.good { background: #16a34a; }
+    .status-dot.warning { background: #f59e0b; }
+    .status-dot.outlier { background: #dc2626; }
     details { margin-top: 10px; }
     summary { cursor: pointer; font-weight: 600; }
     .subset-panel { overflow: hidden; }
@@ -422,14 +500,18 @@ PAGE_TEMPLATE = """
         </div>
         {% if scan.preview_available %}
           <div class="roi-preview-wrap">
+            <p class="roi-preview-guidance">Draw region around gray target.</p>
             <div class="roi-preview-stage" id="roi-stage">
               <img id="roi-image" src="{{ url_for('scan_preview') }}" alt="ROI preview">
               <div id="roi-overlay" class="roi-overlay"></div>
               <div id="roi-canvas" class="roi-canvas"></div>
             </div>
+            {% if scan.preview_note %}
+              <div class="roi-preview-note">{{ scan.preview_note }}</div>
+            {% endif %}
           </div>
         {% else %}
-          <div class="meta">Preview available after scan or first render.</div>
+          <div class="meta">{{ scan.preview_warning or 'Preview available after scan or first render.' }}</div>
         {% endif %}
       </div>
 
@@ -437,7 +519,7 @@ PAGE_TEMPLATE = """
         <h2 class="section-title">Strategies</h2>
         <div class="checkbox-row">
           <label><input type="checkbox" name="target_strategies" value="median" {% if 'median' in form.target_strategies %}checked{% endif %}> median</label>
-          <label><input type="checkbox" name="target_strategies" value="brightest-valid" {% if 'brightest-valid' in form.target_strategies %}checked{% endif %}> brightest-valid</label>
+          <label><input type="checkbox" name="target_strategies" value="optimal-exposure" {% if 'optimal-exposure' in form.target_strategies or 'brightest-valid' in form.target_strategies %}checked{% endif %}> Optimal Exposure (Best Match to Gray)</label>
           <label><input id="manual_strategy" type="checkbox" name="target_strategies" value="manual" {% if 'manual' in form.target_strategies %}checked{% endif %}> manual</label>
           <label><input id="hero_strategy" type="checkbox" name="target_strategies" value="hero-camera" {% if 'hero-camera' in form.target_strategies %}checked{% endif %}> hero-camera</label>
         </div>
@@ -483,6 +565,30 @@ PAGE_TEMPLATE = """
             <a class="link-button secondary" href="{{ report_url }}" target="_blank" rel="noopener">Open Report</a>
           {% endif %}
         </div>
+      </div>
+
+      <div class="card push-card">
+        <h2 class="section-title">Push Looks to Cameras</h2>
+        <p class="section-subtitle">Write calibration corrections to connected RED cameras via RCP2.</p>
+        <div class="row">
+          <div class="field">
+            <label for="apply_cameras">Apply Camera Subset</label>
+            <input id="apply_cameras" name="apply_cameras" type="text" value="{{ form.apply_cameras }}" placeholder="GA,IC or leave blank for all payload cameras">
+          </div>
+          <div class="field">
+            <label for="verification_after_path">After-Apply Review Folder</label>
+            <input id="verification_after_path" name="verification_after_path" type="text" value="{{ form.verification_after_path }}" placeholder="/path/to/reacquired/review/output">
+          </div>
+        </div>
+        <div class="actions">
+          <button type="submit" formaction="{{ url_for('load_recommended_payload_route') }}" class="secondary">Load Recommended Payload</button>
+          <button type="submit" formaction="{{ url_for('read_current_camera_values_route') }}" class="secondary">Read Current Camera Values</button>
+          <button type="submit" formaction="{{ url_for('apply_calibration_route') }}" class="secondary">Dry Run Push</button>
+          <button type="submit" formaction="{{ url_for('apply_calibration_live_route') }}" class="secondary">Live Push</button>
+          <button type="submit" formaction="{{ url_for('verify_last_push_route') }}" class="secondary">Verify Last Push</button>
+          <button type="submit" formaction="{{ url_for('verify_apply_route') }}" class="secondary">Compare Before / After Review</button>
+        </div>
+        <div class="meta">Load Recommended Payload previews the current commit package. Read Current Camera Values queries the connected cameras in read-only mode. Push controls use the generated commit payload for the current output folder. Compare Before / After Review compares the current review output against a later reacquired review run.</div>
       </div>
     </form>
 
@@ -532,12 +638,86 @@ PAGE_TEMPLATE = """
         <pre class="log" id="task-log">{{ task.log_text }}</pre>
       </details>
     </div>
+
+    <div class="card">
+      <h2 class="section-title">Calibration Decision</h2>
+      <div id="decision-surface">{{ task.decision_surface_html | safe }}</div>
+    </div>
+
+    <div class="card">
+      <h2 class="section-title">Per-Camera Commit Table</h2>
+      <div id="commit-table-surface">{{ task.commit_table_html | safe }}</div>
+    </div>
+
+    <div class="card push-card">
+      <h2 class="section-title">Push Looks to Cameras</h2>
+      <p class="section-subtitle">Write calibration corrections to connected RED cameras via RCP2.</p>
+      <div id="push-surface">{{ task.push_surface_html | safe }}</div>
+    </div>
+
+    <div class="card">
+      <h2 class="section-title">Apply Results</h2>
+      <div id="apply-surface">{{ task.apply_surface_html | safe }}</div>
+    </div>
+
+    <div class="card">
+      <h2 class="section-title">Post-Apply Verification</h2>
+      <div id="verification-surface">{{ task.verification_surface_html | safe }}</div>
+    </div>
+  </div>
+
+  <div id="chart-modal" class="chart-modal" hidden>
+    <div class="chart-modal-card">
+      <div class="chart-modal-top">
+        <h3 id="chart-modal-title">Chart</h3>
+        <button type="button" class="chart-modal-close" id="chart-modal-close">Close</button>
+      </div>
+      <div class="chart-modal-body" id="chart-modal-body"></div>
+    </div>
   </div>
 
   <script>
     function clamp(value, min, max) {
       return Math.max(min, Math.min(max, value));
     }
+
+    function wireChartModal() {
+      const modal = document.getElementById('chart-modal');
+      const body = document.getElementById('chart-modal-body');
+      const title = document.getElementById('chart-modal-title');
+      const close = document.getElementById('chart-modal-close');
+      if (!modal || !body || !title || !close) return;
+      document.addEventListener('click', (event) => {
+        const trigger = event.target.closest('.chart-launch');
+        if (trigger) {
+          const frame = trigger.querySelector('.chart-frame');
+          title.textContent = trigger.dataset.chartTitle || 'Chart';
+          body.innerHTML = frame ? frame.outerHTML : '';
+          modal.hidden = false;
+          return;
+        }
+        if (event.target === modal || event.target === close) {
+          modal.hidden = true;
+          body.innerHTML = '';
+        }
+      });
+      document.addEventListener('keydown', (event) => {
+        const trigger = event.target.closest ? event.target.closest('.chart-launch') : null;
+        if (trigger && (event.key === 'Enter' || event.key === ' ')) {
+          event.preventDefault();
+          const frame = trigger.querySelector('.chart-frame');
+          title.textContent = trigger.dataset.chartTitle || 'Chart';
+          body.innerHTML = frame ? frame.outerHTML : '';
+          modal.hidden = false;
+          return;
+        }
+        if (event.key === 'Escape') {
+          modal.hidden = true;
+          body.innerHTML = '';
+        }
+      });
+    }
+    wireChartModal();
 
     function toggleManualReference() {
       const manual = document.getElementById('manual_strategy');
@@ -960,6 +1140,11 @@ PAGE_TEMPLATE = """
         button.onclick = openOutputFolder;
         actions.appendChild(button);
       }
+      document.getElementById('decision-surface').innerHTML = data.decision_surface_html || '';
+      document.getElementById('commit-table-surface').innerHTML = data.commit_table_html || '';
+      document.getElementById('push-surface').innerHTML = data.push_surface_html || '';
+      document.getElementById('apply-surface').innerHTML = data.apply_surface_html || '';
+      document.getElementById('verification-surface').innerHTML = data.verification_surface_html || '';
     }
     applyRoiMode();
     applySourceMode();
@@ -1061,9 +1246,29 @@ def _camera_label_from_clip_id(clip_id: str) -> str:
 def scan_sources(input_path: str) -> Dict[str, object]:
     root = Path(input_path).expanduser().resolve()
     if not input_path.strip():
-        return {"clip_count": 0, "clip_ids": [], "sample_clip_ids": [], "remaining_count": 0, "clip_records": [], "clip_groups": [], "warning": None}
+        return {
+            "clip_count": 0,
+            "clip_ids": [],
+            "sample_clip_ids": [],
+            "remaining_count": 0,
+            "clip_records": [],
+            "clip_groups": [],
+            "warning": None,
+            "preview_note": None,
+            "preview_warning": None,
+        }
     if not root.exists() or not root.is_dir():
-        return {"clip_count": 0, "clip_ids": [], "sample_clip_ids": [], "remaining_count": 0, "clip_records": [], "clip_groups": [], "warning": "Calibration folder does not exist."}
+        return {
+            "clip_count": 0,
+            "clip_ids": [],
+            "sample_clip_ids": [],
+            "remaining_count": 0,
+            "clip_records": [],
+            "clip_groups": [],
+            "warning": "Calibration folder does not exist.",
+            "preview_note": None,
+            "preview_warning": None,
+        }
     clips = discover_clips(str(root))
     clip_ids = [clip_id_from_path(str(path)) for path in clips]
     clip_records = [
@@ -1071,8 +1276,9 @@ def scan_sources(input_path: str) -> Dict[str, object]:
             "clip_id": clip_id,
             "subset_group": subset_key_from_clip_id(clip_id),
             "camera_label": _camera_label_from_clip_id(clip_id),
+            "source_path": str(path),
         }
-        for clip_id in clip_ids
+        for clip_id, path in zip(clip_ids, clips)
     ]
     grouped: Dict[str, List[str]] = {}
     for clip_id in clip_ids:
@@ -1089,6 +1295,8 @@ def scan_sources(input_path: str) -> Dict[str, object]:
         "clip_records": clip_records,
         "clip_groups": clip_groups,
         "first_clip_path": str(clips[0]) if clips else None,
+        "preview_note": None,
+        "preview_warning": None,
         "warning": None if clips else "No valid RED .R3D clips were found in the calibration folder.",
     }
 
@@ -1145,12 +1353,14 @@ def _default_form() -> Dict[str, object]:
         "roi_h": "",
         "selected_clip_ids": [],
         "selected_clip_groups": [],
-        "target_strategies": ["median", "brightest-valid"],
+        "target_strategies": ["median", "optimal-exposure"],
         "reference_clip_id": "",
         "hero_clip_id": "",
         "review_mode": "full_contact_sheet",
         "preview_mode": "calibration",
         "preview_lut": "",
+        "apply_cameras": "",
+        "verification_after_path": "",
         "roi_mode": "draw",
         "advanced_clip_selection": False,
     }
@@ -1158,7 +1368,7 @@ def _default_form() -> Dict[str, object]:
 
 def _parse_form(post_data) -> Dict[str, object]:
     form = _default_form()
-    for key in ["source_mode", "input_path", "output_path", "run_label", "ftps_reel", "ftps_clips", "ftps_cameras", "backend", "target_type", "processing_mode", "matching_domain", "roi_x", "roi_y", "roi_w", "roi_h", "reference_clip_id", "hero_clip_id", "review_mode", "preview_mode", "preview_lut", "roi_mode"]:
+    for key in ["source_mode", "input_path", "output_path", "run_label", "ftps_reel", "ftps_clips", "ftps_cameras", "backend", "target_type", "processing_mode", "matching_domain", "roi_x", "roi_y", "roi_w", "roi_h", "reference_clip_id", "hero_clip_id", "review_mode", "preview_mode", "preview_lut", "apply_cameras", "verification_after_path", "roi_mode"]:
         form[key] = post_data.get(key, form[key]).strip()
     strategies = post_data.getlist("target_strategies")
     form["target_strategies"] = strategies or []
@@ -1232,6 +1442,7 @@ class TaskState:
     status: str = "idle"
     command: str = ""
     output_path: str = ""
+    canonical_output_path: str = ""
     source_mode: str = ""
     logs: List[str] = field(default_factory=lambda: ["Ready.\n"])
     returncode: Optional[int] = None
@@ -1255,6 +1466,7 @@ class TaskState:
     finished_at: Optional[float] = None
     process: Optional[subprocess.Popen[str]] = field(default=None, repr=False, compare=False)
     lock: threading.RLock = field(default_factory=threading.RLock)
+    last_finalization_debug_signature: str = ""
 
     def append(self, text: str) -> None:
         with self.lock:
@@ -1268,6 +1480,7 @@ class TaskState:
                 "status": self.status,
                 "command": self.command,
                 "output_path": self.output_path,
+                "canonical_output_path": self.canonical_output_path,
                 "source_mode": self.source_mode,
                 "returncode": self.returncode,
                 "stage": self.stage,
@@ -1296,7 +1509,20 @@ class TaskState:
 @dataclass
 class UiState:
     form: Dict[str, object] = field(default_factory=_default_form)
-    scan: Dict[str, object] = field(default_factory=lambda: {"clip_count": 0, "clip_ids": [], "sample_clip_ids": [], "remaining_count": 0, "clip_records": [], "clip_groups": [], "warning": None, "preview_available": False})
+    scan: Dict[str, object] = field(
+        default_factory=lambda: {
+            "clip_count": 0,
+            "clip_ids": [],
+            "sample_clip_ids": [],
+            "remaining_count": 0,
+            "clip_records": [],
+            "clip_groups": [],
+            "warning": None,
+            "preview_available": False,
+            "preview_note": None,
+            "preview_warning": None,
+        }
+    )
     task: TaskState = field(default_factory=TaskState)
     error: Optional[str] = None
     message: Optional[str] = None
@@ -1348,6 +1574,907 @@ def _report_url_for_output(output_path: str, *, started_at: Optional[float] = No
     if _path_is_current(report_html, started_at=started_at):
         return url_for("artifact", path=str(report_html))
     return None
+
+
+def _load_json_path(path: Path) -> Optional[Dict[str, object]]:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _load_review_payload(output_root: Optional[Path], *, started_at: Optional[float] = None) -> Optional[Dict[str, object]]:
+    if output_root is None:
+        return None
+    path = review_payload_path_for(output_root)
+    if not _path_is_current(path, started_at=started_at):
+        return None
+    payload = _load_json_path(path)
+    if payload is not None:
+        payload["report_json_path"] = str(path)
+    return payload
+
+
+def _load_commit_payload(output_root: Optional[Path], *, started_at: Optional[float] = None) -> Optional[Dict[str, object]]:
+    if output_root is None:
+        return None
+    path = review_commit_payload_path_for(output_root)
+    if not _path_is_current(path, started_at=started_at):
+        return None
+    payload = _load_json_path(path)
+    if payload is not None:
+        payload["commit_payload_path"] = str(path)
+    return payload
+
+
+def _load_latest_apply_report(output_root: Optional[Path]) -> Optional[Dict[str, object]]:
+    if output_root is None:
+        return None
+    report_root = review_validation_path_for(output_root).parent
+    candidates = sorted(report_root.glob("*apply_report.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for path in candidates:
+        payload = _load_json_path(path)
+        if payload is None:
+            continue
+        payload.update(summarize_apply_report(payload, tolerances=operator_apply_tolerances()))
+        payload["report_path"] = str(path)
+        return payload
+    return None
+
+
+def _camera_state_report_path_for(output_root: Optional[Path]) -> Optional[Path]:
+    if output_root is None:
+        return None
+    return review_validation_path_for(output_root).parent / "rcp2_camera_state_report.json"
+
+
+def _load_latest_camera_state_report(output_root: Optional[Path]) -> Optional[Dict[str, object]]:
+    path = _camera_state_report_path_for(output_root)
+    if path is None or not path.exists():
+        return None
+    payload = _load_json_path(path)
+    if payload is not None:
+        payload["report_path"] = str(path)
+    return payload
+
+
+def _writeback_verification_report_path_for(output_root: Optional[Path]) -> Optional[Path]:
+    if output_root is None:
+        return None
+    return review_validation_path_for(output_root).parent / "rcp2_verification_report.json"
+
+
+def _load_latest_writeback_verification_report(output_root: Optional[Path]) -> Optional[Dict[str, object]]:
+    path = _writeback_verification_report_path_for(output_root)
+    if path is None or not path.exists():
+        return None
+    payload = _load_json_path(path)
+    if payload is not None:
+        payload["report_path"] = str(path)
+    return payload
+
+
+def _requested_camera_tokens(form: Dict[str, object]) -> List[str]:
+    return [item.strip() for item in str(form.get("apply_cameras", "")).split(",") if item.strip()]
+
+
+def _read_current_camera_values_report(
+    *,
+    commit_payload_path: Path,
+    report_path: Path,
+    requested_cameras: Optional[List[str]] = None,
+) -> Dict[str, object]:
+    started_at = datetime.now(timezone.utc).isoformat()
+    results: List[Dict[str, object]] = []
+    targets = load_apply_targets(str(commit_payload_path), requested_cameras=requested_cameras or None)
+    for target in targets:
+        if not str(target.inventory_camera_ip or "").strip():
+            results.append(
+                {
+                    "inventory_camera_label": target.inventory_camera_label,
+                    "inventory_camera_ip": target.inventory_camera_ip,
+                    "camera_id": target.camera_id,
+                    "clip_id": target.clip_id,
+                    "status": "disabled",
+                    "error": "No inventory camera IP is mapped for this target.",
+                    "state": {},
+                }
+            )
+            continue
+        try:
+            snapshot = read_camera_state(
+                host=target.inventory_camera_ip,
+                camera_label=target.inventory_camera_label or target.camera_id or "LIVE",
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "inventory_camera_label": target.inventory_camera_label,
+                    "inventory_camera_ip": target.inventory_camera_ip,
+                    "camera_id": target.camera_id,
+                    "clip_id": target.clip_id,
+                    "status": "failed_to_connect",
+                    "error": str(exc),
+                    "state": {},
+                }
+            )
+            continue
+        results.append(
+            {
+                "inventory_camera_label": target.inventory_camera_label,
+                "inventory_camera_ip": target.inventory_camera_ip,
+                "camera_id": target.camera_id,
+                "clip_id": target.clip_id,
+                "status": "success",
+                "error": "",
+                "state": dict(snapshot.get("state") or {}),
+                "transport_mode": snapshot.get("transport_mode"),
+                "camera_info": dict(((snapshot.get("state") or {}).get("camera_info")) or {}),
+            }
+        )
+    payload = {
+        "schema_version": "r3dmatch_rcp2_camera_state_report_v1",
+        "started_at": started_at,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "payload_path": str(commit_payload_path),
+        "requested_cameras": list(requested_cameras or []),
+        "camera_count": len(results),
+        "connected_camera_count": sum(1 for row in results if str(row.get("status") or "") == "success"),
+        "results": results,
+    }
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    payload["report_path"] = str(report_path)
+    return payload
+
+
+def _load_post_apply_verification(output_root: Optional[Path]) -> Optional[Dict[str, object]]:
+    if output_root is None:
+        return None
+    payload = _load_json_path(post_apply_verification_path_for(output_root))
+    if payload is not None:
+        payload["report_path"] = str(post_apply_verification_path_for(output_root))
+    return payload
+
+
+def _commit_readiness_surface(review_validation: Optional[Dict[str, object]]) -> Dict[str, object]:
+    if not isinstance(review_validation, dict):
+        return {
+            "state": "Ready for Review",
+            "tone": "pending",
+            "reason": "Run review to generate a recommendation, commit payload, and physical validation summary.",
+        }
+    physical_status = str(((review_validation.get("physical_validation") or {}).get("status")) or "")
+    failure_modes = list(review_validation.get("failure_modes") or [])
+    warnings = list(review_validation.get("warnings") or [])
+    recommendation = dict(review_validation.get("recommendation") or {})
+    run_assessment = dict(review_validation.get("run_assessment") or {})
+    confidence_score = float(recommendation.get("confidence_score", 0.0) or 0.0)
+    failure_codes = {str(item.get("code") or "") for item in failure_modes}
+    blocking_codes = {"exposure_out_of_range", "neutrality_failure", "unstable_kelvin"}
+    run_status = str(run_assessment.get("status") or "")
+    if review_validation.get("status") != "success" or physical_status not in {"success", "warning"}:
+        return {
+            "state": "Do Not Commit",
+            "tone": "danger",
+            "reason": "Review validation is not successful enough to commit calibration values safely.",
+        }
+    if run_status == "DO_NOT_PUSH":
+        return {
+            "state": "Do Not Commit",
+            "tone": "danger",
+            "reason": str(run_assessment.get("operator_note") or "The run is too weak to trust for later push."),
+        }
+    if run_status == "REVIEW_REQUIRED":
+        return {
+            "state": "Do Not Commit",
+            "tone": "danger",
+            "reason": str(run_assessment.get("operator_note") or "Review is required before trusting this run."),
+        }
+    if failure_codes & blocking_codes:
+        return {
+            "state": "Do Not Commit",
+            "tone": "danger",
+            "reason": "Blocking physical validation failures are still present in the review results.",
+        }
+    if run_status == "READY_WITH_WARNINGS":
+        return {
+            "state": "Commit with Warnings",
+            "tone": "warning",
+            "reason": str(run_assessment.get("operator_note") or "The run is usable, but some cameras need caution."),
+        }
+    if "excluded_cameras_present" in failure_codes:
+        return {
+            "state": "Commit with Warnings",
+            "tone": "warning",
+            "reason": "The main cluster is still usable, but one or more cameras were excluded from the safe commit set and need separate review.",
+        }
+    if warnings or "low_confidence" in failure_codes or confidence_score < 0.7:
+        return {
+            "state": "Commit with Warnings",
+            "tone": "warning",
+            "reason": "The recommendation is usable, but warnings or lower-confidence measurements should be reviewed before pushing values.",
+        }
+    return {
+        "state": "Ready for Commit",
+        "tone": "success",
+        "reason": "Physical validation passed and the current recommendation is ready to export or apply.",
+    }
+
+
+def _build_operator_surfaces(
+    *,
+    review_validation: Optional[Dict[str, object]],
+    review_payload: Optional[Dict[str, object]],
+    commit_payload: Optional[Dict[str, object]],
+    camera_state_report: Optional[Dict[str, object]],
+    apply_report: Optional[Dict[str, object]],
+    writeback_verification_report: Optional[Dict[str, object]],
+    post_apply_report: Optional[Dict[str, object]],
+    source_mode_label_text: str,
+) -> Dict[str, object]:
+    recommendation = dict((review_validation or {}).get("recommendation") or {})
+    physical = dict((review_validation or {}).get("physical_validation") or {})
+    run_assessment = dict((review_validation or {}).get("run_assessment") or (review_payload or {}).get("run_assessment") or {})
+    wb_model = dict((review_payload or {}).get("white_balance_model") or {})
+    wb_candidates = list(wb_model.get("candidates") or [])
+    chosen_model_key = str(wb_model.get("model_key") or "")
+    chosen_candidate = next((item for item in wb_candidates if str(item.get("model_key") or "") == chosen_model_key), {})
+    commit_rows: List[Dict[str, object]] = []
+    if isinstance(commit_payload, dict):
+        per_camera_note_map: Dict[str, Dict[str, object]] = {}
+        for item in commit_payload.get("per_camera_payloads", []) or []:
+            payload = _load_json_path(Path(str(item.get("path") or "")).expanduser())
+            if isinstance(payload, dict):
+                per_camera_note_map[str(payload.get("camera_id") or "")] = payload
+        for row in commit_payload.get("camera_targets", []) or []:
+            payload = per_camera_note_map.get(str(row.get("camera_id") or ""), {})
+            commit_rows.append(
+                {
+                    "inventory_camera_label": str(row.get("inventory_camera_label") or ""),
+                    "inventory_camera_ip": str(row.get("inventory_camera_ip") or ""),
+                    "camera_id": str(row.get("camera_id") or ""),
+                    "clip_id": str(row.get("clip_id") or ""),
+                    "source_path": str(payload.get("source_path") or ""),
+                    "calibration": dict(row.get("calibration") or {}),
+                    "confidence": float(row.get("confidence", 0.0) or 0.0),
+                    "trust_class": str(row.get("trust_class") or payload.get("trust_class") or ""),
+                    "trust_reason": str(row.get("trust_reason") or payload.get("trust_reason") or ""),
+                    "reference_use": str(row.get("reference_use") or payload.get("reference_use") or ""),
+                    "correction_confidence": str(row.get("correction_confidence") or payload.get("correction_confidence") or ""),
+                    "notes": [str(note) for note in payload.get("notes", []) if str(note).strip()],
+                    "excluded_from_commit": bool(row.get("excluded_from_commit")),
+                    "exclusion_reasons": [str(reason) for reason in row.get("exclusion_reasons", []) if str(reason).strip()],
+                    "safe_to_commit": not bool(row.get("excluded_from_commit")),
+                }
+            )
+        commit_rows.sort(key=_severity_for_commit_row)
+    verification_surface = post_apply_report or dict((review_validation or {}).get("post_apply_validation") or {})
+    camera_state_lookup = _current_state_lookup(camera_state_report)
+    apply_lookup = _apply_result_lookup(apply_report)
+    push_rows: List[Dict[str, object]] = []
+    for row in commit_rows:
+        calibration = dict(row.get("calibration") or {})
+        current_row = dict(camera_state_lookup.get(str(row.get("inventory_camera_label") or "")) or {})
+        current_state = dict(current_row.get("state") or {})
+        apply_row = dict(apply_lookup.get(str(row.get("inventory_camera_label") or "")) or {})
+        current_exposure = current_state.get("exposureAdjust")
+        current_kelvin = current_state.get("kelvin")
+        current_tint = current_state.get("tint")
+        new_exposure = float(calibration.get("exposureAdjust", 0.0) or 0.0)
+        new_kelvin = int(calibration.get("kelvin", 0) or 0)
+        new_tint = float(calibration.get("tint", 0.0) or 0.0)
+        if not str(row.get("inventory_camera_ip") or "").strip():
+            writeback_status = "Disabled"
+            writeback_tone = "pending"
+        elif str((apply_row.get("operator_result") or {}).get("display_status") or "") in {"applied_successfully", "applied_with_deviation"}:
+            writeback_status = "Verified"
+            writeback_tone = "success"
+        elif str(apply_row.get("status") or "") in {"failed_to_connect", "timeout"}:
+            writeback_status = "Not Reachable"
+            writeback_tone = "danger"
+        elif str(apply_row.get("status") or "") in {"rejected_by_camera", "mismatch_after_writeback"}:
+            writeback_status = "Failed"
+            writeback_tone = "danger"
+        elif current_row:
+            writeback_status = "Warning" if row.get("excluded_from_commit") else "Ready"
+            writeback_tone = "warning" if row.get("excluded_from_commit") else "success"
+        else:
+            writeback_status = "Ready" if not row.get("excluded_from_commit") else "Warning"
+            writeback_tone = "success" if not row.get("excluded_from_commit") else "warning"
+        note_bits = [
+            *[str(item) for item in row.get("exclusion_reasons", []) if str(item).strip()],
+            *[str(item) for item in row.get("notes", []) if str(item).strip()],
+            str(current_row.get("error") or "").strip(),
+            str(apply_row.get("error") or "").strip(),
+        ]
+        push_rows.append(
+            {
+                **row,
+                "current_state": current_state,
+                "current_exposure": float(current_exposure) if current_exposure is not None else None,
+                "current_kelvin": int(current_kelvin) if current_kelvin is not None else None,
+                "current_tint": float(current_tint) if current_tint is not None else None,
+                "new_exposure": new_exposure,
+                "new_kelvin": new_kelvin,
+                "new_tint": new_tint,
+                "exposure_delta": (new_exposure - float(current_exposure)) if current_exposure is not None else None,
+                "tint_delta": (new_tint - float(current_tint)) if current_tint is not None else None,
+                "reference_use": "Excluded" if row.get("excluded_from_commit") else "Included",
+                "writeback_status": writeback_status,
+                "writeback_tone": writeback_tone,
+                "notes_text": "; ".join(item for item in note_bits if item) or "Ready for camera sync.",
+                "compact_summary": f"{str(row.get('inventory_camera_label') or '')} → Exposure {_format_signed_value(new_exposure, decimals=2)}, Kelvin {new_kelvin}, Tint {_format_signed_value(new_tint, decimals=1)}",
+            }
+        )
+    return {
+        "recommendation": {
+            "strategy_label": str(((recommendation.get("recommended_strategy") or {}).get("strategy_label")) or "Pending"),
+            "strategy_key": str(((recommendation.get("recommended_strategy") or {}).get("strategy_key")) or ""),
+            "reason": str(((recommendation.get("recommended_strategy") or {}).get("reason")) or "No recommendation available yet."),
+            "hero_camera": recommendation.get("hero_camera"),
+            "hero_camera_confidence": recommendation.get("hero_camera_confidence"),
+            "confidence_score": float(recommendation.get("confidence_score", 0.0) or 0.0),
+            "recommendation_strength": str(recommendation.get("recommendation_strength") or run_assessment.get("recommendation_strength") or ""),
+            "run_status": str(recommendation.get("run_status") or run_assessment.get("status") or ""),
+            "summary_notes": [str(item) for item in recommendation.get("summary_notes", []) if str(item).strip()],
+            "source_mode_label": source_mode_label_text,
+        },
+        "run_assessment": run_assessment,
+        "white_balance_model": {
+            "model_label": str(wb_model.get("model_label") or "n/a"),
+            "model_key": chosen_model_key,
+            "shared_kelvin": wb_model.get("shared_kelvin"),
+            "shared_tint": wb_model.get("shared_tint"),
+            "candidate_count": len(wb_candidates),
+            "selection_reason": (
+                f"{str(wb_model.get('model_label') or 'Selected model')} was chosen because it kept the weighted post-neutral residual at "
+                f"{float((chosen_candidate.get('metrics') or {}).get('weighted_mean_post_neutral_residual', 0.0) or 0.0):.4f} "
+                f"while holding Kelvin scatter to {float((chosen_candidate.get('metrics') or {}).get('kelvin_axis_stddev', 0.0) or 0.0):.4f}."
+                if chosen_candidate
+                else "No white-balance model summary is available yet."
+            ),
+            "candidates": wb_candidates,
+        },
+        "physical_validation": {
+            "status": str(physical.get("status") or "pending"),
+            "exposure": dict(physical.get("exposure") or {}),
+            "neutrality": dict(physical.get("neutrality") or {}),
+            "kelvin_tint_analysis": dict(physical.get("kelvin_tint_analysis") or {}),
+            "confidence": dict(physical.get("confidence") or {}),
+            "outliers": list(physical.get("outliers") or []),
+            "excluded_cameras": list(physical.get("excluded_cameras") or []),
+            "excluded_camera_count": int(physical.get("excluded_camera_count", 0) or 0),
+            "included_camera_count": int(physical.get("included_camera_count", 0) or 0),
+            "cluster_is_usable_after_exclusions": bool(physical.get("cluster_is_usable_after_exclusions")),
+            "warnings": [str(item) for item in physical.get("warnings", []) if str(item).strip()],
+        },
+        "commit_readiness": _commit_readiness_surface(review_validation),
+        "commit_table": {
+            "camera_count": len(commit_rows),
+            "rows": commit_rows,
+        },
+        "push_surface": {
+            "payload_path": str((commit_payload or {}).get("commit_payload_path") or ""),
+            "strategy_label": str(((recommendation.get("recommended_strategy") or {}).get("strategy_label")) or "Pending"),
+            "strategy_key": str(((recommendation.get("recommended_strategy") or {}).get("strategy_key")) or ""),
+            "camera_count": len(push_rows),
+            "connected_camera_count": sum(1 for row in push_rows if row.get("current_state")),
+            "readback_verification_state": str(
+                (writeback_verification_report or {}).get("status")
+                or (apply_report or {}).get("operator_status")
+                or "not_run"
+            ),
+            "verification_mode": str((writeback_verification_report or {}).get("verification_mode") or ""),
+            "rows": push_rows,
+            "compact_summaries": [str(row.get("compact_summary") or "") for row in push_rows if str(row.get("compact_summary") or "")],
+            "current_report_path": str((camera_state_report or {}).get("report_path") or ""),
+            "verification_report_path": str((writeback_verification_report or {}).get("report_path") or ""),
+        },
+        "lightweight_visuals": dict((review_payload or {}).get("visuals") or {}),
+        "strategy_comparison": list((review_payload or {}).get("strategy_comparison") or []),
+        "camera_state_report": camera_state_report or {},
+        "writeback_verification_report": writeback_verification_report or {},
+        "apply_surface": apply_report or {},
+        "verification_surface": verification_surface or {},
+        "failure_modes": list((review_validation or {}).get("failure_modes") or []),
+    }
+
+
+def _badge_html(label: str, tone: str) -> str:
+    return f'<span class="surface-badge {html.escape(tone)}">{html.escape(label)}</span>'
+
+
+def _chart_frame_html(title: str, subtitle: str, svg: str) -> str:
+    return (
+        f"<div class='chart-launch' role='button' tabindex='0' data-chart-title='{html.escape(title)}'>"
+        f"<div class='chart-frame'>{svg}</div>"
+        f"<span class='chart-launch-hint'>{html.escape(subtitle)}</span>"
+        "</div>"
+    )
+
+
+def _format_signed_value(value: Optional[float], *, decimals: int = 2, suffix: str = "") -> str:
+    if value is None:
+        return "—"
+    numeric = float(value or 0.0)
+    sign = "+" if numeric > 0 else ""
+    return f"{sign}{numeric:.{decimals}f}{suffix}"
+
+
+def _format_delta_html(value: Optional[float], *, decimals: int = 2, suffix: str = "") -> str:
+    if value is None:
+        return "<span class='delta-neutral'>—</span>"
+    numeric = float(value or 0.0)
+    tone = "delta-positive" if numeric > 0 else "delta-negative" if numeric < 0 else "delta-neutral"
+    return f"<span class='{tone}'>{html.escape(_format_signed_value(numeric, decimals=decimals, suffix=suffix))}</span>"
+
+
+def _current_state_lookup(camera_state_report: Optional[Dict[str, object]]) -> Dict[str, Dict[str, object]]:
+    lookup: Dict[str, Dict[str, object]] = {}
+    for row in list((camera_state_report or {}).get("results") or []):
+        key = str(row.get("inventory_camera_label") or "")
+        if key:
+            lookup[key] = dict(row)
+    return lookup
+
+
+def _apply_result_lookup(apply_report: Optional[Dict[str, object]]) -> Dict[str, Dict[str, object]]:
+    lookup: Dict[str, Dict[str, object]] = {}
+    for row in list((apply_report or {}).get("results") or []):
+        key = str(row.get("inventory_camera_label") or "")
+        if key:
+            lookup[key] = dict(row)
+    return lookup
+
+
+def _severity_for_commit_row(row: Dict[str, object]) -> tuple[int, float, float]:
+    notes = " ".join(str(item) for item in row.get("notes", []) if str(item).strip()).lower()
+    calibration = dict(row.get("calibration") or {})
+    confidence = float(row.get("confidence", 0.0) or 0.0)
+    exposure_adjust = abs(float(calibration.get("exposureAdjust", 0.0) or 0.0))
+    trust_class = str(row.get("trust_class") or "")
+    if trust_class == "EXCLUDED":
+        return (0, -confidence, -exposure_adjust)
+    if trust_class == "UNTRUSTED":
+        return (1, -confidence, -exposure_adjust)
+    if trust_class == "USE_WITH_CAUTION":
+        return (2, -confidence, -exposure_adjust)
+    if row.get("excluded_from_commit"):
+        return (0, -confidence, -exposure_adjust)
+    if "outlier" in notes or confidence < 0.5 or exposure_adjust >= 1.0:
+        return (1, -confidence, -exposure_adjust)
+    if confidence < 0.75 or exposure_adjust >= 0.5:
+        return (2, -confidence, -exposure_adjust)
+    return (3, -confidence, -exposure_adjust)
+
+
+def _status_meta_for_commit_row(row: Dict[str, object]) -> tuple[str, str]:
+    trust_class = str(row.get("trust_class") or "")
+    if trust_class == "EXCLUDED":
+        return ("Excluded", "outlier")
+    if trust_class == "UNTRUSTED":
+        return ("Untrusted", "warning")
+    if trust_class == "USE_WITH_CAUTION":
+        return ("Caution", "warning")
+    if trust_class == "TRUSTED":
+        return ("Trusted", "good")
+    notes = " ".join(str(item) for item in row.get("notes", []) if str(item).strip()).lower()
+    calibration = dict(row.get("calibration") or {})
+    confidence = float(row.get("confidence", 0.0) or 0.0)
+    exposure_adjust = abs(float(calibration.get("exposureAdjust", 0.0) or 0.0))
+    if row.get("excluded_from_commit"):
+        return ("Excluded", "outlier")
+    if "outlier" in notes or confidence < 0.5 or exposure_adjust >= 1.0:
+        return ("Warning", "warning")
+    return ("Good", "good")
+
+
+def _reason_label_for_commit_row(row: Dict[str, object]) -> str:
+    if str(row.get("trust_reason") or "").strip():
+        return str(row.get("trust_reason") or "")
+    notes = " ".join(str(item) for item in row.get("notes", []) if str(item).strip()).lower()
+    confidence = float(row.get("confidence", 0.0) or 0.0)
+    calibration = dict(row.get("calibration") or {})
+    exposure_adjust = float(calibration.get("exposureAdjust", 0.0) or 0.0)
+    if row.get("excluded_from_commit"):
+        return "Excluded"
+    if exposure_adjust <= -0.75:
+        return "Underexposed"
+    if confidence < 0.5:
+        return "Low confidence"
+    return "Stable"
+
+
+def _bullet_list_html(items: List[str]) -> str:
+    cleaned = [str(item).strip() for item in items if str(item).strip()]
+    if not cleaned:
+        return "<ul class='surface-list'><li>No additional notes.</li></ul>"
+    return "<ul class='surface-list'>" + "".join(f"<li>{html.escape(item)}</li>" for item in cleaned) + "</ul>"
+
+
+def _render_decision_surface(surface: Dict[str, object]) -> str:
+    recommendation = dict(surface.get("recommendation") or {})
+    run_assessment = dict(surface.get("run_assessment") or {})
+    wb_model = dict(surface.get("white_balance_model") or {})
+    readiness = dict(surface.get("commit_readiness") or {})
+    physical = dict(surface.get("physical_validation") or {})
+    exposure = dict(physical.get("exposure") or {})
+    neutrality = dict(physical.get("neutrality") or {})
+    kelvin_tint = dict(physical.get("kelvin_tint_analysis") or {})
+    confidence = dict(physical.get("confidence") or {})
+    failure_modes = list(surface.get("failure_modes") or [])
+    visuals = dict(surface.get("lightweight_visuals") or {})
+    excluded_cameras = list(physical.get("excluded_cameras") or [])
+    readiness_state = str(readiness.get("state") or "Ready for Review")
+    readiness_tone = str(readiness.get("tone") or "pending")
+    shared_kelvin_text = "per-camera" if wb_model.get("shared_kelvin") is None else str(wb_model.get("shared_kelvin"))
+    shared_tint_text = "per-camera" if wb_model.get("shared_tint") is None else str(wb_model.get("shared_tint"))
+    failure_html = "".join(
+        f"<li><strong>{html.escape(str(item.get('code') or 'warning'))}</strong>: {html.escape(str(item.get('message') or ''))}</li>"
+        for item in failure_modes
+    ) or "<li>No blocking failure modes reported.</li>"
+    strategy_label = str(recommendation.get("strategy_label") or "Pending")
+    strategy_key = str(recommendation.get("strategy_key") or "")
+    recommendation_strength = str(recommendation.get("recommendation_strength") or run_assessment.get("recommendation_strength") or "MEDIUM_CONFIDENCE")
+    run_status = str(recommendation.get("run_status") or run_assessment.get("status") or "")
+    optimal_exposure_summary = dict(
+        next(
+            (
+                item
+                for item in list(surface.get("strategy_comparison") or [])
+                if str(item.get("strategy_key") or "") == "optimal_exposure"
+            ),
+            {},
+        )
+        or {}
+    )
+    optimal_reference = str(optimal_exposure_summary.get("reference_clip_id") or "No single camera")
+    optimal_anchor_reason = str((optimal_exposure_summary.get("selection_diagnostics") or {}).get("anchor_reason") or "")
+    decision_subline = (
+        f"{int(physical.get('excluded_camera_count', 0) or 0)} camera excluded from reference, corrections still applied."
+        if int(physical.get("excluded_camera_count", 0) or 0) == 1
+        else f"{int(physical.get('excluded_camera_count', 0) or 0)} cameras excluded from reference, corrections still applied."
+        if int(physical.get("excluded_camera_count", 0) or 0) > 1
+        else "No cameras excluded from reference in this subset."
+    )
+    summary_sentence = (
+        f"Most cameras are consistent. {int(physical.get('excluded_camera_count', 0) or 0)} camera is significantly out of family and excluded from reference."
+        if int(physical.get("excluded_camera_count", 0) or 0) == 1
+        else f"Most cameras are consistent. {int(physical.get('excluded_camera_count', 0) or 0)} cameras are excluded from reference."
+        if int(physical.get("excluded_camera_count", 0) or 0) > 1
+        else "Most cameras are consistent and the array remains usable for review."
+    )
+    why_chosen_points = [
+        "Minimizes correction spread across the stable cameras." if strategy_key == "median" else "Matches the camera already closest to correct gray exposure.",
+        "Keeps neutral error low across the array.",
+        "Avoids extreme adjustments on the remaining cluster." if strategy_key == "median" else "Uses the most trustworthy gray-match camera instead of the brightest image.",
+        str(recommendation.get("reason") or ""),
+        *[str(note) for note in recommendation.get("summary_notes", []) if str(note).strip()],
+    ]
+    if strategy_key == "median":
+        why_chosen_points.insert(
+            0,
+            "Median was chosen as a fallback because no single camera was trustworthy enough to anchor the array."
+            if optimal_anchor_reason and "fell back" in optimal_anchor_reason.lower()
+            else "Median was chosen because it kept the group more stable than a single-camera anchor.",
+        )
+    elif optimal_anchor_reason:
+        why_chosen_points.insert(0, optimal_anchor_reason)
+    if strategy_key != "optimal_exposure" and optimal_reference:
+        why_chosen_points.append(
+            f"Optimal Exposure checked {optimal_reference} as the closest gray match, but it was not selected because {optimal_anchor_reason.lower() or 'it would have pushed the rest of the group harder'}."
+        )
+    wb_points = [
+        str(wb_model.get("selection_reason") or ""),
+        f"Shared Kelvin: {shared_kelvin_text}.",
+        f"Shared Tint Anchor: {shared_tint_text}.",
+    ]
+    validation_points = [
+        summary_sentence,
+        f"Mean exposure error: {float(exposure.get('mean_exposure_error', 0.0) or 0.0):.4f}.",
+        f"Max neutral error: {float(neutrality.get('max_post_neutral_error', 0.0) or 0.0):.4f}.",
+        f"Kelvin stability: {'stable' if kelvin_tint.get('kelvin_is_stable') else 'review required'}.",
+        f"Tint variation: {'present' if kelvin_tint.get('tint_carries_variation') else 'flat'}.",
+        (
+            "The remaining cluster is still commit-worthy after exclusions."
+            if physical.get("cluster_is_usable_after_exclusions")
+            else "No exclusion-based cluster rescue is currently available."
+        ),
+    ]
+    trust_points = [
+        str(run_assessment.get("anchor_summary") or "No anchor summary available."),
+        f"Trusted cameras: {int(run_assessment.get('trusted_camera_count', 0) or 0)} / {int(run_assessment.get('camera_count', 0) or 0)}.",
+        f"Excluded cameras: {int(run_assessment.get('excluded_camera_count', 0) or 0)}.",
+        "Safe to push later." if bool(run_assessment.get("safe_to_push_later")) else "Not safe to push later without review.",
+        *[str(item) for item in run_assessment.get("gating_reasons", []) if str(item).strip()],
+    ]
+    decision_title = {
+        "Ready for Commit": "SAFE TO COMMIT",
+        "Commit with Warnings": "COMMIT WITH WARNINGS",
+        "Do Not Commit": "DO NOT COMMIT",
+        "Ready for Review": "READY FOR REVIEW",
+    }.get(readiness_state, readiness_state.upper())
+    banner_subtitle = str(readiness.get("reason") or "Run review to generate a recommendation and commit readiness summary.")
+    visuals_html = ""
+    if visuals:
+        chart_cards = []
+        if visuals.get("exposure_plot_svg"):
+            chart_cards.append(
+                "<div class='summary-panel'>"
+                "<div class='surface-heading-row'><h3>Exposure Spread</h3></div>"
+                "<p class='surface-copy'>Brighter cameras appear higher. The central blue band marks the stable cluster.</p>"
+                f"{_chart_frame_html('Exposure Spread', 'Click to enlarge', str(visuals.get('exposure_plot_svg') or ''))}"
+                "</div>"
+            )
+        if visuals.get("before_after_exposure_svg"):
+            chart_cards.append(
+                "<div class='summary-panel'>"
+                "<div class='surface-heading-row'><h3>Before / After Exposure</h3></div>"
+                "<p class='surface-copy'>Each line shows the measured camera exposure and the target the recommendation pulls it toward.</p>"
+                f"{_chart_frame_html('Before / After Exposure', 'Click to enlarge', str(visuals.get('before_after_exposure_svg') or ''))}"
+                "</div>"
+            )
+        if visuals.get("confidence_chart_svg"):
+            chart_cards.append(
+                "<div class='summary-panel'>"
+                "<div class='surface-heading-row'><h3>Confidence / Reliability</h3></div>"
+                "<p class='surface-copy'>Higher bars indicate steadier neutral samples and more trustworthy measurements.</p>"
+                f"{_chart_frame_html('Confidence / Reliability', 'Click to enlarge', str(visuals.get('confidence_chart_svg') or ''))}"
+                "</div>"
+            )
+        if visuals.get("strategy_chart_svg"):
+            chart_cards.append(
+                "<div class='summary-panel'>"
+                "<div class='surface-heading-row'><h3>Strategy Comparison</h3></div>"
+                "<p class='surface-copy'>This chart shows why the system favored the winning strategy over brighter but riskier anchors.</p>"
+                f"{_chart_frame_html('Strategy Comparison', 'Click to enlarge', str(visuals.get('strategy_chart_svg') or ''))}"
+                "</div>"
+            )
+        if visuals.get("trust_chart_svg"):
+            chart_cards.append(
+                "<div class='summary-panel'>"
+                "<div class='surface-heading-row'><h3>Camera Trust</h3></div>"
+                "<p class='surface-copy'>Trust classes summarize confidence, stability, cluster membership, and correction size.</p>"
+                f"{_chart_frame_html('Camera Trust', 'Click to enlarge', str(visuals.get('trust_chart_svg') or ''))}"
+                "</div>"
+            )
+        if visuals.get("stability_chart_svg"):
+            chart_cards.append(
+                "<div class='summary-panel'>"
+                "<div class='surface-heading-row'><h3>Sample Stability Ranking</h3></div>"
+                "<p class='surface-copy'>Lower spread means a steadier gray reading. Cameras past the threshold need caution.</p>"
+                f"{_chart_frame_html('Sample Stability Ranking', 'Click to enlarge', str(visuals.get('stability_chart_svg') or ''))}"
+                "</div>"
+            )
+        if chart_cards:
+            visuals_html = f'<div class="summary-grid" style="margin-top: 16px;">{"".join(chart_cards)}</div>'
+    return f"""
+    <div class="decision-banner {html.escape(readiness_tone)}">
+      <div class="decision-banner-kicker">Calibration Decision</div>
+      <div class="decision-banner-title">{html.escape(decision_title)}</div>
+      <p class="decision-banner-subtitle">{html.escape(banner_subtitle)}</p>
+      <p class="decision-banner-subtitle" style="margin-top:8px;font-size:15px;font-weight:700;">{html.escape(decision_subline)}</p>
+      <div class="decision-banner-metrics">
+        <div><span class="metric-label">Strategy</span><span class="metric-value">{html.escape(strategy_label)}</span></div>
+        <div><span class="metric-label">Outliers</span><span class="metric-value">{len(list(physical.get('outliers') or []))}</span></div>
+        <div><span class="metric-label">Excluded Cameras</span><span class="metric-value">{int(physical.get('excluded_camera_count', 0) or 0)}</span></div>
+        <div><span class="metric-label">Confidence</span><span class="metric-value">{float(recommendation.get('confidence_score', 0.0) or 0.0):.2f}</span></div>
+        <div><span class="metric-label">Run Status</span><span class="metric-value">{html.escape(run_status.replace('_', ' ') or readiness_state)}</span></div>
+        <div><span class="metric-label">Recommendation Strength</span><span class="metric-value">{html.escape(recommendation_strength.replace('_', ' '))}</span></div>
+      </div>
+    </div>
+    <div class="summary-grid">
+      <div class="summary-panel">
+        <div class="surface-heading-row">
+          <h3>Recommendation</h3>
+          {_badge_html(readiness_state, readiness_tone)}
+        </div>
+        <p class="surface-kicker">At A Glance</p>
+        <p class="surface-lead">{html.escape(summary_sentence)}</p>
+        <div class="surface-metrics">
+          <div><span class="metric-label">Hero Camera</span><span class="metric-value">{html.escape(str(recommendation.get('hero_camera') or 'Not selected'))}</span></div>
+          <div><span class="metric-label">Confidence</span><span class="metric-value">{float(recommendation.get('confidence_score', 0.0) or 0.0):.2f}</span></div>
+          <div><span class="metric-label">Source Mode</span><span class="metric-value">{html.escape(str(recommendation.get('source_mode_label') or ''))}</span></div>
+        </div>
+        <p class="surface-kicker">Why This Was Chosen</p>
+        {_bullet_list_html(why_chosen_points)}
+      </div>
+      <div class="summary-panel">
+        <div class="surface-heading-row">
+          <h3>White Balance Model</h3>
+          {_badge_html(html.escape(str(wb_model.get('model_label') or 'n/a')), 'info')}
+        </div>
+        <p class="surface-kicker">Model Selection</p>
+        <p class="surface-lead">{html.escape(str(wb_model.get('model_label') or 'n/a'))}</p>
+        <div class="surface-metrics">
+          <div><span class="metric-label">Shared Kelvin</span><span class="metric-value">{html.escape(shared_kelvin_text)}</span></div>
+          <div><span class="metric-label">Shared Tint Anchor</span><span class="metric-value">{html.escape(shared_tint_text)}</span></div>
+          <div><span class="metric-label">Models Compared</span><span class="metric-value">{int(wb_model.get('candidate_count', 0) or 0)}</span></div>
+        </div>
+        {_bullet_list_html(wb_points)}
+      </div>
+      <div class="summary-panel">
+        <div class="surface-heading-row">
+          <h3>Physical Validation</h3>
+          {_badge_html(str(physical.get('status') or 'pending'), 'success' if str(physical.get('status') or '') == 'success' else 'warning')}
+        </div>
+        <p class="surface-kicker">Subset Health</p>
+        <p class="surface-lead">{'Cluster usable' if physical.get('cluster_is_usable_after_exclusions') else 'Review required'}</p>
+        <div class="surface-metrics">
+          <div><span class="metric-label">Mean Exposure Error</span><span class="metric-value">{float(exposure.get('mean_exposure_error', 0.0) or 0.0):.4f}</span></div>
+          <div><span class="metric-label">Max Neutral Error</span><span class="metric-value">{float(neutrality.get('max_post_neutral_error', 0.0) or 0.0):.4f}</span></div>
+          <div><span class="metric-label">Kelvin Stability</span><span class="metric-value">{'stable' if kelvin_tint.get('kelvin_is_stable') else 'review'}</span></div>
+          <div><span class="metric-label">Tint Variation</span><span class="metric-value">{'present' if kelvin_tint.get('tint_carries_variation') else 'flat'}</span></div>
+          <div><span class="metric-label">Mean Confidence</span><span class="metric-value">{float(confidence.get('mean_confidence', 0.0) or 0.0):.2f}</span></div>
+          <div><span class="metric-label">Outliers</span><span class="metric-value">{len(list(physical.get('outliers') or []))}</span></div>
+          <div><span class="metric-label">Excluded Cameras</span><span class="metric-value">{int(physical.get('excluded_camera_count', 0) or 0)}</span></div>
+        </div>
+        {_bullet_list_html(validation_points)}
+        <p class="surface-kicker" style="margin-top:14px;">Warnings and Exclusions</p>
+        <ul class="surface-list">{failure_html}</ul>
+        {_bullet_list_html([f"{str(item.get('camera_id') or item.get('clip_id') or 'camera')}: {', '.join(str(reason) for reason in item.get('reasons', []) if str(reason).strip()) or 'review required'}" for item in excluded_cameras] or ['No cameras are currently excluded from safe commit export.'])}
+      </div>
+      <div class="summary-panel">
+        <div class="surface-heading-row">
+          <h3>Should I Trust This Run?</h3>
+          {_badge_html(run_status.replace('_', ' ') or 'Pending', readiness_tone)}
+        </div>
+        <p class="surface-kicker">Run Gating</p>
+        <p class="surface-lead">{html.escape(str(run_assessment.get('operator_note') or 'Review the trusted camera group before any later push.'))}</p>
+        {_bullet_list_html(trust_points)}
+      </div>
+    </div>
+    {visuals_html}
+    """
+
+
+def _render_commit_table(surface: Dict[str, object]) -> str:
+    rows = list((surface.get("commit_table") or {}).get("rows") or [])
+    if not rows:
+        return '<div class="empty-state">Run review to generate the per-camera commit table.</div>'
+    body = []
+    for row in rows:
+        calibration = dict(row.get("calibration") or {})
+        notes = "; ".join(str(item) for item in row.get("notes", []) if str(item).strip()) or "None"
+        status_label, status_tone = _status_meta_for_commit_row(row)
+        reason_label = _reason_label_for_commit_row(row)
+        camera_badges = _badge_html(status_label, "danger" if status_tone == "outlier" else status_tone)
+        body.append(
+            "<tr>"
+            f"<td><span class='table-status'><span class='status-dot {html.escape(status_tone)}'></span>{camera_badges}</span><div style='margin-top:8px;font-weight:800;'>{html.escape(str(row.get('inventory_camera_label') or ''))}</div><div style='margin-top:6px;color:#64748b;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;'>{html.escape(reason_label)}</div></td>"
+            f"<td>{html.escape(str(row.get('inventory_camera_ip') or ''))}</td>"
+            f"<td>{html.escape(str(row.get('clip_id') or row.get('source_path') or ''))}</td>"
+            f"<td>{html.escape(_format_signed_value(float(calibration.get('exposureAdjust', 0.0) or 0.0), decimals=3))}</td>"
+            f"<td>{int(calibration.get('kelvin', 0) or 0)}</td>"
+            f"<td>{html.escape(_format_signed_value(float(calibration.get('tint', 0.0) or 0.0), decimals=2))}</td>"
+            f"<td>{float(row.get('confidence', 0.0) or 0.0):.2f}</td>"
+            f"<td>{html.escape(notes)}</td>"
+            "</tr>"
+        )
+    return (
+        '<div class="table-wrap"><table class="data-table"><thead><tr>'
+        "<th>Status / Camera</th><th>IP</th><th>Clip / Source</th><th>Exposure Correction</th><th>Kelvin</th><th>Tint</th><th>Confidence</th><th>Warnings / Notes</th>"
+        "</tr></thead><tbody>"
+        + "".join(body)
+        + "</tbody></table></div>"
+    )
+
+
+def _render_push_surface(surface: Dict[str, object]) -> str:
+    push = dict(surface.get("push_surface") or {})
+    rows = list(push.get("rows") or [])
+    if not rows:
+        return '<div class="empty-state">Load or generate a calibration commit payload to preview the camera writeback plan.</div>'
+    metrics_html = "".join(
+        [
+            f"<div><span class='metric-label'>Payload Source</span><span class='metric-value'>{html.escape(str(Path(str(push.get('payload_path') or '')).name or 'current review payload'))}</span></div>",
+            f"<div><span class='metric-label'>Strategy</span><span class='metric-value'>{html.escape(str(push.get('strategy_label') or 'Pending'))}</span></div>",
+            f"<div><span class='metric-label'>Payload Cameras</span><span class='metric-value'>{int(push.get('camera_count', 0) or 0)}</span></div>",
+            f"<div><span class='metric-label'>Connected Cameras Detected</span><span class='metric-value'>{int(push.get('connected_camera_count', 0) or 0)}</span></div>",
+            f"<div><span class='metric-label'>Readback Verification</span><span class='metric-value'>{html.escape(str(push.get('readback_verification_state') or 'not_run').replace('_', ' '))}</span></div>",
+        ]
+    )
+    verification_mode = str(push.get("verification_mode") or "").strip()
+    compact_items = "".join(f"<li>{html.escape(str(item))}</li>" for item in list(push.get("compact_summaries") or []))
+    body = []
+    for row in rows:
+        body.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.get('inventory_camera_label') or ''))}</td>"
+            f"<td>{_format_signed_value(row.get('current_exposure'), decimals=3) if row.get('current_exposure') is not None else '—'}</td>"
+            f"<td>{_format_signed_value(row.get('new_exposure'), decimals=3)}</td>"
+            f"<td>{_format_delta_html(row.get('exposure_delta'), decimals=3)}</td>"
+            f"<td>{int(row.get('current_kelvin')) if row.get('current_kelvin') is not None else '—'}</td>"
+            f"<td>{int(row.get('new_kelvin', 0) or 0)}</td>"
+            f"<td>{_format_signed_value(row.get('current_tint'), decimals=3) if row.get('current_tint') is not None else '—'}</td>"
+            f"<td>{_format_signed_value(row.get('new_tint'), decimals=3)}</td>"
+            f"<td>{html.escape(str(row.get('reference_use') or 'Included'))}</td>"
+            f"<td>{_badge_html(str(row.get('writeback_status') or 'Ready'), str(row.get('writeback_tone') or 'pending'))}</td>"
+            f"<td>{html.escape(str(row.get('notes_text') or ''))}</td>"
+            "</tr>"
+        )
+    return (
+        "<div class='push-callout'>All exposure values shown in this push section are relative corrections applied to match the calibration target.</div>"
+        f"<div class='surface-metrics'>{metrics_html}</div>"
+        "<p class='surface-copy'>Current Exposure / New Exposure / Exposure Change describe the exposure correction value on the camera, not the gray-target measurement used internally during review.</p>"
+        + (
+            f"<p class='surface-note'>Verification mode: {html.escape(verification_mode.replace('_', ' '))}.</p>"
+            if verification_mode
+            else ""
+        )
+        +
+        f"<ul class='compact-summary-list'>{compact_items}</ul>"
+        '<div class="table-wrap"><table class="data-table"><thead><tr>'
+        "<th>Camera</th><th>Current Exposure</th><th>New Exposure</th><th>Exposure Change</th><th>Current Kelvin</th><th>New Kelvin</th><th>Current Tint</th><th>New Tint</th><th>Reference Use</th><th>Writeback Status</th><th>Notes</th>"
+        "</tr></thead><tbody>"
+        + "".join(body)
+        + "</tbody></table></div>"
+    )
+
+
+def _render_apply_surface(surface: Dict[str, object]) -> str:
+    if not surface:
+        return '<div class="empty-state">No apply report has been generated for this run yet.</div>'
+    counts = dict(surface.get("operator_status_counts") or {})
+    rows = list(surface.get("results") or [])
+    counts_html = "".join(
+        f"<div><span class='metric-label'>{html.escape(key)}</span><span class='metric-value'>{int(value)}</span></div>"
+        for key, value in sorted(counts.items())
+    ) or "<div><span class='metric-label'>Status</span><span class='metric-value'>No rows</span></div>"
+    body = []
+    for row in rows:
+        operator_result = dict(row.get("operator_result") or {})
+        requested = dict(row.get("requested") or {})
+        readback = dict(row.get("readback") or {})
+        deviations = dict(operator_result.get("deviations") or {})
+        failure_reason = str(row.get("failure_reason") or "")
+        body.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.get('inventory_camera_label') or row.get('camera_id') or ''))}</td>"
+            f"<td>{html.escape(str(operator_result.get('display_status') or row.get('status') or ''))}</td>"
+            f"<td>{html.escape(failure_reason) if failure_reason else 'n/a'}</td>"
+            f"<td>{html.escape(json.dumps(requested, separators=(', ', ': ')))}</td>"
+            f"<td>{html.escape(json.dumps(readback, separators=(', ', ': '))) if readback else 'n/a'}</td>"
+            f"<td>{html.escape(json.dumps(deviations, separators=(', ', ': '))) if deviations else 'n/a'}</td>"
+            f"<td>{html.escape(str(row.get('error') or ''))}</td>"
+            "</tr>"
+        )
+    return (
+        f"<div class='surface-metrics'>{counts_html}</div>"
+        f"<p class='surface-note'>Transport mode: {html.escape(str(surface.get('transport_mode') or ''))}. "
+        f"Operator status: {html.escape(str(surface.get('operator_status') or surface.get('status') or ''))}. "
+        f"Tolerances: {html.escape(json.dumps(surface.get('operator_tolerances') or {}, separators=(', ', ': ')))}.</p>"
+        '<div class="table-wrap"><table class="data-table"><thead><tr>'
+        "<th>Camera</th><th>Display Status</th><th>Failure Reason</th><th>Requested</th><th>Readback</th><th>Deviation</th><th>Error</th>"
+        "</tr></thead><tbody>"
+        + "".join(body)
+        + "</tbody></table></div>"
+    )
+
+
+def _render_verification_surface(surface: Dict[str, object]) -> str:
+    if not surface:
+        return '<div class="empty-state">No post-apply verification summary is available yet.</div>'
+    summary = dict(surface.get("summary") or {})
+    notes = "".join(f"<li>{html.escape(str(note))}</li>" for note in surface.get("notes", []) or []) or "<li>No verification notes.</li>"
+    mode = str(surface.get("verification_mode") or "before_after_review_comparison")
+    return f"""
+    <div class="surface-heading-row">
+      <h3>Verification Summary</h3>
+      {_badge_html(str(surface.get('status') or 'pending'), 'success' if str(surface.get('status') or '') == 'success' else 'warning')}
+    </div>
+    <div class="surface-metrics">
+      <div><span class="metric-label">Mode</span><span class="metric-value">{html.escape(mode)}</span></div>
+      <div><span class="metric-label">Exposure Improved</span><span class="metric-value">{'yes' if summary.get('exposure_improved') or summary.get('exposure_error_reduced') else 'no'}</span></div>
+      <div><span class="metric-label">Neutrality Improved</span><span class="metric-value">{'yes' if summary.get('neutrality_improved') else 'no'}</span></div>
+      <div><span class="metric-label">Variance Reduced</span><span class="metric-value">{'yes' if summary.get('variance_reduced') else 'no'}</span></div>
+    </div>
+    <ul class="surface-list">{notes}</ul>
+    """
 
 
 def _scan_summary_text(scan: Dict[str, object]) -> str:
@@ -1468,14 +2595,14 @@ def _selected_summary_text(form: Dict[str, object], scan: Dict[str, object]) -> 
 def _resolved_output_path_for_form(form: Dict[str, object], scan: Dict[str, object]) -> str:
     if not str(form.get("output_path", "")).strip():
         return ""
-    selected_clip_ids = _resolve_selected_clip_ids(form, scan)
+    selected_clip_ids = [str(item).strip() for item in form.get("selected_clip_ids", []) if str(item).strip()]
     discovered_clip_ids = [str(item) for item in scan.get("clip_ids", [])]
     selected_clip_groups = [str(item) for item in form.get("selected_clip_groups", []) if str(item).strip()]
     if (
         not str(form.get("run_label") or "").strip()
         and not selected_clip_groups
-        and selected_clip_ids
-        and selected_clip_ids == discovered_clip_ids
+        and not selected_clip_ids
+        and discovered_clip_ids
     ):
         return str(form["output_path"])
     return resolve_review_output_dir(
@@ -1500,22 +2627,77 @@ def _roi_description(form: Dict[str, object]) -> str:
     return "Draw a custom ROI on the preview image."
 
 
-def _scan_preview_path(input_path: str) -> Path:
-    token = hashlib.sha1(str(Path(input_path).expanduser().resolve()).encode("utf-8")).hexdigest()[:12]
+def _preferred_roi_preview_record(form: Dict[str, object], scan: Dict[str, object]) -> Optional[Dict[str, object]]:
+    clip_records = [dict(item) for item in scan.get("clip_records", []) if isinstance(item, dict)]
+    if not clip_records:
+        return None
+    selected_clip_ids = set(_resolve_selected_clip_ids(form, scan))
+    preferred_groups = [str(item).strip() for item in form.get("selected_clip_groups", []) if str(item).strip()]
+    available_groups = {str(item.get("subset_group") or "") for item in clip_records}
+    prioritized_groups: List[str] = []
+    if "063" in available_groups:
+        prioritized_groups.append("063")
+    for group_id in preferred_groups:
+        if group_id in available_groups and group_id not in prioritized_groups:
+            prioritized_groups.append(group_id)
+    if not prioritized_groups:
+        prioritized_groups = sorted(group_id for group_id in available_groups if group_id)
+
+    selected_records = [
+        record for record in clip_records if (not selected_clip_ids or str(record.get("clip_id") or "") in selected_clip_ids)
+    ]
+    candidates = selected_records or clip_records
+
+    def choose_by_group(group_id: str, records: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
+        matching = [record for record in records if str(record.get("subset_group") or "") == group_id]
+        if matching:
+            return sorted(matching, key=lambda item: str(item.get("clip_id") or ""))[0]
+        return None
+
+    for group_id in prioritized_groups:
+        source_records = clip_records if group_id == "063" else candidates
+        chosen = choose_by_group(group_id, source_records)
+        if chosen is not None:
+            return chosen
+    return sorted(candidates, key=lambda item: str(item.get("clip_id") or ""))[0]
+
+
+def _scan_preview_path(input_path: str, *, clip_id: str = "", preview_mode: str = "calibration") -> Path:
+    token_source = "|".join(
+        [
+            str(Path(input_path).expanduser().resolve()),
+            clip_id.strip(),
+            preview_mode.strip() or "calibration",
+        ]
+    )
+    token = hashlib.sha1(token_source.encode("utf-8")).hexdigest()[:12]
     return Path("/tmp") / f"r3dmatch_web_scan_preview_{token}.jpg"
 
 
-def _ensure_scan_preview(input_path: str, scan: Dict[str, object]) -> Optional[str]:
-    first_clip = scan.get("first_clip_path")
-    if not first_clip:
+def _ensure_scan_preview(input_path: str, scan: Dict[str, object], form: Optional[Dict[str, object]] = None) -> Optional[str]:
+    resolved_form = form or {}
+    record = _preferred_roi_preview_record(resolved_form, scan)
+    clip_path = str((record or {}).get("source_path") or scan.get("first_clip_path") or "").strip()
+    clip_id = str((record or {}).get("clip_id") or "")
+    if not clip_path:
+        scan["preview_warning"] = "No representative clip frame was available for ROI preview."
+        scan["preview_note"] = None
         return None
-    output_path = _scan_preview_path(str(input_path))
+    preview_mode = str(resolved_form.get("preview_mode") or "calibration")
+    output_path = _scan_preview_path(str(input_path), clip_id=clip_id, preview_mode=preview_mode)
     if output_path.exists():
+        subset_group = str((record or {}).get("subset_group") or "")
+        scan["preview_note"] = (
+            f"ROI preview uses {clip_id} from group {subset_group} with the active {preview_mode} preview transform."
+            if clip_id and subset_group
+            else f"ROI preview uses {clip_id} with the active {preview_mode} preview transform."
+        )
+        scan["preview_warning"] = None
         return str(output_path)
     redline_executable = _resolve_redline_executable()
     capabilities = _detect_redline_capabilities(redline_executable)
     settings = _normalize_preview_settings(
-        preview_mode="calibration",
+        preview_mode=preview_mode,
         preview_output_space=None,
         preview_output_gamma=None,
         preview_highlight_rolloff=None,
@@ -1523,7 +2705,7 @@ def _ensure_scan_preview(input_path: str, scan: Dict[str, object]) -> Optional[s
         preview_lut=None,
     )
     command = _build_redline_preview_command(
-        str(first_clip),
+        clip_path,
         output_path=str(output_path),
         frame_index=0,
         exposure_stops=None,
@@ -1537,12 +2719,25 @@ def _ensure_scan_preview(input_path: str, scan: Dict[str, object]) -> Optional[s
     )
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
     if completed.returncode != 0:
+        scan["preview_warning"] = f"ROI preview fallback in use because preview extraction failed for {clip_id or 'the selected clip'}."
+        scan["preview_note"] = None
         return None
     if not output_path.exists():
         generated_matches = sorted(output_path.parent.glob(f"{output_path.name}.*"))
         if generated_matches:
             generated_matches[0].replace(output_path)
-    return str(output_path) if output_path.exists() else None
+    if output_path.exists():
+        subset_group = str((record or {}).get("subset_group") or "")
+        scan["preview_note"] = (
+            f"ROI preview uses {clip_id} from group {subset_group} with the active {preview_mode} preview transform."
+            if clip_id and subset_group
+            else f"ROI preview uses {clip_id} with the active {preview_mode} preview transform."
+        )
+        scan["preview_warning"] = None
+        return str(output_path)
+    scan["preview_warning"] = "ROI preview fallback in use because no rendered frame was produced."
+    scan["preview_note"] = None
+    return None
 
 
 REVIEW_STAGES = [
@@ -1606,6 +2801,64 @@ def _load_review_validation(output_root: Optional[Path], *, started_at: Optional
     return payload
 
 
+def _output_root_from_validation_payload(payload: Optional[Dict[str, object]]) -> Optional[Path]:
+    if not isinstance(payload, dict):
+        return None
+    validation_path = str(payload.get("validation_path") or "").strip()
+    if not validation_path:
+        return None
+    candidate = Path(validation_path).expanduser().resolve()
+    if not candidate.exists() or candidate.name != "review_validation.json":
+        return None
+    if candidate.parent.name != "report":
+        return None
+    return candidate.parent.parent
+
+
+def _canonical_output_root_from_base(base: Dict[str, object]) -> Optional[Path]:
+    output_text = str(base.get("canonical_output_path") or base.get("output_path") or "").strip()
+    if not output_text:
+        return None
+    return Path(output_text).expanduser().resolve()
+
+
+def _finalization_debug_payload(
+    *,
+    base: Dict[str, object],
+    output_root: Optional[Path],
+    review_validation: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    validation_path = ""
+    validation_exists = False
+    parsed_status = None
+    validated_at = None
+    if isinstance(review_validation, dict):
+        validation_path = str(review_validation.get("validation_path") or "")
+        parsed_status = review_validation.get("status")
+        validated_at = review_validation.get("validated_at")
+        if validation_path:
+            validation_exists = Path(validation_path).expanduser().resolve().exists()
+    return {
+        "resolved_run_directory": str(output_root) if output_root else "",
+        "resolved_validation_path": validation_path,
+        "validation_exists": validation_exists,
+        "parsed_validation_status": parsed_status,
+        "validated_at": validated_at,
+        "returncode": base.get("returncode"),
+        "final_ui_status": base.get("status"),
+        "final_ui_stage": base.get("stage"),
+    }
+
+
+def _log_finalization_debug(task: TaskState, debug_payload: Dict[str, object]) -> None:
+    signature = json.dumps(debug_payload, sort_keys=True, default=str)
+    with task.lock:
+        if signature == task.last_finalization_debug_signature:
+            return
+        task.last_finalization_debug_signature = signature
+    LOGGER.info("review finalization debug: %s", signature)
+
+
 def _load_review_manifest(output_root: Optional[Path], *, started_at: Optional[float] = None) -> Optional[Dict[str, object]]:
     if output_root is None:
         return None
@@ -1652,10 +2905,20 @@ def _request_task_cancellation(task: TaskState) -> bool:
     return True
 
 
+def _sync_task_output_path(task: TaskState, resolved_output_path: str) -> None:
+    resolved = str(resolved_output_path or "").strip()
+    if not resolved:
+        return
+    with task.lock:
+        task.output_path = resolved
+        task.canonical_output_path = resolved
+
+
 def _infer_progress(task: TaskState) -> None:
     now = time.time()
     process_alive = _process_is_alive(task.process)
-    output_root = Path(task.output_path).expanduser().resolve() if task.output_path else None
+    resolved_output = str(task.canonical_output_path or task.output_path).strip()
+    output_root = Path(resolved_output).expanduser().resolve() if resolved_output else None
     is_review = "review-calibration" in task.command
     is_approve = "approve-master-rmd" in task.command
     review_validation = _load_review_validation(output_root, started_at=task.started_at) if is_review else None
@@ -1833,8 +3096,22 @@ def _status_payload(task: TaskState) -> Dict[str, object]:
     with task.lock:
         _infer_progress(task)
         base = task.snapshot()
-    output_root = Path(str(base["output_path"])).expanduser().resolve() if base.get("output_path") else None
+    output_root = _canonical_output_root_from_base(base)
     review_validation = _load_review_validation(output_root, started_at=float(base.get("started_at") or 0.0)) if "review-calibration" in base["command"] else None
+    canonical_output_root = _output_root_from_validation_payload(review_validation)
+    if canonical_output_root is not None and canonical_output_root != output_root:
+        output_root = canonical_output_root
+        base["canonical_output_path"] = str(canonical_output_root)
+        base["output_path"] = str(canonical_output_root)
+        with task.lock:
+            task.canonical_output_path = str(canonical_output_root)
+            task.output_path = str(canonical_output_root)
+    review_payload = _load_review_payload(output_root, started_at=float(base.get("started_at") or 0.0)) if output_root else None
+    commit_payload = _load_commit_payload(output_root, started_at=float(base.get("started_at") or 0.0)) if output_root else None
+    camera_state_report = _load_latest_camera_state_report(output_root) if output_root else None
+    apply_report = _load_latest_apply_report(output_root) if output_root else None
+    writeback_verification_report = _load_latest_writeback_verification_report(output_root) if output_root else None
+    post_apply_report = _load_post_apply_verification(output_root) if output_root else None
     resolved_review_mode = normalize_review_mode(str(base.get("review_mode") or "full_contact_sheet")) if "review-calibration" in base["command"] else ""
     stage_names = REVIEW_STAGES if "review-calibration" in base["command"] else APPROVAL_STAGES if "approve-master-rmd" in base["command"] else []
     progress_percent = int(((base["stage_index"] + (1 if base["status"] == "completed" else 0)) / max(len(stage_names), 1)) * 100) if stage_names else 0
@@ -1847,13 +3124,26 @@ def _status_payload(task: TaskState) -> Dict[str, object]:
         status_detail = validation_warnings[0]
     if not status_detail and "review-calibration" in base["command"] and base.get("status") == "failed" and base.get("returncode") == 0 and review_validation is None:
         status_detail = "Fresh review_validation.json was not produced for this run."
+    operator_surfaces = _build_operator_surfaces(
+        review_validation=review_validation,
+        review_payload=review_payload,
+        commit_payload=commit_payload,
+        camera_state_report=camera_state_report,
+        apply_report=apply_report,
+        writeback_verification_report=writeback_verification_report,
+        post_apply_report=post_apply_report,
+        source_mode_label_text=source_mode_label(str(base.get("source_mode") or "local_folder")) if base.get("source_mode") else "",
+    )
+    canonical_output_text = str(base.get("canonical_output_path") or base.get("output_path") or "")
     base.update(
         {
+            "output_path": canonical_output_text,
+            "canonical_output_path": canonical_output_text,
             "stage_names": stage_names,
             "progress_percent": progress_percent,
             "preview_pdf_url": url_for("artifact", path=base["preview_pdf_path"]) if base.get("preview_pdf_path") else None,
             "preview_html_url": url_for("artifact", path=base["preview_html_path"]) if base.get("preview_html_path") else None,
-            "output_folder": base.get("output_path"),
+            "output_folder": canonical_output_text,
             "can_cancel": can_cancel,
             "watchdog_status": base["status"],
             "last_activity_seconds": last_activity_seconds,
@@ -1862,10 +3152,21 @@ def _status_payload(task: TaskState) -> Dict[str, object]:
             "status_detail": status_detail,
             "review_validation": review_validation,
             "validation_status": review_validation.get("status") if isinstance(review_validation, dict) else None,
+            "validation_path": review_validation.get("validation_path") if isinstance(review_validation, dict) else None,
             "validation_errors": validation_errors,
             "validation_warnings": validation_warnings,
+            "decision_surface": operator_surfaces,
+            "decision_surface_html": _render_decision_surface(operator_surfaces),
+            "commit_table_html": _render_commit_table(operator_surfaces),
+            "push_surface_html": _render_push_surface(operator_surfaces),
+            "apply_surface_html": _render_apply_surface(operator_surfaces.get("apply_surface") or {}),
+            "verification_surface_html": _render_verification_surface(operator_surfaces.get("verification_surface") or {}),
         }
     )
+    if "review-calibration" in str(base.get("command") or "") and base.get("returncode") is not None:
+        debug_payload = _finalization_debug_payload(base=base, output_root=output_root, review_validation=review_validation)
+        base["finalization_debug"] = debug_payload
+        _log_finalization_debug(task, debug_payload)
     return base
 
 
@@ -1890,6 +3191,7 @@ def _start_command_task(
         task.status = "running"
         task.command = " ".join(command)
         task.output_path = output_path
+        task.canonical_output_path = output_path
         task.source_mode = source_mode
         task.logs = [f"$ {' '.join(command)}\n"]
         task.returncode = None
@@ -1907,6 +3209,7 @@ def _start_command_task(
         task.last_progress_at = task.started_at
         task.finished_at = None
         task.process = None
+        task.last_finalization_debug_signature = ""
         if "review-calibration" in task.command:
             task.total_stages = len(REVIEW_STAGES)
             task.stage_index = 0
@@ -1964,8 +3267,8 @@ def create_app() -> Flask:
         state: UiState = app.config["UI_STATE"]
         selected_clip_ids = _resolve_selected_clip_ids(state.form, state.scan)
         subset_ui = _subset_selection_ui(state.form, state.scan)
-        current_output = str(state.task.output_path or _resolved_output_path_for_form(state.form, state.scan) or state.form.get("output_path", ""))
         task_payload = _status_payload(state.task)
+        current_output = str(task_payload.get("output_folder") or _resolved_output_path_for_form(state.form, state.scan) or state.form.get("output_path", ""))
         report_url = _report_url_for_output(
             current_output,
             started_at=float(task_payload.get("started_at") or 0.0) if task_payload.get("process_alive") else None,
@@ -2004,7 +3307,7 @@ def create_app() -> Flask:
             state.scan = scan_sources(str(form["input_path"]))
             _normalize_subset_form(form, state.scan)
         state.update_form(form)
-        preview_path = _ensure_scan_preview(str(form["input_path"]), state.scan) if state.scan.get("first_clip_path") else None
+        preview_path = _ensure_scan_preview(str(form["input_path"]), state.scan, form) if state.scan.get("first_clip_path") else None
         state.scan["preview_available"] = bool(preview_path)
         state.error = state.scan["warning"] if state.scan.get("warning") else None
         state.message = None if state.error else (
@@ -2025,7 +3328,7 @@ def create_app() -> Flask:
             _normalize_subset_form(form, state.scan)
         form["resolved_output_path"] = _resolved_output_path_for_form(form, state.scan)
         state.update_form(form)
-        preview_path = _ensure_scan_preview(str(form["input_path"]), state.scan) if state.scan.get("first_clip_path") else None
+        preview_path = _ensure_scan_preview(str(form["input_path"]), state.scan, form) if state.scan.get("first_clip_path") else None
         state.scan["preview_available"] = bool(preview_path)
         error = _validate_form(form)
         state.error = error
@@ -2097,6 +3400,206 @@ def create_app() -> Flask:
         )
         return render_page()
 
+    @app.post("/apply-calibration")
+    def apply_calibration_route() -> str:
+        state: UiState = app.config["UI_STATE"]
+        form = _parse_form(request.form)
+        _normalize_subset_form(form, state.scan)
+        form["resolved_output_path"] = _resolved_output_path_for_form(form, state.scan)
+        state.update_form(form)
+        _sync_task_output_path(state.task, str(form.get("resolved_output_path") or ""))
+        if _process_is_alive(state.task.process):
+            state.error = "Wait for the current command to finish before applying calibration."
+            state.message = None
+            return render_page()
+        output_root = Path(str(form.get("resolved_output_path") or "")).expanduser().resolve()
+        commit_payload_path = review_commit_payload_path_for(output_root)
+        if not commit_payload_path.exists():
+            state.error = "No calibration commit payload exists for the current review output yet."
+            state.message = None
+            return render_page()
+        requested_cameras = [item.strip() for item in str(form.get("apply_cameras", "")).split(",") if item.strip()]
+        report_path = output_root / "report" / "rcp2_apply_report.json"
+        try:
+            result = apply_calibration_payload(
+                str(commit_payload_path),
+                out_path=str(report_path),
+                requested_cameras=requested_cameras or None,
+                live=False,
+            )
+        except Exception as exc:
+            state.error = str(exc)
+            state.message = None
+            return render_page()
+        state.error = None
+        state.message = f"Dry-run apply finished with status: {result.get('operator_status') or result.get('status')}."
+        return render_page()
+
+    @app.post("/load-recommended-payload")
+    def load_recommended_payload_route() -> str:
+        state: UiState = app.config["UI_STATE"]
+        form = _parse_form(request.form)
+        _normalize_subset_form(form, state.scan)
+        form["resolved_output_path"] = _resolved_output_path_for_form(form, state.scan)
+        state.update_form(form)
+        _sync_task_output_path(state.task, str(form.get("resolved_output_path") or ""))
+        output_root = Path(str(form.get("resolved_output_path") or "")).expanduser().resolve()
+        commit_payload_path = review_commit_payload_path_for(output_root)
+        if not commit_payload_path.exists():
+            state.error = "No calibration commit payload exists for the current review output yet."
+            state.message = None
+            return render_page()
+        requested_cameras = _requested_camera_tokens(form)
+        try:
+            targets = load_apply_targets(str(commit_payload_path), requested_cameras=requested_cameras or None)
+        except Exception as exc:
+            state.error = str(exc)
+            state.message = None
+            return render_page()
+        state.error = None
+        camera_text = f" for {len(targets)} camera{'s' if len(targets) != 1 else ''}" if targets else ""
+        state.message = f"Loaded recommended payload{camera_text} from {commit_payload_path.name}."
+        return render_page()
+
+    @app.post("/read-current-camera-values")
+    def read_current_camera_values_route() -> str:
+        state: UiState = app.config["UI_STATE"]
+        form = _parse_form(request.form)
+        _normalize_subset_form(form, state.scan)
+        form["resolved_output_path"] = _resolved_output_path_for_form(form, state.scan)
+        state.update_form(form)
+        _sync_task_output_path(state.task, str(form.get("resolved_output_path") or ""))
+        if _process_is_alive(state.task.process):
+            state.error = "Wait for the current command to finish before reading current camera values."
+            state.message = None
+            return render_page()
+        output_root = Path(str(form.get("resolved_output_path") or "")).expanduser().resolve()
+        commit_payload_path = review_commit_payload_path_for(output_root)
+        if not commit_payload_path.exists():
+            state.error = "No calibration commit payload exists for the current review output yet."
+            state.message = None
+            return render_page()
+        requested_cameras = _requested_camera_tokens(form)
+        report_path = _camera_state_report_path_for(output_root)
+        assert report_path is not None
+        try:
+            report = _read_current_camera_values_report(
+                commit_payload_path=commit_payload_path,
+                report_path=report_path,
+                requested_cameras=requested_cameras or None,
+            )
+        except Exception as exc:
+            state.error = str(exc)
+            state.message = None
+            return render_page()
+        state.error = None
+        state.message = (
+            f"Read current camera values for {int(report.get('connected_camera_count', 0) or 0)} of "
+            f"{int(report.get('camera_count', 0) or 0)} payload cameras."
+        )
+        return render_page()
+
+    @app.post("/apply-calibration-live")
+    def apply_calibration_live_route() -> str:
+        state: UiState = app.config["UI_STATE"]
+        form = _parse_form(request.form)
+        _normalize_subset_form(form, state.scan)
+        form["resolved_output_path"] = _resolved_output_path_for_form(form, state.scan)
+        state.update_form(form)
+        _sync_task_output_path(state.task, str(form.get("resolved_output_path") or ""))
+        if _process_is_alive(state.task.process):
+            state.error = "Wait for the current command to finish before applying calibration."
+            state.message = None
+            return render_page()
+        output_root = Path(str(form.get("resolved_output_path") or "")).expanduser().resolve()
+        commit_payload_path = review_commit_payload_path_for(output_root)
+        if not commit_payload_path.exists():
+            state.error = "No calibration commit payload exists for the current review output yet."
+            state.message = None
+            return render_page()
+        requested_cameras = [item.strip() for item in str(form.get("apply_cameras", "")).split(",") if item.strip()]
+        report_path = output_root / "report" / "rcp2_live_apply_report.json"
+        try:
+            result = apply_calibration_payload(
+                str(commit_payload_path),
+                out_path=str(report_path),
+                requested_cameras=requested_cameras or None,
+                live=True,
+            )
+        except Exception as exc:
+            state.error = str(exc)
+            state.message = None
+            return render_page()
+        state.error = None
+        state.message = f"Live apply finished with status: {result.get('operator_status') or result.get('status')}."
+        return render_page()
+
+    @app.post("/verify-last-push")
+    def verify_last_push_route() -> str:
+        state: UiState = app.config["UI_STATE"]
+        form = _parse_form(request.form)
+        _normalize_subset_form(form, state.scan)
+        form["resolved_output_path"] = _resolved_output_path_for_form(form, state.scan)
+        state.update_form(form)
+        _sync_task_output_path(state.task, str(form.get("resolved_output_path") or ""))
+        output_root = Path(str(form.get("resolved_output_path") or "")).expanduser().resolve()
+        commit_payload_path = review_commit_payload_path_for(output_root)
+        if not commit_payload_path.exists():
+            state.error = "No calibration commit payload exists for the current review output yet."
+            state.message = None
+            return render_page()
+        requested_cameras = _requested_camera_tokens(form)
+        verification_report_path = _writeback_verification_report_path_for(output_root)
+        assert verification_report_path is not None
+        camera_state_report = _load_latest_camera_state_report(output_root)
+        try:
+            verification_report = build_camera_verification_report(
+                str(commit_payload_path),
+                out_path=str(verification_report_path),
+                requested_cameras=requested_cameras or None,
+                camera_state_report=camera_state_report,
+            )
+        except Exception as exc:
+            state.error = str(exc)
+            state.message = None
+            return render_page()
+        state.error = None
+        mode = str(verification_report.get("verification_mode") or "unknown").replace("_", " ")
+        state.message = f"Push verification refreshed: {verification_report.get('status')} via {mode}."
+        return render_page()
+
+    @app.post("/verify-apply")
+    def verify_apply_route() -> str:
+        state: UiState = app.config["UI_STATE"]
+        form = _parse_form(request.form)
+        _normalize_subset_form(form, state.scan)
+        form["resolved_output_path"] = _resolved_output_path_for_form(form, state.scan)
+        state.update_form(form)
+        _sync_task_output_path(state.task, str(form.get("resolved_output_path") or ""))
+        output_root = str(form.get("resolved_output_path") or "").strip()
+        after_path = str(form.get("verification_after_path") or "").strip()
+        if not output_root:
+            state.error = "Output folder path is required before building a verification comparison."
+            state.message = None
+            return render_page()
+        if not after_path:
+            state.error = "After-apply review folder is required for verification comparison."
+            state.message = None
+            return render_page()
+        try:
+            result = build_post_apply_verification_from_reviews(
+                output_root,
+                after_path,
+                out_path=str(post_apply_verification_path_for(output_root)),
+            )
+        except Exception as exc:
+            state.error = str(exc)
+            state.message = None
+            return render_page()
+        state.error = None
+        state.message = f"Verification comparison finished with status: {result.get('status')}."
+        return render_page()
+
     @app.post("/cancel-run")
     def cancel_run() -> Response:
         state: UiState = app.config["UI_STATE"]
@@ -2113,7 +3616,12 @@ def create_app() -> Flask:
     @app.get("/scan-preview")
     def scan_preview() -> Response:
         state: UiState = app.config["UI_STATE"]
-        candidate = _scan_preview_path(str(state.form.get("input_path", "")))
+        record = _preferred_roi_preview_record(state.form, state.scan)
+        candidate = _scan_preview_path(
+            str(state.form.get("input_path", "")),
+            clip_id=str((record or {}).get("clip_id") or ""),
+            preview_mode=str(state.form.get("preview_mode") or "calibration"),
+        )
         if not candidate.exists():
             return redirect(url_for("index"))
         return send_file(candidate)
@@ -2137,7 +3645,8 @@ def create_app() -> Flask:
     @app.post("/open-output")
     def open_output() -> Response:
         state: UiState = app.config["UI_STATE"]
-        output_path = str(state.task.output_path or state.form.get("resolved_output_path") or state.form.get("output_path", "")).strip()
+        payload = _status_payload(state.task)
+        output_path = str(payload.get("output_folder") or state.form.get("resolved_output_path") or state.form.get("output_path", "")).strip()
         if output_path:
             subprocess.run(["open", output_path], check=False)
         return jsonify({"ok": True})
