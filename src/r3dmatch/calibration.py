@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from .color import chromaticity_variance, compute_chromaticity_medians, solve_neutral_gains
+from .commit_values import solve_white_balance_model_for_records
 from .models import (
     CalibrationLike,
     CenterCrop,
@@ -67,6 +68,10 @@ class CameraMeasurement:
     measured_rgb_chromaticity: List[float]
     saturation_fraction: float
     black_fraction: float
+    neutral_sample_log2_spread: float = 0.0
+    neutral_sample_chromaticity_spread: float = 0.0
+    as_shot_kelvin: Optional[float] = None
+    as_shot_tint: Optional[float] = None
 
 
 @dataclass
@@ -75,6 +80,10 @@ class CameraSolution:
     rgb_gains: List[float]
     luminance_preserving_gain_normalization: bool
     final_exposure_offset_with_global_intent: float
+    kelvin: Optional[int] = None
+    tint: Optional[float] = None
+    saturation: float = 1.0
+    derivation_method: Optional[str] = None
 
 
 @dataclass
@@ -83,6 +92,10 @@ class CameraQuality:
     exposure_residual_stops: float
     color_residual: float
     flags: List[str]
+    post_exposure_residual_stops: float = 0.0
+    post_color_residual: float = 0.0
+    neutral_sample_log2_spread: float = 0.0
+    neutral_sample_chromaticity_spread: float = 0.0
 
 
 @dataclass
@@ -103,6 +116,8 @@ class ArrayCalibration:
     created_at: str
     input_path: str
     mode: str
+    backend: Optional[str]
+    measurement_domain: str
     group_key: str
     target: ArrayTarget
     global_scene_intent: Dict[str, object]
@@ -917,7 +932,18 @@ def build_array_calibration_from_analysis(
         raise ValueError("array calibration requires at least one clip result")
     resolved_group_key = group_key or derive_array_group_key(input_path)
     resolved_capture_id = capture_id or Path(input_path).expanduser().resolve().name or resolved_group_key
-    measured_log2 = np.array([float(item.diagnostics["measured_log2_luminance_monitoring"]) for item in results], dtype=np.float32)
+    measured_log2 = np.array(
+        [
+            float(
+                item.diagnostics.get(
+                    "measured_log2_luminance_raw",
+                    item.diagnostics["measured_log2_luminance_monitoring"],
+                )
+            )
+            for item in results
+        ],
+        dtype=np.float32,
+    )
     measured_chroma = np.array([item.diagnostics["measured_rgb_chromaticity"] for item in results], dtype=np.float32)
     target_log2 = float(np.median(percentile_clip(measured_log2)))
     target_chroma = percentile_clip(measured_chroma[:, 0]), percentile_clip(measured_chroma[:, 1]), percentile_clip(measured_chroma[:, 2])
@@ -930,6 +956,23 @@ def build_array_calibration_from_analysis(
     print(f"[r3dmatch] shared target exposure monitoring log2={target_log2:.6f}")
     print(f"[r3dmatch] shared target chromaticity={target_rgb}")
 
+    wb_model_solution = solve_white_balance_model_for_records(
+        [
+            {
+                "clip_id": item.clip_id,
+                "measured_rgb_chromaticity": item.diagnostics["measured_rgb_chromaticity"],
+                "target_rgb_chromaticity": target_rgb,
+                "clip_metadata": item.clip_metadata.to_dict() if hasattr(item.clip_metadata, "to_dict") else None,
+                "rgb_gains": None,
+                "confidence": float(item.confidence) if float(item.confidence) > 0.0 else None,
+                "sample_log2_spread": float(item.diagnostics.get("neutral_sample_log2_spread", 0.0) or 0.0),
+                "sample_chromaticity_spread": float(item.diagnostics.get("neutral_sample_chromaticity_spread", 0.0) or 0.0),
+            }
+            for item in results
+        ],
+        target_rgb_chromaticity=target_rgb,
+    )
+
     cameras: list[CameraCalibrationEntry] = []
     for item in results:
         measured_rgb = list(item.diagnostics["measured_rgb_mean"])
@@ -941,37 +984,73 @@ def build_array_calibration_from_analysis(
         ]
         gain_norm = (raw_gains[0] * raw_gains[1] * raw_gains[2]) ** (1.0 / 3.0)
         normalized_gains = [float(value / max(gain_norm, 1e-6)) for value in raw_gains]
-        exposure_offset = float(target_log2 - item.diagnostics["measured_log2_luminance_monitoring"])
-        color_residual = float(np.linalg.norm(np.array(measured_chromaticity, dtype=np.float32) - np.array(target_rgb, dtype=np.float32)))
-        quality_confidence = max(0.0, min(1.0, float(item.confidence) * (1.0 - min(color_residual, 1.0))))
+        measured_log2_value = float(
+            item.diagnostics.get(
+                "measured_log2_luminance_raw",
+                item.diagnostics["measured_log2_luminance_monitoring"],
+            )
+        )
+        exposure_offset = float(target_log2 - measured_log2_value)
+        wb_solution = dict(wb_model_solution["clips"][item.clip_id])
+        color_residual = float(wb_solution["pre_neutral_residual"])
+        post_color_residual = float(wb_solution["post_neutral_residual"])
+        sample_log2_spread = float(item.diagnostics.get("neutral_sample_log2_spread", 0.0) or 0.0)
+        sample_chroma_spread = float(item.diagnostics.get("neutral_sample_chromaticity_spread", 0.0) or 0.0)
+        accepted_ratio = float(item.diagnostics.get("accepted_frames", 0)) / max(float(item.diagnostics.get("sampled_frames", 1)), 1.0)
+        quality_confidence = combine_confidence(
+            float(item.confidence) if float(item.confidence) > 0.0 else accepted_ratio,
+            1.0 - min(sample_log2_spread / 0.35, 1.0),
+            1.0 - min(sample_chroma_spread / 0.03, 1.0),
+            1.0 - min(post_color_residual / 0.05, 1.0),
+        )
+        flags: list[str] = []
+        if sample_log2_spread > 0.12:
+            flags.append("neutral_sample_exposure_spread_high")
+        if sample_chroma_spread > 0.02:
+            flags.append("neutral_sample_chromaticity_spread_high")
         entry = CameraCalibrationEntry(
             clip_id=item.clip_id,
             source_path=item.source_path,
             camera_id=item.clip_id.split("_", 2)[0] + "_" + item.clip_id.split("_", 2)[1] if item.clip_id.count("_") >= 1 else item.clip_id,
             group_key=resolved_group_key,
             measurement=CameraMeasurement(
-                gray_sample_count=int(item.diagnostics.get("sampled_frames", 0)),
+                gray_sample_count=int(item.diagnostics.get("neutral_sample_count", 0) or 0),
                 valid_pixel_count=int(item.diagnostics.get("valid_pixel_count", 0)),
-                measured_log2_luminance=float(item.diagnostics["measured_log2_luminance_monitoring"]),
+                measured_log2_luminance=measured_log2_value,
                 measured_rgb_mean=[float(value) for value in measured_rgb],
                 measured_rgb_chromaticity=[float(value) for value in measured_chromaticity],
-                saturation_fraction=float(item.diagnostics.get("saturation_fraction", 0.0)),
+                saturation_fraction=float(item.diagnostics.get("raw_saturation_fraction", item.diagnostics.get("saturation_fraction", 0.0))),
                 black_fraction=float(item.diagnostics.get("black_fraction", 0.0)),
+                neutral_sample_log2_spread=sample_log2_spread,
+                neutral_sample_chromaticity_spread=sample_chroma_spread,
+                as_shot_kelvin=float(wb_solution["as_shot_kelvin"]),
+                as_shot_tint=float(wb_solution["as_shot_tint"]),
             ),
             solution=CameraSolution(
                 exposure_offset_stops=exposure_offset,
                 rgb_gains=normalized_gains,
                 luminance_preserving_gain_normalization=True,
                 final_exposure_offset_with_global_intent=exposure_offset,
+                kelvin=int(wb_solution["kelvin"]),
+                tint=float(wb_solution["tint"]),
+                saturation=1.0,
+                derivation_method=str(wb_solution["method"]),
             ),
             quality=CameraQuality(
                 confidence=quality_confidence,
                 exposure_residual_stops=abs(exposure_offset),
                 color_residual=color_residual,
-                flags=[],
+                flags=flags,
+                post_exposure_residual_stops=0.0,
+                post_color_residual=post_color_residual,
+                neutral_sample_log2_spread=sample_log2_spread,
+                neutral_sample_chromaticity_spread=sample_chroma_spread,
             ),
         )
-        print(f"[r3dmatch] camera={entry.camera_id} offset={entry.solution.exposure_offset_stops:.6f} gains={entry.solution.rgb_gains}")
+        print(
+            f"[r3dmatch] camera={entry.camera_id} offset={entry.solution.exposure_offset_stops:.6f} "
+            f"gains={entry.solution.rgb_gains} kelvin={entry.solution.kelvin} tint={entry.solution.tint}"
+        )
         cameras.append(entry)
 
     return ArrayCalibration(
@@ -980,6 +1059,8 @@ def build_array_calibration_from_analysis(
         created_at=datetime.now(timezone.utc).isoformat(),
         input_path=str(Path(input_path).expanduser().resolve()),
         mode="array_gray_sphere",
+        backend=str(getattr(results[0], "backend", "") or ""),
+        measurement_domain="scene",
         group_key=resolved_group_key,
         target=ArrayTarget(
             method="robust_array_center",
@@ -996,7 +1077,19 @@ def build_array_calibration_from_analysis(
                 excluded_camera_ids=[],
             ),
         ),
-        global_scene_intent={"enabled": False, "global_exposure_offset_stops": 0.0, "notes": None},
+        global_scene_intent={
+            "enabled": False,
+            "global_exposure_offset_stops": 0.0,
+            "notes": None,
+            "white_balance_model": {
+                "model_key": wb_model_solution.get("model_key"),
+                "model_label": wb_model_solution.get("model_label"),
+                "shared_kelvin": wb_model_solution.get("shared_kelvin"),
+                "shared_tint": wb_model_solution.get("shared_tint"),
+                "metrics": wb_model_solution.get("metrics"),
+                "candidates": wb_model_solution.get("candidates", []),
+            },
+        },
         cameras=cameras,
     )
 

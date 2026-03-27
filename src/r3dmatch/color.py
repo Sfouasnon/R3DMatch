@@ -94,6 +94,7 @@ def solve_cdl_color_model(
     target_rgb_chromaticity: list[float] | tuple[float, float, float],
     measured_saturation_fraction: Optional[float] = None,
     target_saturation_fraction: Optional[float] = None,
+    allow_saturation_adjustment: bool = True,
 ) -> Dict[str, object]:
     raw_gains = [
         float(target_rgb_chromaticity[0]) / max(float(measured_rgb_chromaticity[0]), 1e-6),
@@ -102,7 +103,10 @@ def solve_cdl_color_model(
     ]
     gain_norm = max(float(np.prod(np.asarray(raw_gains, dtype=np.float32)) ** (1.0 / 3.0)), 1e-6)
     diagnostic_rgb_gains = [float(value / gain_norm) for value in raw_gains]
-    if measured_saturation_fraction is None or target_saturation_fraction is None:
+    if not allow_saturation_adjustment:
+        saturation = 1.0
+        saturation_source = "unsupported_neutral_target"
+    elif measured_saturation_fraction is None or target_saturation_fraction is None:
         saturation = 1.0
         saturation_source = "identity_fallback"
     else:

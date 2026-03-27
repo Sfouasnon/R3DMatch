@@ -328,6 +328,9 @@ def analyze_clip(
     valid_pixel_counts: list[int] = []
     saturation_fractions: list[float] = []
     black_fractions: list[float] = []
+    neutral_sample_spreads: list[float] = []
+    neutral_sample_chroma_spreads: list[float] = []
+    representative_neutral_samples: list[dict[str, object]] = []
     for frame_index, timestamp_seconds, image in backend_impl.decode_frames(
         source_path,
         start_frame=sample_plan.start_frame,
@@ -345,6 +348,10 @@ def analyze_clip(
         valid_pixel_counts.append(measurement["valid_pixel_count"])
         saturation_fractions.append(measurement["saturation_fraction"])
         black_fractions.append(measurement["black_fraction"])
+        neutral_sample_spreads.append(float(measurement.get("neutral_sample_log2_spread", 0.0) or 0.0))
+        neutral_sample_chroma_spreads.append(float(measurement.get("neutral_sample_chromaticity_spread", 0.0) or 0.0))
+        if not representative_neutral_samples and measurement.get("neutral_samples"):
+            representative_neutral_samples = list(measurement["neutral_samples"])
         if stat.accepted:
             accepted_values.append(stat.log_luminance_median)
     if not accepted_values:
@@ -381,6 +388,10 @@ def analyze_clip(
             "valid_pixel_count": int(np.median(valid_pixel_counts)) if valid_pixel_counts else 0,
             "saturation_fraction": float(np.median(saturation_fractions)) if saturation_fractions else 0.0,
             "black_fraction": float(np.median(black_fractions)) if black_fractions else 0.0,
+            "neutral_sample_count": 3,
+            "neutral_sample_log2_spread": float(np.median(neutral_sample_spreads)) if neutral_sample_spreads else 0.0,
+            "neutral_sample_chromaticity_spread": float(np.median(neutral_sample_chroma_spreads)) if neutral_sample_chroma_spreads else 0.0,
+            "neutral_samples": representative_neutral_samples,
             "calibration_roi": calibration_roi,
             "calibration_measurement_mode": "shared_roi" if calibration_roi is not None else "center_region_fallback",
             "exposure_measurement_domain": "monitoring",
@@ -458,6 +469,53 @@ def _measure_region_statistics(region: np.ndarray) -> Dict[str, object]:
     }
 
 
+def _neutral_sample_regions(region: np.ndarray) -> list[tuple[str, np.ndarray]]:
+    _, height, width = region.shape
+    sample_width = max(1, int(round(width * 0.24)))
+    sample_height = max(1, int(round(height * 0.28)))
+    center_y = height * 0.5
+    center_x_positions = [width * 0.28, width * 0.5, width * 0.72]
+    labels = ["left", "center", "right"]
+    samples: list[tuple[str, np.ndarray]] = []
+    for label, center_x in zip(labels, center_x_positions):
+        x0 = max(0, min(width - sample_width, int(round(center_x - sample_width / 2.0))))
+        y0 = max(0, min(height - sample_height, int(round(center_y - sample_height / 2.0))))
+        samples.append((label, region[:, y0:y0 + sample_height, x0:x0 + sample_width]))
+    return samples
+
+
+def _measure_three_sample_statistics(region: np.ndarray) -> Dict[str, object]:
+    sample_measurements = []
+    for label, sample_region in _neutral_sample_regions(region):
+        stats = _measure_region_statistics(sample_region)
+        sample_measurements.append(
+            {
+                "label": label,
+                "measured_log2_luminance": float(stats["measured_log2_luminance"]),
+                "measured_rgb_mean": [float(value) for value in stats["measured_rgb_mean"]],
+                "measured_rgb_chromaticity": [float(value) for value in stats["measured_rgb_chromaticity"]],
+                "valid_pixel_count": int(stats["valid_pixel_count"]),
+                "roi_variance": float(stats["roi_variance"]),
+            }
+        )
+    log2_values = np.asarray([item["measured_log2_luminance"] for item in sample_measurements], dtype=np.float32)
+    rgb_means = np.asarray([item["measured_rgb_mean"] for item in sample_measurements], dtype=np.float32)
+    chroma = np.asarray([item["measured_rgb_chromaticity"] for item in sample_measurements], dtype=np.float32)
+    rgb_mean = np.median(rgb_means, axis=0)
+    chroma_mean = np.median(chroma, axis=0)
+    return {
+        "measured_log2_luminance": float(np.median(log2_values)),
+        "measured_rgb_mean": [float(rgb_mean[0]), float(rgb_mean[1]), float(rgb_mean[2])],
+        "measured_rgb_chromaticity": [float(chroma_mean[0]), float(chroma_mean[1]), float(chroma_mean[2])],
+        "valid_pixel_count": int(np.median([item["valid_pixel_count"] for item in sample_measurements])) if sample_measurements else 0,
+        "roi_variance": float(np.median([item["roi_variance"] for item in sample_measurements])) if sample_measurements else 0.0,
+        "neutral_sample_count": len(sample_measurements),
+        "neutral_sample_log2_spread": float(np.max(log2_values) - np.min(log2_values)) if sample_measurements else 0.0,
+        "neutral_sample_chromaticity_spread": float(np.max(np.linalg.norm(chroma - chroma_mean, axis=1))) if sample_measurements else 0.0,
+        "neutral_samples": sample_measurements,
+    }
+
+
 def measure_frame_color_and_exposure(
     image: np.ndarray,
     *,
@@ -473,8 +531,10 @@ def measure_frame_color_and_exposure(
     monitoring_region = _apply_monitoring_review_transform(monitoring_region)
     monitoring_region = _extract_normalized_roi_region(monitoring_region, calibration_roi) if calibration_roi is not None else extract_center_region(monitoring_region, fraction=0.4)
 
-    raw_stats = _measure_region_statistics(raw_region)
-    monitoring_stats = _measure_region_statistics(monitoring_region)
+    raw_stats = _measure_three_sample_statistics(raw_region)
+    monitoring_stats = _measure_three_sample_statistics(monitoring_region)
+    saturation_monitoring = _measure_region_statistics(monitoring_region)
+    saturation_raw = _measure_region_statistics(raw_region)
     return {
         "measured_log2_luminance": monitoring_stats["measured_log2_luminance"],
         "measured_log2_luminance_monitoring": monitoring_stats["measured_log2_luminance"],
@@ -482,11 +542,17 @@ def measure_frame_color_and_exposure(
         "measured_rgb_mean": raw_stats["measured_rgb_mean"],
         "measured_rgb_chromaticity": raw_stats["measured_rgb_chromaticity"],
         "valid_pixel_count": monitoring_stats["valid_pixel_count"],
-        "saturation_fraction": monitoring_stats["saturation_fraction"],
-        "black_fraction": monitoring_stats["black_fraction"],
+        "saturation_fraction": saturation_monitoring["saturation_fraction"],
+        "black_fraction": saturation_monitoring["black_fraction"],
         "roi_variance": monitoring_stats["roi_variance"],
         "monitoring_roi_variance": monitoring_stats["roi_variance"],
         "raw_roi_variance": raw_stats["roi_variance"],
+        "neutral_sample_count": monitoring_stats["neutral_sample_count"],
+        "neutral_sample_log2_spread": monitoring_stats["neutral_sample_log2_spread"],
+        "neutral_sample_chromaticity_spread": raw_stats["neutral_sample_chromaticity_spread"],
+        "neutral_samples": monitoring_stats["neutral_samples"],
+        "neutral_samples_raw": raw_stats["neutral_samples"],
+        "raw_saturation_fraction": saturation_raw["saturation_fraction"],
     }
 
 

@@ -7,8 +7,9 @@ import typer
 
 from .calibration import calibrate_card_path, calibrate_color_path, calibrate_exposure_path, calibrate_sphere_path
 from .execution import CancellationError
+from .ftps_ingest import DEFAULT_FTPS_PASSWORD, DEFAULT_FTPS_USERNAME, ingest_ftps_batch, normalize_source_mode
 from .matching import analyze_path
-from .report import build_contact_sheet_report, normalize_target_strategy_name
+from .report import build_contact_sheet_report, normalize_review_mode, normalize_target_strategy_name
 from .rmd import write_rmds_from_analysis
 from .transcode import write_transcode_plan
 from .validation import validate_pipeline
@@ -229,13 +230,20 @@ def report_contact_sheet_command(
 
 @app.command("review-calibration")
 def review_calibration_command(
-    input_path: str,
+    input_path: Optional[str] = typer.Argument(None),
     out: str = typer.Option(..., "--out", help="Review output directory"),
+    source_mode: str = typer.Option("local_folder", "--source-mode", help="Source mode: local_folder or ftps_camera_pull"),
+    ftps_reel: Optional[str] = typer.Option(None, "--ftps-reel", help="FTPS reel identifier, for example 007"),
+    ftps_clips: Optional[str] = typer.Option(None, "--ftps-clips", help="FTPS clip numbers or ranges, for example 63,64-65"),
+    ftps_camera: list[str] = typer.Option([], "--ftps-camera", help="Repeat to restrict FTPS ingest to a camera subset, for example --ftps-camera AA"),
+    ftps_username: str = typer.Option(DEFAULT_FTPS_USERNAME, "--ftps-username", help="FTPS username"),
+    ftps_password: str = typer.Option(DEFAULT_FTPS_PASSWORD, "--ftps-password", help="FTPS password"),
     run_label: Optional[str] = typer.Option(None, "--run-label", help="Optional subset/run label; creates a nested run folder under --out when provided"),
     target_type: str = typer.Option(..., "--target-type", help="Target type: gray_card, gray_sphere, or color_chart"),
     processing_mode: str = typer.Option("both", "--processing-mode", help="Processing mode: exposure, color, or both"),
     mode: str = typer.Option("scene", "--mode", help="Matching mode: scene or view"),
     matching_domain: str = typer.Option("scene", "--matching-domain", help="Matching domain: scene or perceptual"),
+    review_mode: str = typer.Option("full_contact_sheet", "--review-mode", help="Review mode: full_contact_sheet or lightweight_analysis"),
     lut: Optional[str] = typer.Option(None, "--lut", help="Optional LUT override (.cube)"),
     calibration: Optional[str] = typer.Option(None, "--calibration", help="Optional legacy/single exposure calibration JSON"),
     exposure_calibration: Optional[str] = typer.Option(None, "--exposure-calibration", help="Optional exposure calibration JSON"),
@@ -261,6 +269,13 @@ def review_calibration_command(
     preview_shadow_rolloff: Optional[str] = typer.Option(None, "--preview-shadow-rolloff", help="Preview shadow rolloff"),
     preview_lut: Optional[str] = typer.Option(None, "--preview-lut", help="Optional monitoring LUT (.cube)"),
 ) -> None:
+    try:
+        resolved_source_mode = normalize_source_mode(source_mode)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if resolved_source_mode == "local_folder" and not input_path:
+        raise typer.BadParameter("input_path is required for local_folder source mode")
+    resolved_input_path = input_path or str(Path(out).expanduser().resolve() / "ingest")
     calibration_roi = None
     roi_values = [roi_x, roi_y, roi_w, roi_h]
     if any(value is not None for value in roi_values):
@@ -280,14 +295,25 @@ def review_calibration_command(
         resolved_matching_domain = normalize_matching_domain(matching_domain)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    try:
+        resolved_review_mode = normalize_review_mode(review_mode)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     payload = review_calibration(
-        input_path,
+        resolved_input_path,
         out_dir=out,
+        source_mode=resolved_source_mode,
+        ftps_reel=ftps_reel,
+        ftps_clip_spec=ftps_clips,
+        ftps_cameras=ftps_camera,
+        ftps_username=ftps_username,
+        ftps_password=ftps_password,
         run_label=run_label,
         target_type=target_type,
         processing_mode=processing_mode,
         mode=mode,
         matching_domain=resolved_matching_domain,
+        review_mode=resolved_review_mode,
         backend=backend,
         lut_override=lut,
         calibration_path=calibration,
@@ -309,6 +335,26 @@ def review_calibration_command(
         preview_highlight_rolloff=preview_highlight_rolloff,
         preview_shadow_rolloff=preview_shadow_rolloff,
         preview_lut=preview_lut,
+    )
+    typer.echo(str(payload))
+
+
+@app.command("ingest-ftps")
+def ingest_ftps_command(
+    out: str = typer.Option(..., "--out", help="Local ingest output directory"),
+    ftps_reel: str = typer.Option(..., "--ftps-reel", help="FTPS reel identifier, for example 007"),
+    ftps_clips: str = typer.Option(..., "--ftps-clips", help="FTPS clip numbers or ranges, for example 63,64-65"),
+    ftps_camera: list[str] = typer.Option([], "--ftps-camera", help="Repeat to restrict FTPS ingest to a camera subset"),
+    ftps_username: str = typer.Option(DEFAULT_FTPS_USERNAME, "--ftps-username", help="FTPS username"),
+    ftps_password: str = typer.Option(DEFAULT_FTPS_PASSWORD, "--ftps-password", help="FTPS password"),
+) -> None:
+    payload = ingest_ftps_batch(
+        out_dir=out,
+        reel_identifier=ftps_reel,
+        clip_spec=ftps_clips,
+        requested_cameras=ftps_camera,
+        username=ftps_username,
+        password=ftps_password,
     )
     typer.echo(str(payload))
 

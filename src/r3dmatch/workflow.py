@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
+import statistics
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -10,15 +13,81 @@ from typing import Dict, List, Optional
 from PIL import Image, UnidentifiedImageError
 
 from .color import is_identity_cdl_payload
+from .commit_values import build_commit_values
 from .execution import raise_if_cancelled
+from .ftps_ingest import ingest_ftps_batch, normalize_source_mode, source_mode_label
 from .identity import group_key_from_clip_id
 from .matching import analyze_path
-from .report import build_contact_sheet_report, build_review_package, clear_preview_cache, render_contact_sheet_pdf
+from .report import (
+    build_contact_sheet_report,
+    build_review_package,
+    clear_preview_cache,
+    normalize_review_mode,
+    render_contact_sheet_pdf,
+    review_mode_label,
+)
 from .rmd import write_rmd_for_clip_with_metadata
 
 
 class ReviewValidationError(RuntimeError):
     pass
+
+
+LOG3G10_MID_GRAY_CODE_VALUE = 0.3333
+LOG3G10_LIN_SLOPE = 155.975327
+LOG3G10_LIN_OFFSET = 0.01
+LOG3G10_LOG_SLOPE = 0.224282
+
+PHYSICAL_MEAN_EXPOSURE_ERROR_THRESHOLD = 0.02
+PHYSICAL_MAX_NEUTRAL_ERROR_THRESHOLD = 0.02
+PHYSICAL_EXTREME_EXPOSURE_ERROR_THRESHOLD = 0.03
+PHYSICAL_EXTREME_NEUTRAL_ERROR_THRESHOLD = 0.025
+PHYSICAL_MIN_CONFIDENCE_THRESHOLD = 0.35
+PHYSICAL_KELVIN_STDDEV_THRESHOLD = 150.0
+PHYSICAL_TINT_VARIATION_THRESHOLD = 0.1
+PHYSICAL_LOG2_SPREAD_REFERENCE = 0.25
+PHYSICAL_CHROMA_SPREAD_REFERENCE = 0.01
+PHYSICAL_ROI_VARIANCE_REFERENCE = 0.001
+
+
+def review_report_root(analysis_dir: str | Path) -> Path:
+    return Path(analysis_dir).expanduser().resolve() / "report"
+
+
+def review_payload_path_for(analysis_dir: str | Path) -> Path:
+    return review_report_root(analysis_dir) / "contact_sheet.json"
+
+
+def review_html_path_for(analysis_dir: str | Path) -> Path:
+    return review_report_root(analysis_dir) / "contact_sheet.html"
+
+
+def review_pdf_path_for(analysis_dir: str | Path) -> Path:
+    return review_report_root(analysis_dir) / "preview_contact_sheet.pdf"
+
+
+def review_manifest_path_for(analysis_dir: str | Path) -> Path:
+    return review_report_root(analysis_dir) / "review_manifest.json"
+
+
+def review_package_path_for(analysis_dir: str | Path) -> Path:
+    return review_report_root(analysis_dir) / "review_package.json"
+
+
+def review_validation_path_for(analysis_dir: str | Path) -> Path:
+    return review_report_root(analysis_dir) / "review_validation.json"
+
+
+def review_preview_commands_path_for(analysis_dir: str | Path) -> Path:
+    return Path(analysis_dir).expanduser().resolve() / "previews" / "preview_commands.json"
+
+
+def review_commit_payload_path_for(analysis_dir: str | Path) -> Path:
+    return review_report_root(analysis_dir) / "calibration_commit_payload.json"
+
+
+def review_commit_payloads_dir_for(analysis_dir: str | Path) -> Path:
+    return review_report_root(analysis_dir) / "calibration_payloads"
 
 
 def normalize_matching_domain(value: str) -> str:
@@ -117,9 +186,614 @@ def _review_preview_paths_from_payload(payload: Dict[str, object]) -> List[str]:
     return sorted(set(paths))
 
 
+def _load_optional_json(path: Path) -> Optional[Dict[str, object]]:
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _confidence_bucket(value: float) -> str:
+    if value >= 0.8:
+        return "high"
+    if value >= 0.55:
+        return "medium"
+    return "low"
+
+
+def _log3g10_encode(linear_value: float) -> float:
+    clamped = max(float(linear_value), -LOG3G10_LIN_OFFSET)
+    return math.log10((clamped + LOG3G10_LIN_OFFSET) * LOG3G10_LIN_SLOPE + 1.0) * LOG3G10_LOG_SLOPE
+
+
+def _luminance_from_rgb(rgb: List[float]) -> float:
+    return float(rgb[0]) * 0.2126 + float(rgb[1]) * 0.7152 + float(rgb[2]) * 0.0722
+
+
+def _chromaticity(rgb: List[float]) -> List[float]:
+    total = max(sum(float(value) for value in rgb), 1e-6)
+    return [float(value) / total for value in rgb]
+
+
+def _neutrality_error_from_chromaticity(chromaticity: List[float]) -> float:
+    neutral = 1.0 / 3.0
+    return max(abs(float(chromaticity[0]) - neutral), abs(float(chromaticity[1]) - neutral), abs(float(chromaticity[2]) - neutral))
+
+
+def _per_camera_validation_confidence(
+    *,
+    exposure_error: float,
+    neutrality_error: float,
+    sample_log2_spread: float,
+    sample_chromaticity_spread: float,
+    roi_variance: float,
+) -> float:
+    exposure_component = max(0.0, 1.0 - (float(exposure_error) / PHYSICAL_EXTREME_EXPOSURE_ERROR_THRESHOLD))
+    neutrality_component = max(0.0, 1.0 - (float(neutrality_error) / PHYSICAL_MAX_NEUTRAL_ERROR_THRESHOLD))
+    spread_component = 0.5 * max(0.0, 1.0 - (float(sample_log2_spread) / PHYSICAL_LOG2_SPREAD_REFERENCE))
+    spread_component += 0.5 * max(0.0, 1.0 - (float(sample_chromaticity_spread) / PHYSICAL_CHROMA_SPREAD_REFERENCE))
+    roi_component = max(0.0, 1.0 - (float(roi_variance) / PHYSICAL_ROI_VARIANCE_REFERENCE))
+    return (
+        0.40 * exposure_component
+        + 0.30 * neutrality_component
+        + 0.20 * spread_component
+        + 0.10 * roi_component
+    )
+
+
+def _build_physical_validation(analysis_root: Path) -> Dict[str, object]:
+    array_path = analysis_root / "array_calibration.json"
+    array_payload = _load_optional_json(array_path)
+    if not isinstance(array_payload, dict):
+        raise ReviewValidationError(f"Missing required artifact for physical validation: {array_path}")
+
+    analysis_dir = analysis_root / "analysis"
+    analysis_by_clip: Dict[str, Dict[str, object]] = {}
+    if analysis_dir.exists():
+        for path in analysis_dir.glob("*.analysis.json"):
+            try:
+                payload = _load_optional_json(path)
+            except Exception:
+                payload = None
+            if isinstance(payload, dict) and isinstance(payload.get("clip_id"), str):
+                analysis_by_clip[str(payload["clip_id"])] = payload
+
+    exposure_rows: List[Dict[str, object]] = []
+    neutrality_rows: List[Dict[str, object]] = []
+    confidence_rows: List[Dict[str, object]] = []
+    outliers: List[Dict[str, object]] = []
+    kelvin_values: List[float] = []
+    tint_values: List[float] = []
+
+    for camera in array_payload.get("cameras", []):
+        clip_id = str(camera.get("clip_id") or "")
+        camera_id = str(camera.get("camera_id") or clip_id)
+        measurement = camera.get("measurement") or {}
+        solution = camera.get("solution") or {}
+        quality = camera.get("quality") or {}
+        analysis_payload = analysis_by_clip.get(clip_id, {})
+        diagnostics = analysis_payload.get("diagnostics") or {}
+
+        measured_rgb = [float(value) for value in measurement.get("measured_rgb_mean", [0.0, 0.0, 0.0])]
+        gains = [float(value) for value in solution.get("rgb_gains", [1.0, 1.0, 1.0])]
+        measured_chromaticity = [float(value) for value in measurement.get("measured_rgb_chromaticity", _chromaticity(measured_rgb))]
+
+        pre_linear_luminance = _luminance_from_rgb(measured_rgb)
+        post_linear_luminance = pre_linear_luminance * (2.0 ** float(solution.get("exposure_offset_stops", 0.0) or 0.0))
+        pre_log3g10_luminance = _log3g10_encode(pre_linear_luminance)
+        post_log3g10_luminance = _log3g10_encode(post_linear_luminance)
+        exposure_error = abs(post_log3g10_luminance - LOG3G10_MID_GRAY_CODE_VALUE)
+        pre_exposure_error = abs(pre_log3g10_luminance - LOG3G10_MID_GRAY_CODE_VALUE)
+
+        post_rgb = [measured_rgb[index] * gains[index] for index in range(3)]
+        post_chromaticity = _chromaticity(post_rgb)
+        pre_neutral_error = _neutrality_error_from_chromaticity(measured_chromaticity)
+        post_neutral_error = _neutrality_error_from_chromaticity(post_chromaticity)
+
+        neutral_samples = diagnostics.get("neutral_samples") or []
+        roi_variances = [float(sample.get("roi_variance", 0.0) or 0.0) for sample in neutral_samples if isinstance(sample, dict)]
+        roi_variance = float(statistics.median(roi_variances)) if roi_variances else 0.0
+        sample_log2_spread = float(quality.get("neutral_sample_log2_spread", measurement.get("neutral_sample_log2_spread", 0.0)) or 0.0)
+        sample_chromaticity_spread = float(
+            quality.get("neutral_sample_chromaticity_spread", measurement.get("neutral_sample_chromaticity_spread", 0.0)) or 0.0
+        )
+        confidence = _per_camera_validation_confidence(
+            exposure_error=exposure_error,
+            neutrality_error=post_neutral_error,
+            sample_log2_spread=sample_log2_spread,
+            sample_chromaticity_spread=sample_chromaticity_spread,
+            roi_variance=roi_variance,
+        )
+
+        outlier_reasons: List[str] = []
+        if exposure_error > PHYSICAL_EXTREME_EXPOSURE_ERROR_THRESHOLD:
+            outlier_reasons.append("exposure_error_extreme")
+        if post_neutral_error > PHYSICAL_EXTREME_NEUTRAL_ERROR_THRESHOLD:
+            outlier_reasons.append("neutrality_error_extreme")
+        if confidence < PHYSICAL_MIN_CONFIDENCE_THRESHOLD:
+            outlier_reasons.append("validation_confidence_low")
+        if outlier_reasons:
+            outliers.append({"clip_id": clip_id, "camera_id": camera_id, "reasons": outlier_reasons})
+
+        exposure_rows.append(
+            {
+                "clip_id": clip_id,
+                "camera_id": camera_id,
+                "pre_log3g10_luminance": pre_log3g10_luminance,
+                "post_log3g10_luminance": post_log3g10_luminance,
+                "pre_exposure_error": pre_exposure_error,
+                "exposure_error": exposure_error,
+                "exposure_adjust": float(solution.get("exposure_offset_stops", 0.0) or 0.0),
+            }
+        )
+        neutrality_rows.append(
+            {
+                "clip_id": clip_id,
+                "camera_id": camera_id,
+                "pre_neutral_error": pre_neutral_error,
+                "post_neutral_error": post_neutral_error,
+                "pre_rgb_chromaticity": measured_chromaticity,
+                "post_rgb_chromaticity": post_chromaticity,
+            }
+        )
+        confidence_rows.append(
+            {
+                "clip_id": clip_id,
+                "camera_id": camera_id,
+                "confidence": confidence,
+                "roi_variance": roi_variance,
+                "sample_log2_spread": sample_log2_spread,
+                "sample_chromaticity_spread": sample_chromaticity_spread,
+            }
+        )
+        if solution.get("kelvin") is not None:
+            kelvin_values.append(float(solution.get("kelvin")))
+        if solution.get("tint") is not None:
+            tint_values.append(float(solution.get("tint")))
+
+    mean_exposure_error = float(statistics.mean(row["exposure_error"] for row in exposure_rows)) if exposure_rows else 0.0
+    max_exposure_error = float(max((row["exposure_error"] for row in exposure_rows), default=0.0))
+    mean_pre_neutral_error = float(statistics.mean(row["pre_neutral_error"] for row in neutrality_rows)) if neutrality_rows else 0.0
+    mean_post_neutral_error = float(statistics.mean(row["post_neutral_error"] for row in neutrality_rows)) if neutrality_rows else 0.0
+    max_post_neutral_error = float(max((row["post_neutral_error"] for row in neutrality_rows), default=0.0))
+    mean_confidence = float(statistics.mean(row["confidence"] for row in confidence_rows)) if confidence_rows else 0.0
+    min_confidence = float(min((row["confidence"] for row in confidence_rows), default=1.0))
+    kelvin_stddev = float(statistics.pstdev(kelvin_values)) if len(kelvin_values) > 1 else 0.0
+    tint_stddev = float(statistics.pstdev(tint_values)) if len(tint_values) > 1 else 0.0
+
+    validation_errors: List[str] = []
+    if mean_exposure_error >= PHYSICAL_MEAN_EXPOSURE_ERROR_THRESHOLD:
+        validation_errors.append(
+            f"Physical exposure validation failed: mean exposure error {mean_exposure_error:.4f} exceeds threshold {PHYSICAL_MEAN_EXPOSURE_ERROR_THRESHOLD:.4f}."
+        )
+    if max_post_neutral_error >= PHYSICAL_MAX_NEUTRAL_ERROR_THRESHOLD:
+        validation_errors.append(
+            f"Physical neutrality validation failed: max post neutral error {max_post_neutral_error:.4f} exceeds threshold {PHYSICAL_MAX_NEUTRAL_ERROR_THRESHOLD:.4f}."
+        )
+    if outliers:
+        validation_errors.append(f"Physical validation failed: {len(outliers)} extreme outlier camera(s) detected.")
+    if kelvin_stddev > PHYSICAL_KELVIN_STDDEV_THRESHOLD:
+        validation_errors.append(
+            f"Physical Kelvin validation failed: Kelvin stddev {kelvin_stddev:.2f} exceeds threshold {PHYSICAL_KELVIN_STDDEV_THRESHOLD:.2f}."
+        )
+
+    return {
+        "status": "success" if not validation_errors else "failed",
+        "errors": validation_errors,
+        "thresholds": {
+            "expected_log3g10_gray": LOG3G10_MID_GRAY_CODE_VALUE,
+            "mean_exposure_error_threshold": PHYSICAL_MEAN_EXPOSURE_ERROR_THRESHOLD,
+            "max_neutral_error_threshold": PHYSICAL_MAX_NEUTRAL_ERROR_THRESHOLD,
+            "extreme_exposure_error_threshold": PHYSICAL_EXTREME_EXPOSURE_ERROR_THRESHOLD,
+            "extreme_neutral_error_threshold": PHYSICAL_EXTREME_NEUTRAL_ERROR_THRESHOLD,
+            "minimum_confidence_threshold": PHYSICAL_MIN_CONFIDENCE_THRESHOLD,
+            "kelvin_stddev_threshold": PHYSICAL_KELVIN_STDDEV_THRESHOLD,
+        },
+        "exposure": {
+            "expected_log3g10_gray": LOG3G10_MID_GRAY_CODE_VALUE,
+            "mean_exposure_error": mean_exposure_error,
+            "max_exposure_error": max_exposure_error,
+            "per_camera": exposure_rows,
+        },
+        "neutrality": {
+            "target_rgb_chromaticity": [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
+            "mean_pre_neutral_error": mean_pre_neutral_error,
+            "mean_post_neutral_error": mean_post_neutral_error,
+            "max_post_neutral_error": max_post_neutral_error,
+            "per_camera": neutrality_rows,
+        },
+        "kelvin_tint_analysis": {
+            "kelvin_stddev": kelvin_stddev,
+            "kelvin_variance": float(statistics.pvariance(kelvin_values)) if len(kelvin_values) > 1 else 0.0,
+            "kelvin_min": min(kelvin_values) if kelvin_values else None,
+            "kelvin_max": max(kelvin_values) if kelvin_values else None,
+            "kelvin_is_stable": kelvin_stddev <= PHYSICAL_KELVIN_STDDEV_THRESHOLD,
+            "tint_stddev": tint_stddev,
+            "tint_variance": float(statistics.pvariance(tint_values)) if len(tint_values) > 1 else 0.0,
+            "tint_min": min(tint_values) if tint_values else None,
+            "tint_max": max(tint_values) if tint_values else None,
+            "tint_carries_variation": tint_stddev >= PHYSICAL_TINT_VARIATION_THRESHOLD,
+        },
+        "confidence": {
+            "mean_confidence": mean_confidence,
+            "min_confidence": min_confidence,
+            "per_camera": confidence_rows,
+        },
+        "outliers": outliers,
+    }
+
+
+def _physical_validation_capability(
+    analysis_root: Path,
+    *,
+    summary_payload: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    array_path = analysis_root / "array_calibration.json"
+    array_payload = _load_optional_json(array_path)
+    backend = str((array_payload or {}).get("backend") or (summary_payload or {}).get("backend") or "").strip().lower()
+    measurement_domain = str(
+        (array_payload or {}).get("measurement_domain")
+        or (summary_payload or {}).get("mode")
+        or ""
+    ).strip().lower()
+
+    if isinstance(array_payload, dict) and backend == "red" and measurement_domain == "scene":
+        return {"applicable": True, "reason": "physical_scene_validation_available"}
+    if isinstance(array_payload, dict):
+        return {
+            "applicable": False,
+            "status": "unsupported",
+            "warnings": [
+                "Physical validation skipped because this run is not a RED scene-domain array calibration."
+            ],
+            "reason": f"backend={backend or 'unknown'} domain={measurement_domain or 'unknown'}",
+        }
+    if backend == "red" and measurement_domain == "scene":
+        return {
+            "applicable": False,
+            "status": "failed",
+            "errors": [f"Missing required artifact for physical validation: {array_path}"],
+            "reason": "physical_scene_validation_missing_array_calibration",
+        }
+    return {
+        "applicable": False,
+        "status": "unsupported",
+        "warnings": [
+            "Physical validation skipped because this run is not a RED scene-domain array calibration."
+        ],
+        "reason": "physical_scene_validation_not_applicable",
+    }
+
+
+def _strategy_label_from_key(value: str) -> str:
+    mapping = {
+        "median": "Median",
+        "brightest_valid": "Brightest Valid",
+        "brightest-valid": "Brightest Valid",
+        "hero_camera": "Hero Camera",
+        "hero-camera": "Hero Camera",
+        "manual": "Manual Reference",
+    }
+    return mapping.get(str(value), str(value).replace("_", " ").title())
+
+
+def _build_failure_modes(physical_validation: Dict[str, object]) -> List[Dict[str, object]]:
+    thresholds = physical_validation.get("thresholds") or {}
+    exposure = physical_validation.get("exposure") or {}
+    neutrality = physical_validation.get("neutrality") or {}
+    kelvin_tint = physical_validation.get("kelvin_tint_analysis") or {}
+    confidence = physical_validation.get("confidence") or {}
+    failure_modes: List[Dict[str, object]] = []
+    if float(exposure.get("mean_exposure_error", 0.0) or 0.0) >= float(
+        thresholds.get("mean_exposure_error_threshold", PHYSICAL_MEAN_EXPOSURE_ERROR_THRESHOLD)
+    ):
+        failure_modes.append(
+            {
+                "code": "exposure_out_of_range",
+                "severity": "error",
+                "message": (
+                    f"Mean exposure error {float(exposure.get('mean_exposure_error', 0.0) or 0.0):.4f} "
+                    f"exceeds threshold {float(thresholds.get('mean_exposure_error_threshold', PHYSICAL_MEAN_EXPOSURE_ERROR_THRESHOLD)):.4f}."
+                ),
+            }
+        )
+    if float(neutrality.get("max_post_neutral_error", 0.0) or 0.0) >= float(
+        thresholds.get("max_neutral_error_threshold", PHYSICAL_MAX_NEUTRAL_ERROR_THRESHOLD)
+    ):
+        failure_modes.append(
+            {
+                "code": "neutrality_failure",
+                "severity": "error",
+                "message": (
+                    f"Max post-neutral error {float(neutrality.get('max_post_neutral_error', 0.0) or 0.0):.4f} "
+                    f"exceeds threshold {float(thresholds.get('max_neutral_error_threshold', PHYSICAL_MAX_NEUTRAL_ERROR_THRESHOLD)):.4f}."
+                ),
+            }
+        )
+    if not bool(kelvin_tint.get("kelvin_is_stable", True)):
+        failure_modes.append(
+            {
+                "code": "unstable_kelvin",
+                "severity": "error",
+                "message": (
+                    f"Kelvin spread is unstable across cameras "
+                    f"(stddev {float(kelvin_tint.get('kelvin_stddev', 0.0) or 0.0):.2f} K)."
+                ),
+            }
+        )
+    if float(confidence.get("min_confidence", 1.0) or 1.0) < float(
+        thresholds.get("minimum_confidence_threshold", PHYSICAL_MIN_CONFIDENCE_THRESHOLD)
+    ):
+        failure_modes.append(
+            {
+                "code": "low_confidence",
+                "severity": "warning",
+                "message": (
+                    f"Lowest per-camera confidence {float(confidence.get('min_confidence', 0.0) or 0.0):.3f} "
+                    f"is below threshold {float(thresholds.get('minimum_confidence_threshold', PHYSICAL_MIN_CONFIDENCE_THRESHOLD)):.3f}."
+                ),
+            }
+        )
+    return failure_modes
+
+
+def _camera_rows_for_commit_payload(
+    *,
+    report_payload: Dict[str, object],
+    array_payload: Optional[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for item in report_payload.get("per_camera_analysis", []):
+        commit_values = dict(item.get("commit_values") or {})
+        camera_id = str(item.get("camera_label") or item.get("camera_id") or item.get("clip_id") or "").strip()
+        if not camera_id or not commit_values:
+            continue
+        rows.append(
+            {
+                "camera_id": camera_id,
+                "clip_id": str(item.get("clip_id") or ""),
+                "commit_values": commit_values,
+                "confidence": float(item.get("confidence", 0.0) or 0.0),
+                "note": str(item.get("note") or ""),
+                "is_hero_camera": bool(item.get("is_hero_camera")),
+            }
+        )
+    if rows or not isinstance(array_payload, dict):
+        return rows
+    for camera in array_payload.get("cameras", []):
+        commit_values = build_commit_values(
+            exposure_adjust=float((camera.get("solution") or {}).get("exposure_offset_stops", 0.0) or 0.0),
+            rgb_gains=(camera.get("solution") or {}).get("rgb_gains"),
+            confidence=float((camera.get("quality") or {}).get("confidence", 0.0) or 0.0),
+            sample_log2_spread=float((camera.get("quality") or {}).get("neutral_sample_log2_spread", 0.0) or 0.0),
+            sample_chromaticity_spread=float((camera.get("quality") or {}).get("neutral_sample_chromaticity_spread", 0.0) or 0.0),
+            measured_rgb_chromaticity=(camera.get("measurement") or {}).get("measured_rgb_chromaticity"),
+            target_rgb_chromaticity=((array_payload.get("target") or {}).get("color") or {}).get("target_rgb_chromaticity"),
+            saturation=1.0,
+            saturation_supported=False,
+            wb_solution={
+                "kelvin": int((camera.get("solution") or {}).get("kelvin") or 5600),
+                "tint": float((camera.get("solution") or {}).get("tint", 0.0) or 0.0),
+                "method": str((camera.get("solution") or {}).get("derivation_method") or "unknown"),
+                "model_key": (((array_payload.get("global_scene_intent") or {}).get("white_balance_model") or {}).get("model_key")),
+                "model_label": (((array_payload.get("global_scene_intent") or {}).get("white_balance_model") or {}).get("model_label")),
+                "as_shot_kelvin": int((camera.get("measurement") or {}).get("as_shot_kelvin") or 5600),
+                "as_shot_tint": float((camera.get("measurement") or {}).get("as_shot_tint", 0.0) or 0.0),
+                "white_balance_axes": {"amber_blue": 0.0, "green_magenta": 0.0},
+                "predicted_white_balance_axes": {"amber_blue": 0.0, "green_magenta": 0.0},
+                "implied_rgb_gains": list((camera.get("solution") or {}).get("rgb_gains") or [1.0, 1.0, 1.0]),
+                "pre_neutral_residual": float((camera.get("quality") or {}).get("color_residual", 0.0) or 0.0),
+                "post_neutral_residual": float((camera.get("quality") or {}).get("post_color_residual", 0.0) or 0.0),
+                "confidence_weight": float((camera.get("quality") or {}).get("confidence", 1.0) or 1.0),
+            },
+        )
+        rows.append(
+            {
+                "camera_id": str(camera.get("camera_id") or camera.get("clip_id") or "").strip(),
+                "clip_id": str(camera.get("clip_id") or ""),
+                "commit_values": commit_values,
+                "confidence": float((camera.get("quality") or {}).get("confidence", 0.0) or 0.0),
+                "note": "",
+                "is_hero_camera": False,
+            }
+        )
+    return rows
+
+
+def _write_commit_payload_artifacts(
+    *,
+    analysis_root: Path,
+    report_payload: Dict[str, object],
+    array_payload: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    rows = _camera_rows_for_commit_payload(report_payload=report_payload, array_payload=array_payload)
+    payload_dir = review_commit_payloads_dir_for(analysis_root)
+    payload_dir.mkdir(parents=True, exist_ok=True)
+    mapping: Dict[str, Dict[str, object]] = {}
+    per_camera_paths: List[Dict[str, object]] = []
+    for row in rows:
+        camera_id = str(row["camera_id"])
+        commit_values = dict(row["commit_values"])
+        calibration_values = {
+            "exposureAdjust": float(commit_values.get("exposureAdjust", 0.0) or 0.0),
+            "kelvin": int(commit_values.get("kelvin", 5600) or 5600),
+            "tint": float(commit_values.get("tint", 0.0) or 0.0),
+        }
+        payload = {
+            "schema_version": "r3dmatch_rcp2_ready_v1",
+            "camera_id": camera_id,
+            "clip_id": row["clip_id"],
+            "format": "rcp2_ready",
+            "calibration": calibration_values,
+            "confidence": float(row["confidence"]),
+            "is_hero_camera": bool(row["is_hero_camera"]),
+            "notes": [str(row["note"])] if str(row["note"]).strip() else [],
+        }
+        payload_path = payload_dir / f"{camera_id}.json"
+        payload_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        mapping[camera_id] = calibration_values
+        per_camera_paths.append({"camera_id": camera_id, "path": str(payload_path)})
+
+    aggregate = {
+        "schema_version": "r3dmatch_calibration_commit_payload_v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "run_label": report_payload.get("run_label"),
+        "recommended_strategy": ((report_payload.get("recommended_strategy") or {}).get("strategy_key")),
+        "hero_camera": ((report_payload.get("hero_recommendation") or {}).get("candidate_clip_id")),
+        "cameras": mapping,
+        "per_camera_payloads": per_camera_paths,
+    }
+    aggregate_path = review_commit_payload_path_for(analysis_root)
+    aggregate_path.write_text(json.dumps(aggregate, indent=2), encoding="utf-8")
+    return {
+        "aggregate_path": str(aggregate_path),
+        "per_camera_dir": str(payload_dir),
+        "camera_count": len(mapping),
+        "mapping": mapping,
+        "per_camera_payloads": per_camera_paths,
+    }
+
+
+def _build_recommendation_layer(
+    *,
+    report_payload: Dict[str, object],
+    physical_validation: Dict[str, object],
+) -> Dict[str, object]:
+    recommended = dict(report_payload.get("recommended_strategy") or {})
+    hero = dict(report_payload.get("hero_recommendation") or {})
+    physical_confidence = float(((physical_validation.get("confidence") or {}).get("mean_confidence", 0.0)) or 0.0)
+    strategy_confidence = max(
+        0.0,
+        1.0 - float(((recommended.get("metrics") or {}).get("mean_confidence_penalty", 1.0)) or 1.0),
+    )
+    confidence_score = round((physical_confidence + strategy_confidence) / 2.0, 4) if recommended else round(physical_confidence, 4)
+    notes: List[str] = []
+    if recommended.get("reason"):
+        notes.append(str(recommended["reason"]))
+    if hero.get("reason"):
+        notes.append(str(hero["reason"]))
+    operator_note = str(report_payload.get("operator_recommendation") or "").strip()
+    if operator_note:
+        notes.append(operator_note)
+    return {
+        "recommended_strategy": {
+            "strategy_key": str(recommended.get("strategy_key") or ""),
+            "strategy_label": str(recommended.get("strategy_label") or _strategy_label_from_key(str(recommended.get("strategy_key") or ""))),
+            "reason": str(recommended.get("reason") or ""),
+            "metrics": dict(recommended.get("metrics") or {}),
+        },
+        "hero_camera": str(hero.get("candidate_clip_id") or "") or None,
+        "hero_camera_confidence": str(hero.get("confidence") or "") or None,
+        "confidence_score": confidence_score,
+        "summary_notes": notes,
+    }
+
+
+def _build_human_summary(
+    *,
+    report_payload: Dict[str, object],
+    recommendation: Dict[str, object],
+    physical_validation: Dict[str, object],
+    failure_modes: List[Dict[str, object]],
+) -> Dict[str, object]:
+    recommended = recommendation.get("recommended_strategy") or {}
+    exposure = physical_validation.get("exposure") or {}
+    neutrality = physical_validation.get("neutrality") or {}
+    exec_summary = str(report_payload.get("executive_synopsis") or "").strip()
+    if not exec_summary:
+        exec_summary = (
+            f"{recommended.get('strategy_label') or 'No strategy'} is the current recommendation. "
+            f"Mean exposure error is {float(exposure.get('mean_exposure_error', 0.0) or 0.0):.4f} and "
+            f"max post-neutral error is {float(neutrality.get('max_post_neutral_error', 0.0) or 0.0):.4f}."
+        )
+    pass_fail = (
+        "Physical validation passed and the calibration recommendation is ready for commit export."
+        if physical_validation.get("status") == "success"
+        else "Physical validation did not fully pass; review the flagged failure modes before committing calibration values."
+    )
+    per_camera_summary = [
+        {
+            "camera_id": str(item.get("camera_label") or item.get("camera_id") or item.get("clip_id") or ""),
+            "clip_id": str(item.get("clip_id") or ""),
+            "summary": str(item.get("note") or "No additional note."),
+            "confidence": float(item.get("confidence", 0.0) or 0.0),
+        }
+        for item in report_payload.get("per_camera_analysis", [])
+    ]
+    return {
+        "executive_summary": exec_summary,
+        "pass_fail_explanation": pass_fail,
+        "failure_modes_explanation": [str(item.get("message") or "") for item in failure_modes],
+        "per_camera_summary": per_camera_summary,
+    }
+
+
+def _build_post_apply_validation(
+    *,
+    report_payload: Dict[str, object],
+    physical_validation: Dict[str, object],
+    recommendation: Dict[str, object],
+) -> Dict[str, object]:
+    exposure = physical_validation.get("exposure") or {}
+    neutrality = physical_validation.get("neutrality") or {}
+    exp_rows = {str(item.get("clip_id") or ""): item for item in exposure.get("per_camera", [])}
+    neu_rows = {str(item.get("clip_id") or ""): item for item in neutrality.get("per_camera", [])}
+    per_camera: List[Dict[str, object]] = []
+    for item in report_payload.get("per_camera_analysis", []):
+        clip_id = str(item.get("clip_id") or "")
+        exp_row = exp_rows.get(clip_id, {})
+        neu_row = neu_rows.get(clip_id, {})
+        pre_exp = float(exp_row.get("pre_exposure_error", 0.0) or 0.0)
+        post_exp = float(exp_row.get("exposure_error", 0.0) or 0.0)
+        pre_neu = float(neu_row.get("pre_neutral_error", 0.0) or 0.0)
+        post_neu = float(neu_row.get("post_neutral_error", 0.0) or 0.0)
+        per_camera.append(
+            {
+                "camera_id": str(item.get("camera_label") or clip_id),
+                "clip_id": clip_id,
+                "pre_exposure_error": pre_exp,
+                "post_exposure_error": post_exp,
+                "pre_neutral_error": pre_neu,
+                "post_neutral_error": post_neu,
+                "exposure_error_reduced": post_exp <= pre_exp,
+                "neutrality_improved": post_neu <= pre_neu,
+                "variance_reduced": (post_exp + post_neu) <= (pre_exp + pre_neu),
+            }
+        )
+    pre_mean_exp = float(statistics.mean(item["pre_exposure_error"] for item in per_camera)) if per_camera else 0.0
+    post_mean_exp = float(statistics.mean(item["post_exposure_error"] for item in per_camera)) if per_camera else 0.0
+    pre_mean_neu = float(statistics.mean(item["pre_neutral_error"] for item in per_camera)) if per_camera else 0.0
+    post_mean_neu = float(statistics.mean(item["post_neutral_error"] for item in per_camera)) if per_camera else 0.0
+    pre_combined = [item["pre_exposure_error"] + item["pre_neutral_error"] for item in per_camera]
+    post_combined = [item["post_exposure_error"] + item["post_neutral_error"] for item in per_camera]
+    pre_var = float(statistics.pvariance(pre_combined)) if len(pre_combined) > 1 else 0.0
+    post_var = float(statistics.pvariance(post_combined)) if len(post_combined) > 1 else 0.0
+    improved = post_mean_exp <= pre_mean_exp and post_mean_neu <= pre_mean_neu and post_var <= pre_var
+    return {
+        "status": "success" if improved else "warning",
+        "verification_mode": "modeled_from_recommended_commit_values",
+        "recommended_strategy": (recommendation.get("recommended_strategy") or {}).get("strategy_key"),
+        "summary": {
+            "pre_mean_exposure_error": pre_mean_exp,
+            "post_mean_exposure_error": post_mean_exp,
+            "pre_mean_neutral_error": pre_mean_neu,
+            "post_mean_neutral_error": post_mean_neu,
+            "pre_combined_variance": pre_var,
+            "post_combined_variance": post_var,
+            "exposure_error_reduced": post_mean_exp <= pre_mean_exp,
+            "neutrality_improved": post_mean_neu <= pre_mean_neu,
+            "variance_reduced": post_var <= pre_var,
+        },
+        "notes": [
+            "This verification pass is modeled from the solved correction residuals and physical validation outputs.",
+            "Automated camera re-measurement after apply is not yet implemented in this loop.",
+        ],
+        "per_camera": per_camera,
+    }
+
+
 def validate_review_run_contract(analysis_dir: str) -> Dict[str, object]:
     analysis_root = Path(analysis_dir).expanduser().resolve()
-    report_root = analysis_root / "report"
+    report_root = review_report_root(analysis_root)
     result: Dict[str, object] = {
         "analysis_dir": str(analysis_root),
         "report_dir": str(report_root),
@@ -135,14 +809,14 @@ def validate_review_run_contract(analysis_dir: str) -> Dict[str, object]:
 
     required_paths = {
         "summary_json": analysis_root / "summary.json",
-        "contact_sheet_json": report_root / "contact_sheet.json",
-        "review_manifest_json": report_root / "review_manifest.json",
-        "review_package_json": report_root / "review_package.json",
-        "preview_commands_json": analysis_root / "previews" / "preview_commands.json",
+        "contact_sheet_json": review_payload_path_for(analysis_root),
+        "review_manifest_json": review_manifest_path_for(analysis_root),
+        "review_package_json": review_package_path_for(analysis_root),
+        "preview_commands_json": review_preview_commands_path_for(analysis_root),
     }
     optional_paths = {
-        "contact_sheet_html": report_root / "contact_sheet.html",
-        "preview_contact_sheet_pdf": report_root / "preview_contact_sheet.pdf",
+        "contact_sheet_html": review_html_path_for(analysis_root),
+        "preview_contact_sheet_pdf": review_pdf_path_for(analysis_root),
     }
 
     parsed_payloads: Dict[str, Dict[str, object]] = {}
@@ -172,7 +846,17 @@ def validate_review_run_contract(analysis_dir: str) -> Dict[str, object]:
         elif entry["size_bytes"] <= 0:
             result["errors"].append(f"Optional report artifact is empty: {key} ({path})")
 
-    contact_sheet_payload = parsed_payloads.get("contact_sheet_json")
+    review_manifest_payload = parsed_payloads.get("review_manifest_json") or {}
+    contact_sheet_payload = parsed_payloads.get("contact_sheet_json") or {}
+    resolved_review_mode = normalize_review_mode(
+        str(
+            review_manifest_payload.get("review_mode")
+            or contact_sheet_payload.get("review_mode")
+            or "full_contact_sheet"
+        )
+    )
+    result["review_mode"] = resolved_review_mode
+    result["review_mode_label"] = review_mode_label(resolved_review_mode)
     if contact_sheet_payload:
         preview_paths = _review_preview_paths_from_payload(contact_sheet_payload)
         missing_preview_paths = [path for path in preview_paths if not Path(path).exists()]
@@ -199,13 +883,13 @@ def validate_review_run_contract(analysis_dir: str) -> Dict[str, object]:
         result["missing_preview_paths"] = missing_preview_paths
         result["empty_preview_paths"] = empty_preview_paths
         result["unreadable_preview_paths"] = unreadable_preview_paths
-        if not preview_paths:
+        if resolved_review_mode == "full_contact_sheet" and not preview_paths:
             result["errors"].append("Review report did not reference any preview images.")
-        if missing_preview_paths:
+        if resolved_review_mode == "full_contact_sheet" and missing_preview_paths:
             result["errors"].append(f"Missing {len(missing_preview_paths)} preview image(s) referenced by contact_sheet.json.")
-        if empty_preview_paths:
+        if resolved_review_mode == "full_contact_sheet" and empty_preview_paths:
             result["errors"].append(f"Found {len(empty_preview_paths)} empty preview image(s) referenced by contact_sheet.json.")
-        if unreadable_preview_paths:
+        if resolved_review_mode == "full_contact_sheet" and unreadable_preview_paths:
             result["errors"].append(f"Found {len(unreadable_preview_paths)} unreadable preview image(s) referenced by contact_sheet.json.")
         result["clip_count"] = int(contact_sheet_payload.get("clip_count", 0) or 0)
         result["color_preview_status"] = contact_sheet_payload.get("color_preview_status")
@@ -214,13 +898,68 @@ def validate_review_run_contract(analysis_dir: str) -> Dict[str, object]:
     if not result["optional_artifacts"]["contact_sheet_html"]["exists"] and not result["optional_artifacts"]["preview_contact_sheet_pdf"]["exists"]:
         result["errors"].append("No human-readable report artifact was produced: both HTML and PDF are missing.")
 
+    capability = _physical_validation_capability(
+        analysis_root,
+        summary_payload=parsed_payloads.get("summary_json"),
+    )
+    array_payload = _load_optional_json(analysis_root / "array_calibration.json")
+    if capability.get("applicable"):
+        try:
+            physical_validation = _build_physical_validation(analysis_root)
+        except Exception as exc:
+            physical_validation = {
+                "status": "failed",
+                "errors": [f"Failed to compute physical validation: {exc}"],
+                "reason": "physical_validation_exception",
+            }
+    else:
+        physical_validation = {
+            "status": capability.get("status", "unsupported"),
+            "errors": list(capability.get("errors", [])),
+            "warnings": list(capability.get("warnings", [])),
+            "reason": capability.get("reason"),
+        }
+    result["physical_validation"] = physical_validation
+    if physical_validation.get("status") == "failed":
+        result["errors"].extend(str(item) for item in physical_validation.get("errors", []) if str(item).strip())
+    result["warnings"].extend(str(item) for item in physical_validation.get("warnings", []) if str(item).strip())
+
+    report_payload = parsed_payloads.get("contact_sheet_json") or {}
+    failure_modes = _build_failure_modes(physical_validation)
+    recommendation = _build_recommendation_layer(
+        report_payload=report_payload,
+        physical_validation=physical_validation,
+    )
+    human_summary = _build_human_summary(
+        report_payload=report_payload,
+        recommendation=recommendation,
+        physical_validation=physical_validation,
+        failure_modes=failure_modes,
+    )
+    commit_payload = _write_commit_payload_artifacts(
+        analysis_root=analysis_root,
+        report_payload=report_payload,
+        array_payload=array_payload,
+    )
+    post_apply_validation = _build_post_apply_validation(
+        report_payload=report_payload,
+        physical_validation=physical_validation,
+        recommendation=recommendation,
+    )
+    result["recommendation"] = recommendation
+    result["failure_modes"] = failure_modes
+    result["human_summary"] = human_summary
+    result["commit_payload"] = commit_payload
+    result["post_apply_validation"] = post_apply_validation
+
     if result["errors"]:
         result["status"] = "failed"
 
-    validation_path = report_root / "review_validation.json"
+    validation_path = review_validation_path_for(analysis_root)
     validation_path.parent.mkdir(parents=True, exist_ok=True)
-    validation_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     result["validation_path"] = str(validation_path)
+    result["validated_at"] = time.time()
+    validation_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
 
 
@@ -246,6 +985,12 @@ def review_calibration(
     input_path: str,
     *,
     out_dir: str,
+    source_mode: str = "local_folder",
+    ftps_reel: Optional[str] = None,
+    ftps_clip_spec: Optional[str] = None,
+    ftps_cameras: Optional[List[str]] = None,
+    ftps_username: str = "ftp1",
+    ftps_password: str = "12345678",
     target_type: str,
     processing_mode: str,
     mode: str,
@@ -266,6 +1011,7 @@ def review_calibration(
     clip_subset_file: Optional[str] = None,
     run_label: Optional[str] = None,
     matching_domain: str = "scene",
+    review_mode: str = "full_contact_sheet",
     preview_mode: str = "calibration",
     preview_output_space: Optional[str] = None,
     preview_output_gamma: Optional[str] = None,
@@ -273,6 +1019,7 @@ def review_calibration(
     preview_shadow_rolloff: Optional[str] = None,
     preview_lut: Optional[str] = None,
 ) -> Dict[str, object]:
+    resolved_source_mode = normalize_source_mode(source_mode)
     subset_definition = _load_clip_subset_definition(clip_subset_file) if clip_subset_file else None
     merged_clip_ids = [str(item) for item in (selected_clip_ids or []) if str(item).strip()]
     merged_clip_groups = [str(item) for item in (selected_clip_groups or []) if str(item).strip()]
@@ -292,9 +1039,27 @@ def review_calibration(
         selected_clip_ids=merged_clip_ids,
         selected_clip_groups=merged_clip_groups,
     )
+    source_input_path = input_path
+    ingest_manifest = None
+    if resolved_source_mode == "ftps_camera_pull":
+        if not ftps_reel:
+            raise ValueError("FTPS source mode requires --ftps-reel.")
+        if not ftps_clip_spec:
+            raise ValueError("FTPS source mode requires --ftps-clips.")
+        ingest_root = Path(resolved_out_dir).expanduser().resolve() / "ingest"
+        raise_if_cancelled("Run cancelled before FTPS ingest.")
+        ingest_manifest = ingest_ftps_batch(
+            out_dir=str(ingest_root),
+            reel_identifier=ftps_reel,
+            clip_spec=ftps_clip_spec,
+            requested_cameras=ftps_cameras,
+            username=ftps_username,
+            password=ftps_password,
+        )
+        source_input_path = str(ingest_root)
     raise_if_cancelled("Run cancelled before analysis.")
     analyze_summary = analyze_path(
-        input_path,
+        source_input_path,
         out_dir=resolved_out_dir,
         mode=mode,
         backend=backend,
@@ -311,7 +1076,7 @@ def review_calibration(
     )
     raise_if_cancelled("Run cancelled before review package generation.")
     package = build_review_package(
-        input_path,
+        source_input_path,
         out_dir=resolved_out_dir,
         exposure_calibration_path=exposure_calibration_path or calibration_path,
         color_calibration_path=color_calibration_path,
@@ -319,6 +1084,7 @@ def review_calibration(
         processing_mode=processing_mode,
         run_label=resolved_run_label,
         matching_domain=resolved_matching_domain,
+        review_mode=review_mode,
         selected_clip_ids=merged_clip_ids,
         selected_clip_groups=merged_clip_groups,
         preview_mode=preview_mode,
@@ -331,6 +1097,10 @@ def review_calibration(
         target_strategies=target_strategies,
         reference_clip_id=reference_clip_id,
         hero_clip_id=hero_clip_id,
+        source_mode=resolved_source_mode,
+        source_mode_label_value=source_mode_label(resolved_source_mode),
+        source_input_path=source_input_path,
+        ingest_manifest=ingest_manifest,
     )
     package["analyze_summary"] = analyze_summary
     package["analysis_dir"] = resolved_out_dir
@@ -339,6 +1109,10 @@ def review_calibration(
     package["selected_clip_groups"] = merged_clip_groups
     package["matching_domain"] = resolved_matching_domain
     package["matching_domain_label"] = matching_domain_label(resolved_matching_domain)
+    package["source_mode"] = resolved_source_mode
+    package["source_mode_label"] = source_mode_label(resolved_source_mode)
+    package["source_input_path"] = source_input_path
+    package["ingest_manifest"] = ingest_manifest
     package["clip_subset_file"] = subset_definition["path"] if subset_definition else None
     validation = validate_review_run_contract(resolved_out_dir)
     package["review_validation"] = validation
@@ -481,6 +1255,14 @@ def _write_master_rmds_from_strategy(strategy_payload: Dict[str, object], *, out
             "cdl_enabled": cdl_enabled,
             "cdl": color_cdl,
             "rgb_gains_diagnostic": color_metrics.get("rgb_gains_diagnostic") or color_metrics.get("rgb_gains"),
+            "commit_values": representative.get("commit_values")
+            or build_commit_values(
+                exposure_adjust=exposure_offset,
+                rgb_gains=color_metrics.get("rgb_gains_diagnostic") or color_metrics.get("rgb_gains"),
+                confidence=representative["metrics"].get("confidence"),
+                sample_log2_spread=representative["metrics"]["exposure"].get("neutral_sample_log2_spread"),
+                sample_chromaticity_spread=representative["metrics"]["color"].get("neutral_sample_chromaticity_spread"),
+            ),
         }
         exports.append(export_record)
 
@@ -503,6 +1285,14 @@ def _write_master_rmds_from_strategy(strategy_payload: Dict[str, object], *, out
                     "authored_cdl_summary": clip_cdl,
                     "cdl_enabled": bool(not is_identity_cdl_payload(clip_cdl)),
                     "is_hero_camera": bool(clip.get("is_hero_camera")),
+                    "commit_values": clip.get("commit_values")
+                    or build_commit_values(
+                        exposure_adjust=float(clip["metrics"]["exposure"]["final_offset_stops"]),
+                        rgb_gains=clip["metrics"]["color"].get("rgb_gains_diagnostic") or clip["metrics"]["color"].get("rgb_gains"),
+                        confidence=clip["metrics"].get("confidence"),
+                        sample_log2_spread=clip["metrics"]["exposure"].get("neutral_sample_log2_spread"),
+                        sample_chromaticity_spread=clip["metrics"]["color"].get("neutral_sample_chromaticity_spread"),
+                    ),
                 }
             )
 
@@ -529,6 +1319,8 @@ def _build_batch_manifest(
     master_rmd_manifest: Dict[str, object],
     run_label: Optional[str] = None,
     matching_domain: Optional[str] = None,
+    source_mode: str = "local_folder",
+    source_mode_label_value: Optional[str] = None,
     selected_clip_ids: Optional[List[str]] = None,
     selected_clip_groups: Optional[List[str]] = None,
 ) -> Dict[str, object]:
@@ -558,6 +1350,7 @@ def _build_batch_manifest(
                 "authored_cdl_summary": item["authored_cdl_summary"],
                 "cdl_enabled": item["cdl_enabled"],
                 "is_hero_camera": item["is_hero_camera"],
+                "commit_values": item.get("commit_values"),
             }
         )
 
@@ -568,6 +1361,8 @@ def _build_batch_manifest(
         "run_label": run_label,
         "matching_domain": matching_domain,
         "matching_domain_label": matching_domain_label(matching_domain or "scene"),
+        "source_mode": source_mode,
+        "source_mode_label": source_mode_label_value or source_mode_label(source_mode),
         "selected_clip_ids": [str(item) for item in (selected_clip_ids or []) if str(item).strip()],
         "selected_clip_groups": [str(item) for item in (selected_clip_groups or []) if str(item).strip()],
         "approved_strategy": strategy_payload["strategy_key"],
@@ -605,6 +1400,7 @@ def _build_batch_readme(*, batch_root: Path, batch_manifest: Dict[str, object]) 
         "Review manifest.json for exact clip-to-RMD mappings and authored correction payload summaries.",
         f"Run label: {batch_manifest.get('run_label')}",
         f"Matching domain: {batch_manifest.get('matching_domain_label')}",
+        f"Source mode: {batch_manifest.get('source_mode_label')}",
     ]
     readme_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return str(readme_path)
@@ -714,6 +1510,10 @@ def approve_master_rmd(
         str(analysis_root),
         out_dir=str(report_dir),
         clear_cache=False,
+        source_mode=str(review_package.get("source_mode", "local_folder")),
+        source_mode_label_value=str(review_package.get("source_mode_label", source_mode_label("local_folder"))),
+        source_input_path=str(review_package.get("source_input_path", analysis_root)),
+        ingest_manifest=review_package.get("ingest_manifest"),
         target_type=review_package.get("target_type"),
         processing_mode=review_package.get("processing_mode"),
         run_label=review_package.get("run_label"),
@@ -742,6 +1542,8 @@ def approve_master_rmd(
         master_rmd_manifest=rmd_manifest,
         run_label=review_package.get("run_label"),
         matching_domain=review_package.get("matching_domain"),
+        source_mode=str(review_package.get("source_mode", "local_folder")),
+        source_mode_label_value=str(review_package.get("source_mode_label", source_mode_label("local_folder"))),
         selected_clip_ids=review_package.get("selected_clip_ids"),
         selected_clip_groups=review_package.get("selected_clip_groups"),
     )
@@ -757,6 +1559,34 @@ def approve_master_rmd(
         title="R3DMatch Approval Report",
         timestamp_label=f"Approved at: {approval_timestamp}",
     )
+    commit_package = {
+        "schema_version": "r3dmatch_commit_package_v1",
+        "generated_at": approval_timestamp,
+        "analysis_dir": str(analysis_root),
+        "approval_dir": str(approval_root),
+        "run_label": review_package.get("run_label"),
+        "source_mode": review_package.get("source_mode", "local_folder"),
+        "source_mode_label": review_package.get("source_mode_label", source_mode_label("local_folder")),
+        "matching_domain": review_package.get("matching_domain"),
+        "matching_domain_label": review_package.get("matching_domain_label"),
+        "selected_strategy": chosen_strategy["strategy_key"],
+        "selected_reference_clip_id": chosen_strategy.get("reference_clip_id"),
+        "selected_hero_clip_id": chosen_strategy.get("hero_clip_id"),
+        "per_camera_values": [
+            {
+                "clip_id": item["clip_id"],
+                "correction_key": item["correction_key"],
+                "camera_group_key": item["camera_group_key"],
+                "master_rmd_path": item["master_rmd_path"],
+                "commit_values": item.get("commit_values"),
+                "is_hero_camera": item.get("is_hero_camera"),
+                "notes": ["Hero camera receives identity correction."] if item.get("is_hero_camera") else [],
+            }
+            for item in rmd_manifest["clip_mappings"]
+        ],
+    }
+    commit_package_path = approval_root / "calibration_commit_package.json"
+    commit_package_path.write_text(json.dumps(commit_package, indent=2), encoding="utf-8")
     manifest = {
         "workflow_phase": "approved_master",
         "approved_at": approval_timestamp,
@@ -772,6 +1602,10 @@ def approve_master_rmd(
         "run_label": review_package.get("run_label"),
         "matching_domain": review_package.get("matching_domain"),
         "matching_domain_label": review_package.get("matching_domain_label"),
+        "source_mode": review_package.get("source_mode", "local_folder"),
+        "source_mode_label": review_package.get("source_mode_label", source_mode_label("local_folder")),
+        "source_input_path": review_package.get("source_input_path", str(analysis_root)),
+        "ingest_manifest": review_package.get("ingest_manifest"),
         "selected_clip_ids": review_package.get("selected_clip_ids"),
         "selected_clip_groups": review_package.get("selected_clip_groups"),
         "target_type": review_payload.get("target_type"),
@@ -792,6 +1626,7 @@ def approve_master_rmd(
             "tcsh": batch_script_tcsh,
         },
         "batch_readme": batch_readme,
+        "calibration_commit_package": str(commit_package_path),
     }
     manifest_path = approval_root / "approval_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")

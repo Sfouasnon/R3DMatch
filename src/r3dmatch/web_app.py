@@ -16,6 +16,7 @@ from typing import Dict, List, Optional
 
 from flask import Flask, Response, jsonify, redirect, render_template_string, request, send_file, url_for
 
+from .ftps_ingest import normalize_source_mode, plan_ftps_request, source_mode_label
 from .identity import clip_id_from_path, subset_key_from_clip_id
 from .matching import discover_clips
 from .execution import CANCEL_FILE_ENV, terminate_process_group
@@ -24,8 +25,17 @@ from .report import (
     _detect_redline_capabilities,
     _normalize_preview_settings,
     _resolve_redline_executable,
+    normalize_review_mode,
+    review_mode_label,
 )
-from .workflow import matching_domain_label, resolve_review_output_dir
+from .workflow import (
+    matching_domain_label,
+    resolve_review_output_dir,
+    review_html_path_for,
+    review_manifest_path_for,
+    review_pdf_path_for,
+    review_validation_path_for,
+)
 
 
 DEFAULT_LOGO_PATH = Path(__file__).resolve().parent / "static" / "r3dmatch_logo.png"
@@ -184,9 +194,35 @@ PAGE_TEMPLATE = """
     <form method="post" action="{{ url_for('scan') }}">
       <div class="card">
         <h2 class="section-title">Calibration Folder</h2>
+        <div class="row">
+          <div class="field">
+            <label for="source_mode">Source Mode</label>
+            <select id="source_mode" name="source_mode">
+              <option value="local_folder" {% if form.source_mode == 'local_folder' %}selected{% endif %}>Local Folder</option>
+              <option value="ftps_camera_pull" {% if form.source_mode == 'ftps_camera_pull' %}selected{% endif %}>FTPS Camera Pull</option>
+            </select>
+          </div>
+        </div>
         <div class="field">
           <label for="input_path">Calibration Folder Path</label>
           <input id="input_path" name="input_path" type="text" value="{{ form.input_path }}">
+        </div>
+        <div id="ftps-fields" {% if form.source_mode != 'ftps_camera_pull' %}style="display:none"{% endif %}>
+          <div class="row">
+            <div class="field">
+              <label for="ftps_reel">FTPS Reel</label>
+              <input id="ftps_reel" name="ftps_reel" type="text" value="{{ form.ftps_reel }}" placeholder="007">
+            </div>
+            <div class="field">
+              <label for="ftps_clips">Clip Numbers / Ranges</label>
+              <input id="ftps_clips" name="ftps_clips" type="text" value="{{ form.ftps_clips }}" placeholder="63,64-65">
+            </div>
+            <div class="field">
+              <label for="ftps_cameras">Camera Subset</label>
+              <input id="ftps_cameras" name="ftps_cameras" type="text" value="{{ form.ftps_cameras }}" placeholder="AA,AB,AC or leave blank for all">
+            </div>
+          </div>
+          <div class="meta">FTPS ingest uses the built-in camera map and default RED camera credentials unless overridden in the CLI.</div>
         </div>
         <div class="actions">
           <button type="submit">Scan Folder</button>
@@ -356,6 +392,14 @@ PAGE_TEMPLATE = """
             </select>
             <div class="meta">Choose whether matching is solved in a camera-space style domain or the human review display domain.</div>
           </div>
+          <div class="field">
+            <label for="review_mode">Review Mode</label>
+            <select id="review_mode" name="review_mode">
+              <option value="full_contact_sheet" {% if form.review_mode == 'full_contact_sheet' %}selected{% endif %}>Full Contact Sheet</option>
+              <option value="lightweight_analysis" {% if form.review_mode == 'lightweight_analysis' %}selected{% endif %}>Lightweight Analysis</option>
+            </select>
+            <div class="meta">Lightweight Analysis skips bulk still generation and produces a fast exposure-first diagnostic brief.</div>
+          </div>
         </div>
       </div>
 
@@ -450,6 +494,8 @@ PAGE_TEMPLATE = """
       <div class="meta"><strong>Watchdog:</strong> <span id="task-watchdog">{{ task.watchdog_status }}</span> | Process alive: <span id="task-process-alive">{{ 'yes' if task.process_alive else 'no' }}</span> | Last activity: <span id="task-last-activity">{{ task.last_activity_seconds }}</span>s ago</div>
       <div class="meta"><strong>Clips Found:</strong> <span id="task-clip-count">{{ task.clip_count }}</span></div>
       <div class="meta"><strong>Strategies:</strong> <span id="task-strategies">{{ task.strategies_text }}</span></div>
+      <div class="meta"><strong>Review Mode:</strong> <span id="task-review-mode">{{ task.review_mode_label or task.review_mode }}</span></div>
+      <div class="meta"><strong>Source Mode:</strong> <span id="task-source-mode">{{ task.source_mode_label or task.source_mode }}</span></div>
       <div class="meta"><strong>Preview Mode:</strong> <span id="task-preview-mode">{{ task.preview_mode }}</span></div>
       <div class="meta"><strong>Output Folder:</strong> <span id="task-output">{{ task.output_path or form.output_path }}</span></div>
       <div class="progress-track"><div id="task-progress-fill" class="progress-fill" style="width: {{ task.progress_percent }}%;"></div></div>
@@ -744,6 +790,25 @@ PAGE_TEMPLATE = """
     }
     document.getElementById('roi_mode').addEventListener('change', applyRoiMode);
 
+    function applySourceMode() {
+      const mode = document.getElementById('source_mode').value;
+      const ftpsFields = document.getElementById('ftps-fields');
+      const inputField = document.getElementById('input_path');
+      const inputLabel = document.querySelector('label[for="input_path"]');
+      if (ftpsFields) {
+        ftpsFields.style.display = mode === 'ftps_camera_pull' ? '' : 'none';
+      }
+      if (inputLabel) {
+        inputLabel.textContent = mode === 'ftps_camera_pull' ? 'Local Ingest Cache Root (optional)' : 'Calibration Folder Path';
+      }
+      if (inputField && mode === 'ftps_camera_pull' && !inputField.value) {
+        inputField.placeholder = 'Leave blank to ingest under the review output folder';
+      } else if (inputField) {
+        inputField.placeholder = '';
+      }
+    }
+    document.getElementById('source_mode').addEventListener('change', applySourceMode);
+
     function updateOverlayFromInputs() {
       const stage = document.getElementById('roi-stage');
       const overlay = document.getElementById('roi-overlay');
@@ -842,6 +907,8 @@ PAGE_TEMPLATE = """
       document.getElementById('task-last-activity').textContent = String(data.last_activity_seconds ?? 0);
       document.getElementById('task-clip-count').textContent = data.clip_count ?? '';
       document.getElementById('task-strategies').textContent = data.strategies_text || '';
+      document.getElementById('task-review-mode').textContent = data.review_mode_label || data.review_mode || '';
+      document.getElementById('task-source-mode').textContent = data.source_mode_label || data.source_mode || '';
       document.getElementById('task-preview-mode').textContent = data.preview_mode || '';
       document.getElementById('task-output').textContent = data.output_path || '';
       document.getElementById('task-command').textContent = data.command || '';
@@ -895,6 +962,7 @@ PAGE_TEMPLATE = """
       }
     }
     applyRoiMode();
+    applySourceMode();
     wireSubsetPanel();
     wireDrawRoi();
     updateOverlayFromInputs();
@@ -906,14 +974,18 @@ PAGE_TEMPLATE = """
 
 
 def build_review_web_command(repo_root: str, form: Dict[str, object]) -> List[str]:
+    source_mode = normalize_source_mode(str(form.get("source_mode", "local_folder")))
+    input_path = str(form["input_path"]) if source_mode == "local_folder" else str(Path(str(form["output_path"])).expanduser().resolve() / "ingest")
     args = [
         "python3",
         "-m",
         "r3dmatch.cli",
         "review-calibration",
-        str(form["input_path"]),
+        input_path,
         "--out",
         str(form["output_path"]),
+        "--source-mode",
+        source_mode,
         "--backend",
         str(form["backend"]),
         "--target-type",
@@ -922,9 +994,15 @@ def build_review_web_command(repo_root: str, form: Dict[str, object]) -> List[st
         str(form["processing_mode"]),
         "--matching-domain",
         str(form["matching_domain"]),
+        "--review-mode",
+        str(form["review_mode"]),
         "--preview-mode",
         str(form["preview_mode"]),
     ]
+    if source_mode == "ftps_camera_pull":
+        args.extend(["--ftps-reel", str(form["ftps_reel"]), "--ftps-clips", str(form["ftps_clips"])])
+        for camera in [item.strip() for item in str(form.get("ftps_cameras", "")).split(",") if item.strip()]:
+            args.extend(["--ftps-camera", camera])
     roi_values = [form.get("roi_x"), form.get("roi_y"), form.get("roi_w"), form.get("roi_h")]
     if all(value not in (None, "") for value in roi_values):
         args.extend(["--roi-x", str(form["roi_x"]), "--roi-y", str(form["roi_y"]), "--roi-w", str(form["roi_w"]), "--roi-h", str(form["roi_h"])])
@@ -1015,11 +1093,48 @@ def scan_sources(input_path: str) -> Dict[str, object]:
     }
 
 
+def _plan_ftps_scan(form: Dict[str, object]) -> Dict[str, object]:
+    try:
+        plan = plan_ftps_request(
+            reel_identifier=str(form.get("ftps_reel", "")),
+            clip_spec=str(form.get("ftps_clips", "")),
+            requested_cameras=[item.strip() for item in str(form.get("ftps_cameras", "")).split(",") if item.strip()],
+        )
+    except Exception as exc:
+        return {
+            "clip_count": 0,
+            "clip_ids": [],
+            "sample_clip_ids": [],
+            "remaining_count": 0,
+            "clip_records": [],
+            "clip_groups": [],
+            "warning": str(exc),
+            "source_mode": "ftps_camera_pull",
+            "summary": None,
+        }
+    return {
+        "clip_count": 0,
+        "clip_ids": [],
+        "sample_clip_ids": [f"{camera} reel {plan['reel_identifier']} clip(s) {plan['clip_spec']}" for camera in plan["requested_cameras"][:12]],
+        "remaining_count": max(0, len(plan["requested_cameras"]) - 12),
+        "clip_records": [],
+        "clip_groups": [],
+        "first_clip_path": None,
+        "warning": None,
+        "source_mode": "ftps_camera_pull",
+        "summary": plan,
+    }
+
+
 def _default_form() -> Dict[str, object]:
     return {
+        "source_mode": "local_folder",
         "input_path": "",
         "output_path": "",
         "run_label": "",
+        "ftps_reel": "",
+        "ftps_clips": "",
+        "ftps_cameras": "",
         "backend": "red",
         "target_type": "gray_sphere",
         "processing_mode": "both",
@@ -1033,6 +1148,7 @@ def _default_form() -> Dict[str, object]:
         "target_strategies": ["median", "brightest-valid"],
         "reference_clip_id": "",
         "hero_clip_id": "",
+        "review_mode": "full_contact_sheet",
         "preview_mode": "calibration",
         "preview_lut": "",
         "roi_mode": "draw",
@@ -1042,7 +1158,7 @@ def _default_form() -> Dict[str, object]:
 
 def _parse_form(post_data) -> Dict[str, object]:
     form = _default_form()
-    for key in ["input_path", "output_path", "run_label", "backend", "target_type", "processing_mode", "matching_domain", "roi_x", "roi_y", "roi_w", "roi_h", "reference_clip_id", "hero_clip_id", "preview_mode", "preview_lut", "roi_mode"]:
+    for key in ["source_mode", "input_path", "output_path", "run_label", "ftps_reel", "ftps_clips", "ftps_cameras", "backend", "target_type", "processing_mode", "matching_domain", "roi_x", "roi_y", "roi_w", "roi_h", "reference_clip_id", "hero_clip_id", "review_mode", "preview_mode", "preview_lut", "roi_mode"]:
         form[key] = post_data.get(key, form[key]).strip()
     strategies = post_data.getlist("target_strategies")
     form["target_strategies"] = strategies or []
@@ -1054,19 +1170,36 @@ def _parse_form(post_data) -> Dict[str, object]:
 
 def _validate_form(form: Dict[str, object], *, require_output: bool = True, require_source: bool = True) -> Optional[str]:
     scan = None
+    try:
+        resolved_source_mode = normalize_source_mode(str(form.get("source_mode", "local_folder")))
+    except ValueError as exc:
+        return str(exc)
     if require_source:
-        input_path = str(form["input_path"]).strip()
-        if not input_path:
-            return "Calibration folder path is required."
-        scan = scan_sources(input_path)
-        if scan["warning"]:
-            return str(scan["warning"])
-        if not _resolve_selected_clip_ids(form, scan):
-            return "Select at least one clip for this calibration run."
+        if resolved_source_mode == "local_folder":
+            input_path = str(form["input_path"]).strip()
+            if not input_path:
+                return "Calibration folder path is required."
+            scan = scan_sources(input_path)
+            if scan["warning"]:
+                return str(scan["warning"])
+            if not _resolve_selected_clip_ids(form, scan):
+                return "Select at least one clip for this calibration run."
+        else:
+            if not str(form.get("ftps_reel", "")).strip():
+                return "FTPS source mode requires a reel identifier."
+            if not str(form.get("ftps_clips", "")).strip():
+                return "FTPS source mode requires clip numbers or ranges."
+            planned = _plan_ftps_scan(form)
+            if planned.get("warning"):
+                return str(planned["warning"])
     if require_output and not str(form["output_path"]).strip():
         return "Output folder path is required."
     try:
         matching_domain_label(str(form.get("matching_domain", "scene")))
+    except ValueError as exc:
+        return str(exc)
+    try:
+        normalize_review_mode(str(form.get("review_mode", "full_contact_sheet")))
     except ValueError as exc:
         return str(exc)
     roi_mode = str(form.get("roi_mode", "draw"))
@@ -1099,6 +1232,7 @@ class TaskState:
     status: str = "idle"
     command: str = ""
     output_path: str = ""
+    source_mode: str = ""
     logs: List[str] = field(default_factory=lambda: ["Ready.\n"])
     returncode: Optional[int] = None
     stage: str = "Idle"
@@ -1108,6 +1242,7 @@ class TaskState:
     items_total: int = 0
     clip_count: int = 0
     strategies_text: str = ""
+    review_mode: str = ""
     preview_mode: str = ""
     preview_pdf_path: Optional[str] = None
     preview_html_path: Optional[str] = None
@@ -1133,6 +1268,7 @@ class TaskState:
                 "status": self.status,
                 "command": self.command,
                 "output_path": self.output_path,
+                "source_mode": self.source_mode,
                 "returncode": self.returncode,
                 "stage": self.stage,
                 "stage_index": self.stage_index,
@@ -1141,6 +1277,7 @@ class TaskState:
                 "items_total": self.items_total,
                 "clip_count": self.clip_count,
                 "strategies_text": self.strategies_text,
+                "review_mode": self.review_mode,
                 "preview_mode": self.preview_mode,
                 "preview_pdf_path": self.preview_pdf_path,
                 "preview_html_path": self.preview_html_path,
@@ -1181,13 +1318,33 @@ def _path_is_current(path: Path, *, started_at: Optional[float] = None) -> bool:
         return False
 
 
+def _validation_timestamp_is_current(
+    payload: Dict[str, object],
+    path: Path,
+    *,
+    started_at: Optional[float] = None,
+) -> bool:
+    if started_at is None:
+        return True
+    threshold = float(started_at) - ARTIFACT_FRESHNESS_TOLERANCE_SECONDS
+    candidate_times: list[float] = []
+    validated_at = payload.get("validated_at")
+    if isinstance(validated_at, (int, float)):
+        candidate_times.append(float(validated_at))
+    try:
+        candidate_times.append(path.stat().st_mtime)
+    except OSError:
+        pass
+    return bool(candidate_times) and max(candidate_times) >= threshold
+
+
 def _report_url_for_output(output_path: str, *, started_at: Optional[float] = None) -> Optional[str]:
     if not output_path.strip():
         return None
-    report_pdf = Path(output_path).expanduser().resolve() / "report" / "preview_contact_sheet.pdf"
+    report_pdf = review_pdf_path_for(output_path)
     if _path_is_current(report_pdf, started_at=started_at):
         return url_for("artifact", path=str(report_pdf))
-    report_html = Path(output_path).expanduser().resolve() / "report" / "contact_sheet.html"
+    report_html = review_html_path_for(output_path)
     if _path_is_current(report_html, started_at=started_at):
         return url_for("artifact", path=str(report_html))
     return None
@@ -1196,6 +1353,12 @@ def _report_url_for_output(output_path: str, *, started_at: Optional[float] = No
 def _scan_summary_text(scan: Dict[str, object]) -> str:
     if scan.get("warning"):
         return str(scan["warning"])
+    if scan.get("source_mode") == "ftps_camera_pull" and scan.get("summary"):
+        summary = scan["summary"]
+        return (
+            f"Planned FTPS pull: reel {summary['reel_identifier']} | clips {summary['clip_spec']} | "
+            f"{summary['camera_count']} cameras"
+        )
     return f"Found {scan.get('clip_count', 0)} RED clips"
 
 
@@ -1415,8 +1578,7 @@ def _artifacts_ready_for_task(task: TaskState, output_root: Optional[Path], *, i
     if output_root is None or not output_root.exists():
         return False
     if is_review:
-        report_dir = output_root / "report"
-        return _path_is_current(report_dir / "preview_contact_sheet.pdf", started_at=task.started_at) or _path_is_current(report_dir / "contact_sheet.html", started_at=task.started_at)
+        return _path_is_current(review_pdf_path_for(output_root), started_at=task.started_at) or _path_is_current(review_html_path_for(output_root), started_at=task.started_at)
     if is_approve:
         approval_root = output_root / "approval"
         return _path_is_current(approval_root / "calibration_report.pdf", started_at=task.started_at) or _path_is_current(approval_root / "approval_manifest.json", started_at=task.started_at)
@@ -1426,8 +1588,8 @@ def _artifacts_ready_for_task(task: TaskState, output_root: Optional[Path], *, i
 def _load_review_validation(output_root: Optional[Path], *, started_at: Optional[float] = None) -> Optional[Dict[str, object]]:
     if output_root is None:
         return None
-    validation_path = output_root / "report" / "review_validation.json"
-    if not _path_is_current(validation_path, started_at=started_at):
+    validation_path = review_validation_path_for(output_root)
+    if not validation_path.exists():
         return None
     try:
         payload = json.loads(validation_path.read_text(encoding="utf-8"))
@@ -1438,7 +1600,23 @@ def _load_review_validation(output_root: Optional[Path], *, started_at: Optional
             "warnings": [],
             "validation_path": str(validation_path),
         }
+    if not _validation_timestamp_is_current(payload, validation_path, started_at=started_at):
+        return None
     payload["validation_path"] = str(validation_path)
+    return payload
+
+
+def _load_review_manifest(output_root: Optional[Path], *, started_at: Optional[float] = None) -> Optional[Dict[str, object]]:
+    if output_root is None:
+        return None
+    manifest_path = review_manifest_path_for(output_root)
+    if not _path_is_current(manifest_path, started_at=started_at):
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    payload["manifest_path"] = str(manifest_path)
     return payload
 
 
@@ -1481,6 +1659,17 @@ def _infer_progress(task: TaskState) -> None:
     is_review = "review-calibration" in task.command
     is_approve = "approve-master-rmd" in task.command
     review_validation = _load_review_validation(output_root, started_at=task.started_at) if is_review else None
+    review_manifest = _load_review_manifest(output_root, started_at=task.started_at) if is_review else None
+    resolved_review_mode = normalize_review_mode(
+        str(
+            task.review_mode
+            or (review_manifest or {}).get("review_mode")
+            or (review_validation or {}).get("review_mode")
+            or "full_contact_sheet"
+        )
+    ) if is_review else ""
+    if is_review:
+        task.review_mode = resolved_review_mode
     previous_progress_state = (
         task.stage,
         task.stage_index,
@@ -1494,8 +1683,8 @@ def _infer_progress(task: TaskState) -> None:
     if is_review:
         task.total_stages = len(REVIEW_STAGES)
         if output_root and output_root.exists():
-            preview_pdf = output_root / "report" / "preview_contact_sheet.pdf"
-            preview_html = output_root / "report" / "contact_sheet.html"
+            preview_pdf = review_pdf_path_for(output_root)
+            preview_html = review_html_path_for(output_root)
             analysis_dir = output_root / "analysis"
             array_cal = output_root / "array_calibration.json"
             previews_dir = output_root / "previews"
@@ -1505,10 +1694,14 @@ def _infer_progress(task: TaskState) -> None:
             ] if previews_dir.exists() else []
             clip_count = len([p for p in analysis_dir.glob("*.analysis.json") if _path_is_current(p, started_at=task.started_at)]) if analysis_dir.exists() else 0
             strategies_count = max(1, len([item for item in task.strategies_text.split(", ") if item])) if task.strategies_text else 1
-            expected_previews = clip_count * (1 + strategies_count * 3) if clip_count else 0
+            expected_previews = clip_count * (1 + strategies_count * 3) if clip_count and resolved_review_mode == "full_contact_sheet" else 0
             task.clip_count = clip_count or task.clip_count
-            task.items_total = expected_previews or task.items_total
-            task.items_completed = min(len(visible_previews), task.items_total or len(visible_previews))
+            if resolved_review_mode == "lightweight_analysis":
+                task.items_total = clip_count or task.items_total
+                task.items_completed = min(task.items_completed, task.items_total) if task.items_total else task.items_completed
+            else:
+                task.items_total = expected_previews or task.items_total
+                task.items_completed = min(len(visible_previews), task.items_total or len(visible_previews))
             preview_pdf_ready = _path_is_current(preview_pdf, started_at=task.started_at)
             preview_html_ready = _path_is_current(preview_html, started_at=task.started_at)
             if preview_pdf_ready or preview_html_ready:
@@ -1542,6 +1735,11 @@ def _infer_progress(task: TaskState) -> None:
                 if preview_reference_count:
                     task.items_total = max(task.items_total, preview_reference_count)
                     task.items_completed = max(task.items_completed, preview_existing_count)
+                elif resolved_review_mode == "lightweight_analysis":
+                    clip_count_from_validation = int(review_validation.get("clip_count", task.clip_count) or task.clip_count)
+                    task.items_total = max(task.items_total, clip_count_from_validation)
+                    if task.report_ready or not process_alive:
+                        task.items_completed = task.items_total
     elif is_approve:
         task.total_stages = len(APPROVAL_STAGES)
         if output_root and output_root.exists():
@@ -1578,10 +1776,9 @@ def _infer_progress(task: TaskState) -> None:
     last_activity_at = max(task.started_at, task.last_output_at, task.last_progress_at)
     stalled = process_alive and (now - last_activity_at) >= STALL_THRESHOLD_SECONDS
 
-    if task.cancellation_requested:
-        task.status = "cancelling" if process_alive else "cancelled"
-        if not process_alive:
-            task.stage = "Cancelled"
+    if task.cancellation_requested and process_alive:
+        task.status = "cancelling"
+        task.stage = "Cancelling..."
         return
 
     if process_alive:
@@ -1638,13 +1835,16 @@ def _status_payload(task: TaskState) -> Dict[str, object]:
         base = task.snapshot()
     output_root = Path(str(base["output_path"])).expanduser().resolve() if base.get("output_path") else None
     review_validation = _load_review_validation(output_root, started_at=float(base.get("started_at") or 0.0)) if "review-calibration" in base["command"] else None
+    resolved_review_mode = normalize_review_mode(str(base.get("review_mode") or "full_contact_sheet")) if "review-calibration" in base["command"] else ""
     stage_names = REVIEW_STAGES if "review-calibration" in base["command"] else APPROVAL_STAGES if "approve-master-rmd" in base["command"] else []
     progress_percent = int(((base["stage_index"] + (1 if base["status"] == "completed" else 0)) / max(len(stage_names), 1)) * 100) if stage_names else 0
     can_cancel = bool(base.get("process_alive")) or base["status"] == "cancelling"
     last_activity_seconds = int(max(0.0, time.time() - max(float(base.get("last_output_at") or 0.0), float(base.get("last_progress_at") or 0.0), float(base.get("started_at") or 0.0))))
     validation_errors = list(review_validation.get("errors", [])) if isinstance(review_validation, dict) else []
     validation_warnings = list(review_validation.get("warnings", [])) if isinstance(review_validation, dict) else []
-    status_detail = validation_errors[0] if validation_errors else (validation_warnings[0] if validation_warnings else "")
+    status_detail = validation_errors[0] if validation_errors else ""
+    if not status_detail and base.get("status") not in {"completed"} and validation_warnings:
+        status_detail = validation_warnings[0]
     if not status_detail and "review-calibration" in base["command"] and base.get("status") == "failed" and base.get("returncode") == 0 and review_validation is None:
         status_detail = "Fresh review_validation.json was not produced for this run."
     base.update(
@@ -1657,6 +1857,8 @@ def _status_payload(task: TaskState) -> Dict[str, object]:
             "can_cancel": can_cancel,
             "watchdog_status": base["status"],
             "last_activity_seconds": last_activity_seconds,
+            "review_mode_label": review_mode_label(resolved_review_mode) if resolved_review_mode else "",
+            "source_mode_label": source_mode_label(str(base.get("source_mode") or "local_folder")) if base.get("source_mode") else "",
             "status_detail": status_detail,
             "review_validation": review_validation,
             "validation_status": review_validation.get("status") if isinstance(review_validation, dict) else None,
@@ -1674,6 +1876,8 @@ def _start_command_task(
     *,
     clip_count: int = 0,
     strategies_text: str = "",
+    source_mode: str = "",
+    review_mode: str = "",
     preview_mode: str = "",
 ) -> None:
     task = state.task
@@ -1686,10 +1890,12 @@ def _start_command_task(
         task.status = "running"
         task.command = " ".join(command)
         task.output_path = output_path
+        task.source_mode = source_mode
         task.logs = [f"$ {' '.join(command)}\n"]
         task.returncode = None
         task.clip_count = clip_count
         task.strategies_text = strategies_text
+        task.review_mode = review_mode
         task.preview_mode = preview_mode
         task.preview_pdf_path = None
         task.preview_html_path = None
@@ -1735,12 +1941,12 @@ def _start_command_task(
             with task.lock:
                 task.returncode = returncode
                 task.finished_at = time.time()
-                if task.cancellation_requested:
+                if task.cancellation_requested and returncode in {130, -15, -9}:
                     task.status = "cancelled"
                     task.stage = "Cancelled"
                 elif returncode != 0:
                     task.status = "failed"
-                task.logs.append("\n[cancelled]\n" if task.cancellation_requested else f"\n[exit] {returncode}\n")
+                task.logs.append("\n[cancelled]\n" if task.cancellation_requested and returncode in {130, -15, -9} else f"\n[exit] {returncode}\n")
         finally:
             Path(cancel_file_path).unlink(missing_ok=True)
             with task.lock:
@@ -1792,37 +1998,49 @@ def create_app() -> Flask:
     def scan() -> str:
         state: UiState = app.config["UI_STATE"]
         form = _parse_form(request.form)
-        state.scan = scan_sources(str(form["input_path"]))
-        _normalize_subset_form(form, state.scan)
+        if normalize_source_mode(str(form.get("source_mode", "local_folder"))) == "ftps_camera_pull":
+            state.scan = _plan_ftps_scan(form)
+        else:
+            state.scan = scan_sources(str(form["input_path"]))
+            _normalize_subset_form(form, state.scan)
         state.update_form(form)
-        preview_path = _ensure_scan_preview(str(form["input_path"]), state.scan)
+        preview_path = _ensure_scan_preview(str(form["input_path"]), state.scan) if state.scan.get("first_clip_path") else None
         state.scan["preview_available"] = bool(preview_path)
         state.error = state.scan["warning"] if state.scan.get("warning") else None
-        state.message = None if state.error else f"Scanned calibration folder: found {state.scan['clip_count']} RED clips."
+        state.message = None if state.error else (
+            f"Prepared FTPS ingest request for reel {state.scan['summary']['reel_identifier']}."
+            if state.scan.get("source_mode") == "ftps_camera_pull" and state.scan.get("summary")
+            else f"Scanned calibration folder: found {state.scan['clip_count']} RED clips."
+        )
         return render_page()
 
     @app.post("/run-review")
     def run_review() -> str:
         state: UiState = app.config["UI_STATE"]
         form = _parse_form(request.form)
-        state.scan = scan_sources(str(form["input_path"]))
-        _normalize_subset_form(form, state.scan)
+        if normalize_source_mode(str(form.get("source_mode", "local_folder"))) == "ftps_camera_pull":
+            state.scan = _plan_ftps_scan(form)
+        else:
+            state.scan = scan_sources(str(form["input_path"]))
+            _normalize_subset_form(form, state.scan)
         form["resolved_output_path"] = _resolved_output_path_for_form(form, state.scan)
         state.update_form(form)
-        preview_path = _ensure_scan_preview(str(form["input_path"]), state.scan)
+        preview_path = _ensure_scan_preview(str(form["input_path"]), state.scan) if state.scan.get("first_clip_path") else None
         state.scan["preview_available"] = bool(preview_path)
         error = _validate_form(form)
         state.error = error
         state.message = None
         if error is None:
             command = build_review_web_command(app.config["REPO_ROOT"], form)
-            selected_clip_ids = _resolve_selected_clip_ids(form, state.scan)
+            selected_clip_ids = _resolve_selected_clip_ids(form, state.scan) if state.scan.get("clip_ids") else []
             _start_command_task(
                 state,
                 command,
                 str(form["resolved_output_path"]),
                 clip_count=len(selected_clip_ids),
                 strategies_text=", ".join(str(value) for value in form.get("target_strategies", [])),
+                source_mode=str(form.get("source_mode", "")),
+                review_mode=str(form.get("review_mode", "")),
                 preview_mode=str(form.get("preview_mode", "")),
             )
             state.message = "Review command started."
@@ -1846,6 +2064,8 @@ def create_app() -> Flask:
                 str(form["resolved_output_path"]),
                 clip_count=len(_resolve_selected_clip_ids(form, state.scan)),
                 strategies_text=", ".join(str(value) for value in form.get("target_strategies", [])),
+                source_mode=str(form.get("source_mode", "")),
+                review_mode=str(form.get("review_mode", "")),
                 preview_mode=str(form.get("preview_mode", "")),
             )
             state.message = "Approve Master RMD command started."
@@ -1871,6 +2091,8 @@ def create_app() -> Flask:
             str(form["resolved_output_path"]),
             clip_count=len(_resolve_selected_clip_ids(form, state.scan)),
             strategies_text=", ".join(str(value) for value in form.get("target_strategies", [])),
+            source_mode=str(form.get("source_mode", "")),
+            review_mode=str(form.get("review_mode", "")),
             preview_mode=str(form.get("preview_mode", "")),
         )
         return render_page()
