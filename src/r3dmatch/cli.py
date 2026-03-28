@@ -221,6 +221,7 @@ def report_contact_sheet_command(
     preview_highlight_rolloff: Optional[str] = typer.Option(None, "--preview-highlight-rolloff", help="Preview highlight rolloff"),
     preview_shadow_rolloff: Optional[str] = typer.Option(None, "--preview-shadow-rolloff", help="Preview shadow rolloff"),
     preview_lut: Optional[str] = typer.Option(None, "--preview-lut", help="Optional monitoring LUT (.cube)"),
+    require_real_redline: bool = typer.Option(False, "--require-real-redline", help="Require real REDLine plus real source media; fail explicitly instead of accepting mock-backed validation"),
 ) -> None:
     payload = build_contact_sheet_report(
         input_path,
@@ -235,6 +236,7 @@ def report_contact_sheet_command(
         preview_highlight_rolloff=preview_highlight_rolloff,
         preview_shadow_rolloff=preview_shadow_rolloff,
         preview_lut=preview_lut,
+        require_real_redline=require_real_redline,
     )
     typer.echo(str(payload))
 
@@ -279,6 +281,7 @@ def review_calibration_command(
     preview_highlight_rolloff: Optional[str] = typer.Option(None, "--preview-highlight-rolloff", help="Preview highlight rolloff"),
     preview_shadow_rolloff: Optional[str] = typer.Option(None, "--preview-shadow-rolloff", help="Preview shadow rolloff"),
     preview_lut: Optional[str] = typer.Option(None, "--preview-lut", help="Optional monitoring LUT (.cube)"),
+    require_real_redline: bool = typer.Option(False, "--require-real-redline", help="Require real REDLine plus real source media; fail explicitly instead of accepting mock-backed validation"),
 ) -> None:
     try:
         resolved_source_mode = normalize_source_mode(source_mode)
@@ -346,6 +349,7 @@ def review_calibration_command(
         preview_highlight_rolloff=preview_highlight_rolloff,
         preview_shadow_rolloff=preview_shadow_rolloff,
         preview_lut=preview_lut,
+        require_real_redline=require_real_redline,
     )
     typer.echo(str(payload))
 

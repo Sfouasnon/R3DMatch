@@ -7,11 +7,22 @@ from typing import Dict, Iterable, List, Optional
 
 import numpy as np
 
-from .calibration import build_array_calibration_from_analysis, calibration_baselines, color_calibration_gains, derive_array_group_key, extract_center_region, load_color_calibration, load_exposure_calibration, percentile_clip, write_array_calibration_json
+from .calibration import (
+    build_array_calibration_from_analysis,
+    calibration_baselines,
+    color_calibration_gains,
+    derive_array_group_key,
+    extract_center_region,
+    load_color_calibration,
+    load_exposure_calibration,
+    measure_sphere_region_statistics,
+    percentile_clip,
+    write_array_calibration_json,
+)
 from .execution import raise_if_cancelled
 from .identity import clip_id_from_path, legacy_camera_group_from_clip_id, subset_key_from_clip_id
 from .luts import CubeLut, apply_lut, load_cube_lut
-from .models import ClipResult, FrameStat, MonitoringContext, SamplePlan
+from .models import ClipResult, FrameStat, MonitoringContext, SamplePlan, SphereROI
 from .sdk import resolve_backend
 from .sidecar import write_sidecar_file
 
@@ -31,6 +42,7 @@ def analyze_path(
     sampling_strategy: str = "uniform",
     clamp_stops: float = 3.0,
     calibration_roi: Optional[Dict[str, float]] = None,
+    target_type: Optional[str] = None,
     selected_clip_ids: Optional[List[str]] = None,
     selected_clip_groups: Optional[List[str]] = None,
 ) -> Dict[str, object]:
@@ -74,6 +86,7 @@ def analyze_path(
                 sample_count=sample_count,
                 sampling_strategy=sampling_strategy,
                 calibration_roi=calibration_roi,
+                target_type=target_type,
             )
         )
 
@@ -303,6 +316,7 @@ def analyze_clip(
     sample_count: int,
     sampling_strategy: str,
     calibration_roi: Optional[Dict[str, float]] = None,
+    target_type: Optional[str] = None,
 ) -> ClipResult:
     raise_if_cancelled("Run cancelled before clip decode.")
     backend_impl = resolve_backend(backend)
@@ -331,6 +345,8 @@ def analyze_clip(
     neutral_sample_spreads: list[float] = []
     neutral_sample_chroma_spreads: list[float] = []
     representative_neutral_samples: list[dict[str, object]] = []
+    sphere_sampling_measurements: list[dict[str, object]] = []
+    sphere_sampling_confidences: list[float] = []
     for frame_index, timestamp_seconds, image in backend_impl.decode_frames(
         source_path,
         start_frame=sample_plan.start_frame,
@@ -340,7 +356,13 @@ def analyze_clip(
         raise_if_cancelled("Run cancelled during frame measurement.")
         stat = analyze_frame(frame_index, timestamp_seconds, image, mode=mode, lut=lut)
         frame_stats.append(stat)
-        measurement = measure_frame_color_and_exposure(image, mode=mode, lut=lut, calibration_roi=calibration_roi)
+        measurement = measure_frame_color_and_exposure(
+            image,
+            mode=mode,
+            lut=lut,
+            calibration_roi=calibration_roi,
+            target_type=target_type,
+        )
         measured_log_values.append(measurement["measured_log2_luminance"])
         measured_log_values_raw.append(measurement["measured_log2_luminance_raw"])
         measured_rgb_means.append(measurement["measured_rgb_mean"])
@@ -352,6 +374,9 @@ def analyze_clip(
         neutral_sample_chroma_spreads.append(float(measurement.get("neutral_sample_chromaticity_spread", 0.0) or 0.0))
         if not representative_neutral_samples and measurement.get("neutral_samples"):
             representative_neutral_samples = list(measurement["neutral_samples"])
+        if measurement.get("sphere_sampling_comparison"):
+            sphere_sampling_measurements.append(dict(measurement["sphere_sampling_comparison"]))
+            sphere_sampling_confidences.append(float(measurement.get("gray_sphere_sampling_confidence", 0.0) or 0.0))
         if stat.accepted:
             accepted_values.append(stat.log_luminance_median)
     if not accepted_values:
@@ -360,6 +385,34 @@ def analyze_clip(
     clip_statistic = median(accepted_values)
     global_reference = math.log2(0.18)
     raw_offset = global_reference - clip_statistic
+    diagnostics = {
+        "sampled_frames": len(frame_stats),
+        "accepted_frames": sum(1 for item in frame_stats if item.accepted),
+        "measured_log2_luminance": median(measured_log_values),
+        "measured_log2_luminance_monitoring": median(measured_log_values),
+        "measured_log2_luminance_raw": median(measured_log_values_raw),
+        "measured_rgb_mean": np.median(np.asarray(measured_rgb_means, dtype=np.float32), axis=0).tolist() if measured_rgb_means else [0.0, 0.0, 0.0],
+        "measured_rgb_chromaticity": np.median(np.asarray(measured_rgb_chroma, dtype=np.float32), axis=0).tolist() if measured_rgb_chroma else [1 / 3, 1 / 3, 1 / 3],
+        "valid_pixel_count": int(np.median(valid_pixel_counts)) if valid_pixel_counts else 0,
+        "saturation_fraction": float(np.median(saturation_fractions)) if saturation_fractions else 0.0,
+        "black_fraction": float(np.median(black_fractions)) if black_fractions else 0.0,
+        "neutral_sample_count": 3,
+        "neutral_sample_log2_spread": float(np.median(neutral_sample_spreads)) if neutral_sample_spreads else 0.0,
+        "neutral_sample_chromaticity_spread": float(np.median(neutral_sample_chroma_spreads)) if neutral_sample_chroma_spreads else 0.0,
+        "neutral_samples": representative_neutral_samples,
+        "calibration_roi": calibration_roi,
+        "calibration_measurement_mode": "shared_roi" if calibration_roi is not None else "center_region_fallback",
+        "exposure_measurement_domain": "monitoring",
+        "monitoring_preview_transform": "REDLine / IPP2 / Rec709 / BT1886 / Medium / Medium",
+    }
+    if sphere_sampling_measurements:
+        diagnostics.update(
+            {
+                "sphere_sampling_comparison": _aggregate_sphere_sampling_comparisons(sphere_sampling_measurements),
+                "gray_sphere_sampling_confidence": float(np.median(np.asarray(sphere_sampling_confidences, dtype=np.float32))) if sphere_sampling_confidences else 0.0,
+                "calibration_measurement_mode": str(measurement.get("calibration_measurement_mode") or diagnostics["calibration_measurement_mode"]),
+            }
+        )
     return ClipResult(
         clip_id=clip.clip_id,
         group_key=clip.group_key,
@@ -377,26 +430,7 @@ def analyze_clip(
         monitoring=monitoring,
         clip_metadata=clip,
         frame_stats=frame_stats,
-        diagnostics={
-            "sampled_frames": len(frame_stats),
-            "accepted_frames": sum(1 for item in frame_stats if item.accepted),
-            "measured_log2_luminance": median(measured_log_values),
-            "measured_log2_luminance_monitoring": median(measured_log_values),
-            "measured_log2_luminance_raw": median(measured_log_values_raw),
-            "measured_rgb_mean": np.median(np.asarray(measured_rgb_means, dtype=np.float32), axis=0).tolist() if measured_rgb_means else [0.0, 0.0, 0.0],
-            "measured_rgb_chromaticity": np.median(np.asarray(measured_rgb_chroma, dtype=np.float32), axis=0).tolist() if measured_rgb_chroma else [1 / 3, 1 / 3, 1 / 3],
-            "valid_pixel_count": int(np.median(valid_pixel_counts)) if valid_pixel_counts else 0,
-            "saturation_fraction": float(np.median(saturation_fractions)) if saturation_fractions else 0.0,
-            "black_fraction": float(np.median(black_fractions)) if black_fractions else 0.0,
-            "neutral_sample_count": 3,
-            "neutral_sample_log2_spread": float(np.median(neutral_sample_spreads)) if neutral_sample_spreads else 0.0,
-            "neutral_sample_chromaticity_spread": float(np.median(neutral_sample_chroma_spreads)) if neutral_sample_chroma_spreads else 0.0,
-            "neutral_samples": representative_neutral_samples,
-            "calibration_roi": calibration_roi,
-            "calibration_measurement_mode": "shared_roi" if calibration_roi is not None else "center_region_fallback",
-            "exposure_measurement_domain": "monitoring",
-            "monitoring_preview_transform": "REDLine / IPP2 / Rec709 / BT1886 / Medium / Medium",
-        },
+        diagnostics=diagnostics,
     )
 
 
@@ -563,12 +597,112 @@ def _measure_three_sample_statistics(region: np.ndarray) -> Dict[str, object]:
     }
 
 
+def _sphere_roi_for_region(region: np.ndarray) -> SphereROI:
+    _, height, width = region.shape
+    radius = max(min(width, height) * 0.46, 1.0)
+    return SphereROI(
+        cx=(float(width) - 1.0) / 2.0,
+        cy=(float(height) - 1.0) / 2.0,
+        r=float(radius),
+    )
+
+
+def _measure_gray_sphere_statistics(raw_region: np.ndarray, monitoring_region: np.ndarray) -> Dict[str, object]:
+    sphere_roi = _sphere_roi_for_region(raw_region)
+    legacy_raw = measure_sphere_region_statistics(raw_region, sphere_roi, sampling_variant="legacy")
+    refined_raw = measure_sphere_region_statistics(raw_region, sphere_roi, sampling_variant="refined")
+    legacy_monitoring = measure_sphere_region_statistics(monitoring_region, sphere_roi, sampling_variant="legacy")
+    refined_monitoring = measure_sphere_region_statistics(monitoring_region, sphere_roi, sampling_variant="refined")
+    raw_window_stats = _measure_three_sample_statistics(raw_region)
+    monitoring_window_stats = _measure_three_sample_statistics(monitoring_region)
+    return {
+        "measured_log2_luminance": float(refined_monitoring["measured_log2_luminance"]),
+        "measured_log2_luminance_monitoring": float(refined_monitoring["measured_log2_luminance"]),
+        "measured_log2_luminance_raw": float(refined_raw["measured_log2_luminance"]),
+        "measured_rgb_mean": [float(value) for value in refined_raw["measured_rgb_mean"]],
+        "measured_rgb_chromaticity": [float(value) for value in refined_raw["measured_rgb_chromaticity"]],
+        "valid_pixel_count": int(refined_monitoring["valid_pixel_count"]),
+        "saturation_fraction": float(refined_monitoring["saturation_fraction"]),
+        "black_fraction": float(refined_monitoring["black_fraction"]),
+        "roi_variance": float(refined_monitoring["roi_variance"]),
+        "monitoring_roi_variance": float(refined_monitoring["roi_variance"]),
+        "raw_roi_variance": float(refined_raw["roi_variance"]),
+        "neutral_sample_count": monitoring_window_stats["neutral_sample_count"],
+        "neutral_sample_log2_spread": monitoring_window_stats["neutral_sample_log2_spread"],
+        "neutral_sample_chromaticity_spread": raw_window_stats["neutral_sample_chromaticity_spread"],
+        "neutral_samples": monitoring_window_stats["neutral_samples"],
+        "neutral_samples_raw": raw_window_stats["neutral_samples"],
+        "raw_saturation_fraction": float(refined_raw["saturation_fraction"]),
+        "sphere_sampling_comparison": {
+            "measurement_geometry": "inscribed_circle_with_refined_interior_mask",
+            "sphere_roi_within_roi": {"cx": sphere_roi.cx, "cy": sphere_roi.cy, "r": sphere_roi.r},
+            "legacy": {
+                "monitoring_log2": float(legacy_monitoring["measured_log2_luminance"]),
+                "raw_log2": float(legacy_raw["measured_log2_luminance"]),
+                "confidence": float(legacy_raw["confidence"]),
+                "mask_fraction": float(legacy_raw["mask_fraction"]),
+                "sampling_method": str(legacy_raw["sampling_method"]),
+                "rgb_mean_raw": [float(value) for value in legacy_raw["measured_rgb_mean"]],
+                "rgb_chromaticity_raw": [float(value) for value in legacy_raw["measured_rgb_chromaticity"]],
+            },
+            "refined": {
+                "monitoring_log2": float(refined_monitoring["measured_log2_luminance"]),
+                "raw_log2": float(refined_raw["measured_log2_luminance"]),
+                "confidence": float(refined_raw["confidence"]),
+                "mask_fraction": float(refined_raw["mask_fraction"]),
+                "sampling_method": str(refined_raw["sampling_method"]),
+                "rgb_mean_raw": [float(value) for value in refined_raw["measured_rgb_mean"]],
+                "rgb_chromaticity_raw": [float(value) for value in refined_raw["measured_rgb_chromaticity"]],
+            },
+            "delta_raw_log2": float(refined_raw["measured_log2_luminance"] - legacy_raw["measured_log2_luminance"]),
+            "delta_monitoring_log2": float(refined_monitoring["measured_log2_luminance"] - legacy_monitoring["measured_log2_luminance"]),
+            "window_reference_raw_log2": float(raw_window_stats["measured_log2_luminance"]),
+            "window_reference_monitoring_log2": float(monitoring_window_stats["measured_log2_luminance"]),
+        },
+        "gray_sphere_sampling_confidence": float(refined_raw["confidence"]),
+        "calibration_measurement_mode": "gray_sphere_refined_circle",
+    }
+
+
+def _aggregate_sampling_variant(values: List[Dict[str, object]]) -> Dict[str, object]:
+    return {
+        "monitoring_log2": float(np.median(np.asarray([float(item.get("monitoring_log2", 0.0) or 0.0) for item in values], dtype=np.float32))),
+        "raw_log2": float(np.median(np.asarray([float(item.get("raw_log2", 0.0) or 0.0) for item in values], dtype=np.float32))),
+        "confidence": float(np.median(np.asarray([float(item.get("confidence", 0.0) or 0.0) for item in values], dtype=np.float32))),
+        "mask_fraction": float(np.median(np.asarray([float(item.get("mask_fraction", 0.0) or 0.0) for item in values], dtype=np.float32))),
+        "sampling_method": str(values[0].get("sampling_method") or ""),
+        "rgb_mean_raw": np.median(np.asarray([item.get("rgb_mean_raw", [0.0, 0.0, 0.0]) for item in values], dtype=np.float32), axis=0).tolist(),
+        "rgb_chromaticity_raw": np.median(
+            np.asarray([item.get("rgb_chromaticity_raw", [1 / 3, 1 / 3, 1 / 3]) for item in values], dtype=np.float32),
+            axis=0,
+        ).tolist(),
+    }
+
+
+def _aggregate_sphere_sampling_comparisons(values: List[Dict[str, object]]) -> Dict[str, object]:
+    legacy = _aggregate_sampling_variant([dict(item.get("legacy") or {}) for item in values])
+    refined = _aggregate_sampling_variant([dict(item.get("refined") or {}) for item in values])
+    return {
+        "measurement_geometry": str(values[0].get("measurement_geometry") or "inscribed_circle_with_refined_interior_mask"),
+        "sphere_roi_within_roi": dict(values[0].get("sphere_roi_within_roi") or {}),
+        "legacy": legacy,
+        "refined": refined,
+        "delta_raw_log2": float(refined["raw_log2"]) - float(legacy["raw_log2"]),
+        "delta_monitoring_log2": float(refined["monitoring_log2"]) - float(legacy["monitoring_log2"]),
+        "window_reference_raw_log2": float(np.median(np.asarray([float(item.get("window_reference_raw_log2", 0.0) or 0.0) for item in values], dtype=np.float32))),
+        "window_reference_monitoring_log2": float(
+            np.median(np.asarray([float(item.get("window_reference_monitoring_log2", 0.0) or 0.0) for item in values], dtype=np.float32))
+        ),
+    }
+
+
 def measure_frame_color_and_exposure(
     image: np.ndarray,
     *,
     mode: str,
     lut: Optional[CubeLut],
     calibration_roi: Optional[Dict[str, float]] = None,
+    target_type: Optional[str] = None,
 ) -> Dict[str, object]:
     raw_region = np.clip(image, 0.0, 1.0)
     raw_region = _extract_normalized_roi_region(raw_region, calibration_roi) if calibration_roi is not None else extract_center_region(raw_region, fraction=0.4)
@@ -577,6 +711,9 @@ def measure_frame_color_and_exposure(
         monitoring_region = apply_lut(monitoring_region, lut) if lut is not None else np.power(monitoring_region, 1.0 / 2.4)
     monitoring_region = _apply_monitoring_review_transform(monitoring_region)
     monitoring_region = _extract_normalized_roi_region(monitoring_region, calibration_roi) if calibration_roi is not None else extract_center_region(monitoring_region, fraction=0.4)
+
+    if str(target_type or "").strip().lower().replace("-", "_") == "gray_sphere" and calibration_roi is not None:
+        return _measure_gray_sphere_statistics(raw_region, monitoring_region)
 
     raw_stats = _measure_three_sample_statistics(raw_region)
     monitoring_stats = _measure_three_sample_statistics(monitoring_region)

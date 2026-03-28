@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import html
 import json
 import os
@@ -13,11 +14,19 @@ from typing import Dict, List, Optional
 import numpy as np
 from PIL import Image
 
-from .calibration import extract_center_region, load_color_calibration, load_exposure_calibration, percentile_clip
+from .calibration import (
+    extract_center_region,
+    load_color_calibration,
+    load_exposure_calibration,
+    measure_sphere_region_statistics,
+    percentile_clip,
+)
 from .color import identity_lggs, is_identity_cdl_payload as _color_is_identity_cdl_payload, rgb_gains_to_cdl, solve_cdl_color_model
 from .commit_values import build_commit_values, extract_as_shot_white_balance, solve_white_balance_model_for_records
 from .execution import CancellationError, raise_if_cancelled, run_cancellable_subprocess
 from .ftps_ingest import source_mode_label
+from .matching import _measure_three_sample_statistics
+from .models import SphereROI
 from .rmd import write_rmd_for_clip_with_metadata, write_rmds_from_analysis
 
 
@@ -55,6 +64,7 @@ ROLLOFF_CODES = {"none": 0, "hard": 1, "default": 2, "medium": 3, "soft": 4}
 TONEMAP_CODES = {"low": 0, "medium": 1, "high": 2, "none": 3}
 SHADOW_ROLLOFF_VALUES = {"hard": -0.25, "medium": 0.0, "soft": 0.25}
 LOGO_PATH = Path(__file__).resolve().parent / "static" / "r3dmatch_logo.png"
+REDLINE_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "redline.json"
 COLOR_PREVIEW_OVERRIDE_ENV = "R3DMATCH_ENABLE_UNVERIFIED_COLOR_PREVIEW"
 REVIEW_MODE_LABELS = {
     "full_contact_sheet": "Full Contact Sheet",
@@ -69,6 +79,15 @@ CAMERA_TRUST_CAUTION_LOG2_SPREAD = 0.08
 CAMERA_TRUST_CAUTION_CHROMA_SPREAD = 0.014
 CAMERA_TRUST_LARGE_CORRECTION = 0.75
 CAMERA_TRUST_EXTREME_CORRECTION = 1.0
+CORRECTED_RESIDUAL_PASS_STOPS = 0.10
+CORRECTED_RESIDUAL_REVIEW_STOPS = 0.20
+IPP2_VALIDATION_PASS_STOPS = 0.05
+IPP2_VALIDATION_REVIEW_STOPS = 0.10
+IPP2_CLOSED_LOOP_MAX_ITERATIONS = 6
+IPP2_CLOSED_LOOP_MAX_CORRECTION_STOPS = 3.0
+IPP2_CLOSED_LOOP_MIN_STEP_STOPS = 0.01
+IPP2_CLOSED_LOOP_DAMPING = 0.85
+IPP2_CLOSED_LOOP_MIN_IMPROVEMENT_STOPS = 0.002
 
 
 def normalize_review_mode(value: str) -> str:
@@ -302,6 +321,10 @@ def clear_preview_cache(input_path: str, *, report_dir: Optional[str] = None) ->
         if measurement_dir.exists():
             shutil.rmtree(measurement_dir)
             removed.append(str(measurement_dir))
+        ipp2_dir = preview_root / "_ipp2_validation"
+        if ipp2_dir.exists():
+            shutil.rmtree(ipp2_dir)
+            removed.append(str(ipp2_dir))
         commands_path = preview_root / "preview_commands.json"
         if commands_path.exists():
             commands_path.unlink()
@@ -318,6 +341,7 @@ def clear_preview_cache(input_path: str, *, report_dir: Optional[str] = None) ->
             "review_manifest.json",
             "review_package.json",
             "review_validation.json",
+            "ipp2_validation.json",
         ):
             path = report_root / name
             if path.exists():
@@ -332,13 +356,140 @@ def clear_preview_cache(input_path: str, *, report_dir: Optional[str] = None) ->
 
 
 def _resolve_redline_executable() -> str:
-    executable = os.environ.get("R3DMATCH_REDLINE_EXECUTABLE", "REDLine")
+    executable = str(os.environ.get("R3DMATCH_REDLINE_EXECUTABLE", "") or "").strip()
+    if not executable and REDLINE_CONFIG_PATH.exists():
+        try:
+            config_payload = json.loads(REDLINE_CONFIG_PATH.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Invalid REDLine config JSON: {REDLINE_CONFIG_PATH}") from exc
+        executable = str(config_payload.get("redline_executable") or config_payload.get("redline_path") or "").strip()
+    executable = executable or "REDLine"
     resolved = shutil.which(executable)
     if resolved:
         return resolved
-    if executable != "REDLine":
-        return executable
-    return executable
+    candidate = Path(executable).expanduser()
+    if candidate.exists():
+        return str(candidate.resolve())
+    raise RuntimeError("REDLine not found — real validation required")
+
+
+def _is_real_red_source_path(source_path: str) -> bool:
+    path = Path(source_path).expanduser().resolve()
+    suffix = path.suffix.lower()
+    if suffix == ".r3d":
+        return path.is_file() and path.stat().st_size > 0
+    if suffix == ".rdc":
+        return path.is_dir()
+    return False
+
+
+def _resolve_probe_output_path(output_path: str | Path) -> Path:
+    candidate = Path(output_path).expanduser().resolve()
+    if candidate.exists():
+        return candidate
+    matches = sorted(candidate.parent.glob(f"{candidate.name}.*"))
+    return matches[0] if matches else candidate
+
+
+def _probe_redline_source_renderability(
+    source_path: str,
+    *,
+    redline_executable: str,
+    probe_root: Path,
+) -> Dict[str, object]:
+    clip_name = Path(source_path).stem
+    requested_output = probe_root / f"{clip_name}.probe.jpg"
+    command = [
+        redline_executable,
+        "--i",
+        str(Path(source_path).expanduser().resolve()),
+        "--o",
+        str(requested_output),
+        "--format",
+        "3",
+        "--start",
+        "0",
+        "--frameCount",
+        "1",
+        "--colorSciVersion",
+        "3",
+        "--silent",
+        "--useMeta",
+        "--colorSpace",
+        str(COLOR_SPACE_CODES["BT.709"]),
+        "--gammaCurve",
+        str(GAMMA_CODES["BT.1886"]),
+        "--outputToneMap",
+        str(TONEMAP_CODES["medium"]),
+        "--rollOff",
+        str(ROLLOFF_CODES["medium"]),
+        "--shadow",
+        f"{float(SHADOW_ROLLOFF_VALUES['medium']):.3f}",
+    ]
+    completed = run_cancellable_subprocess(command)
+    actual_output = _resolve_probe_output_path(requested_output)
+    output = ((completed.stdout or "") + (completed.stderr or "")).strip()
+    return {
+        "source_path": str(Path(source_path).expanduser().resolve()),
+        "command": command,
+        "returncode": int(completed.returncode),
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+        "output_path": str(actual_output),
+        "ok": int(completed.returncode) == 0 and actual_output.exists(),
+        "output_preview": output[:400],
+    }
+
+
+def _require_real_redline_validation(
+    *,
+    input_path: str,
+    analysis_records: List[Dict[str, object]],
+    redline_executable: str,
+    out_root: Path,
+) -> Dict[str, object]:
+    summary = _load_summary_payload(input_path) or {}
+    backend_name = str(summary.get("backend") or "").strip().lower()
+    if backend_name == "mock":
+        raise RuntimeError(
+            "Real REDLine validation requires analysis produced from real media, not the mock backend."
+        )
+    source_probes: List[Dict[str, object]] = []
+    invalid_sources: List[str] = []
+    probe_root = out_root / "_real_redline_probe"
+    probe_root.mkdir(parents=True, exist_ok=True)
+    for record in analysis_records:
+        source_path = str(record.get("source_path") or "").strip()
+        if not source_path or not _is_real_red_source_path(source_path):
+            invalid_sources.append(source_path or "<missing>")
+            continue
+        probe = _probe_redline_source_renderability(
+            source_path,
+            redline_executable=redline_executable,
+            probe_root=probe_root,
+        )
+        source_probes.append(probe)
+        if not bool(probe["ok"]):
+            raise RuntimeError(
+                f"Real REDLine validation requires decodable source media. Render probe failed for {source_path}. "
+                f"STDERR: {str(probe.get('stderr') or '').strip()}"
+            )
+    if invalid_sources:
+        formatted = ", ".join(sorted(set(invalid_sources)))
+        raise RuntimeError(
+            "Real REDLine validation requires real source media inside the project. "
+            f"Invalid or placeholder sources: {formatted}"
+        )
+    payload = {
+        "required": True,
+        "redline_executable": redline_executable,
+        "analysis_backend": backend_name or None,
+        "validated_source_count": len(source_probes),
+        "source_probes": source_probes,
+    }
+    output_path = out_root / "real_redline_validation.json"
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return {"path": str(output_path), "summary": payload}
 
 
 def _detect_redline_capabilities(redline_executable: str) -> Dict[str, object]:
@@ -477,28 +628,1084 @@ def _extract_normalized_roi_region_hwc(image: np.ndarray, calibration_roi: Optio
     return image[y0:y1, x0:x1, :]
 
 
+def _solver_sampling_measurement_from_hwc_region(region: np.ndarray) -> Dict[str, object]:
+    chw = np.moveaxis(region, -1, 0)
+    stats = _measure_three_sample_statistics(chw)
+    return {
+        "measured_log2_luminance_monitoring": float(stats["measured_log2_luminance"]),
+        "measured_rgb_mean_monitoring": [float(value) for value in stats["measured_rgb_mean"]],
+        "measured_rgb_chromaticity_monitoring": [float(value) for value in stats["measured_rgb_chromaticity"]],
+        "valid_pixel_count_monitoring": int(stats["valid_pixel_count"]),
+        "monitoring_roi_variance": float(stats["roi_variance"]),
+        "neutral_sample_count_monitoring": int(stats["neutral_sample_count"]),
+        "neutral_sample_log2_spread_monitoring": float(stats["neutral_sample_log2_spread"]),
+        "neutral_sample_chromaticity_spread_monitoring": float(stats["neutral_sample_chromaticity_spread"]),
+        "neutral_samples_monitoring": [dict(item) for item in stats["neutral_samples"]],
+        "measurement_geometry": "three_rect_windows_within_roi",
+    }
+
+
 def _measure_rendered_preview_roi(preview_path: str, calibration_roi: Optional[Dict[str, float]]) -> Dict[str, object]:
     image = np.asarray(Image.open(preview_path).convert("RGB"), dtype=np.float32) / 255.0
     region = _extract_normalized_roi_region_hwc(image, calibration_roi)
-    luminance = np.clip(region[..., 0] * 0.2126 + region[..., 1] * 0.7152 + region[..., 2] * 0.0722, 1e-6, 1.0)
-    valid_mask = (luminance > 0.002) & (luminance < 0.998)
-    pixels = region[valid_mask]
-    if pixels.size == 0:
-        pixels = region.reshape(-1, 3)
-        luminance_values = luminance.reshape(-1)
-    else:
-        luminance_values = luminance[valid_mask]
-    trimmed_luma = percentile_clip(luminance_values, 5.0, 95.0)
-    measured_log2 = float(np.median(np.log2(trimmed_luma)))
-    rgb_mean = np.median(pixels, axis=0)
-    chroma = rgb_mean / max(float(np.sum(rgb_mean)), 1e-6)
+    stats = _solver_sampling_measurement_from_hwc_region(region)
+    pixels = region.reshape(-1, 3)
     saturation_fraction = float(np.mean(np.max(pixels, axis=1) >= 0.998)) if pixels.size else 0.0
     return {
-        "measured_log2_luminance_monitoring": measured_log2,
-        "measured_rgb_mean_monitoring": [float(rgb_mean[0]), float(rgb_mean[1]), float(rgb_mean[2])],
-        "measured_rgb_chromaticity_monitoring": [float(chroma[0]), float(chroma[1]), float(chroma[2])],
+        **stats,
         "measured_saturation_fraction_monitoring": saturation_fraction,
-        "valid_pixel_count_monitoring": int(pixels.shape[0]),
+    }
+
+
+def _sphere_roi_for_region_hwc(region: np.ndarray) -> SphereROI:
+    height, width = region.shape[:2]
+    radius = max(1.0, min(width, height) * 0.46)
+    return SphereROI(
+        cx=(float(width) - 1.0) / 2.0,
+        cy=(float(height) - 1.0) / 2.0,
+        r=float(radius),
+    )
+
+
+def _measure_rendered_preview_roi_ipp2(preview_path: str, calibration_roi: Optional[Dict[str, float]]) -> Dict[str, object]:
+    image = np.asarray(Image.open(preview_path).convert("RGB"), dtype=np.float32) / 255.0
+    region = _extract_normalized_roi_region_hwc(image, calibration_roi)
+    if region.size == 0:
+        stats = _measure_rendered_preview_roi(preview_path, calibration_roi)
+        return {
+            **stats,
+            "measurement_geometry": "empty_roi_fallback",
+            "sampling_method": "empty_roi_fallback",
+            "sampling_confidence": 0.0,
+            "mask_fraction": 0.0,
+        }
+    sphere_roi = _sphere_roi_for_region_hwc(region)
+    stats = measure_sphere_region_statistics(np.transpose(region, (2, 0, 1)), sphere_roi, sampling_variant="refined")
+    pixels = region.reshape(-1, 3)
+    saturation_fraction = float(np.mean(np.max(pixels, axis=1) >= 0.998)) if pixels.size else 0.0
+    return {
+        "measured_log2_luminance": float(stats["measured_log2_luminance"]),
+        "measured_log2_luminance_monitoring": float(stats["measured_log2_luminance"]),
+        "measured_rgb_mean": [float(value) for value in stats["measured_rgb_mean"]],
+        "measured_rgb_chromaticity": [float(value) for value in stats["measured_rgb_chromaticity"]],
+        "valid_pixel_count": int(stats["valid_pixel_count"]),
+        "roi_variance": float(stats["roi_variance"]),
+        "monitoring_roi_variance": float(stats["roi_variance"]),
+        "measured_saturation_fraction_monitoring": saturation_fraction,
+        "measurement_geometry": "refined_sphere_mask_in_rendered_ipp2_roi",
+        "sampling_method": str(stats["sampling_method"]),
+        "sampling_confidence": float(stats["confidence"]),
+        "mask_fraction": float(stats["mask_fraction"]),
+        "interior_radius_ratio": float(stats.get("interior_radius_ratio", 0.0) or 0.0),
+    }
+
+
+def _corrected_residual_status(abs_residual: float) -> Dict[str, object]:
+    value = float(abs_residual)
+    if value <= CORRECTED_RESIDUAL_PASS_STOPS:
+        return {
+            "status": "within_tolerance",
+            "label": "Within tolerance",
+            "tone": "good",
+        }
+    if value <= CORRECTED_RESIDUAL_REVIEW_STOPS:
+        return {
+            "status": "review",
+            "label": "Needs review",
+            "tone": "warning",
+        }
+    return {
+        "status": "outside_tolerance",
+        "label": "Outside tolerance",
+        "tone": "danger",
+    }
+
+
+def _corrected_residual_tolerance_model() -> Dict[str, object]:
+    return {
+        "metric": "absolute corrected render residual in log2 stops",
+        "pass_threshold_stops": CORRECTED_RESIDUAL_PASS_STOPS,
+        "review_threshold_stops": CORRECTED_RESIDUAL_REVIEW_STOPS,
+        "rationale": (
+            "Post-correction residuals should stay below the existing sample-stability caution band. "
+            "Residuals above 0.20 stops remain visibly mismatched on the contact sheet and are treated as failures."
+        ),
+    }
+
+
+def _ipp2_validation_status(abs_residual: float) -> Dict[str, object]:
+    value = float(abs_residual)
+    if value <= IPP2_VALIDATION_PASS_STOPS:
+        return {"status": "PASS", "tone": "good"}
+    if value <= IPP2_VALIDATION_REVIEW_STOPS:
+        return {"status": "REVIEW", "tone": "warning"}
+    return {"status": "FAIL", "tone": "danger"}
+
+
+def _ipp2_tolerance_model() -> Dict[str, object]:
+    return {
+        "metric": "absolute corrected IPP2 residual in log2 stops",
+        "pass_threshold_stops": IPP2_VALIDATION_PASS_STOPS,
+        "review_threshold_stops": IPP2_VALIDATION_REVIEW_STOPS,
+        "rationale": (
+            "R3DMatch is judged in monitoring space. Corrected cameras must match within 0.05 stops in the "
+            "IPP2 Medium / Medium review domain to pass acceptance."
+        ),
+    }
+
+
+def _ipp2_validation_preview_settings() -> Dict[str, object]:
+    return _normalize_preview_settings(
+        preview_mode="monitoring",
+        preview_output_space="BT.709",
+        preview_output_gamma="BT.1886",
+        preview_highlight_rolloff="medium",
+        preview_shadow_rolloff="medium",
+        preview_lut=None,
+    )
+
+
+def _ipp2_closed_loop_target(
+    *,
+    strategy_key: str,
+    reference_clip_id: Optional[str],
+    rows: List[Dict[str, object]],
+) -> Dict[str, object]:
+    trusted_rows = [
+        item for item in rows
+        if str(item.get("trust_class") or "") in {"TRUSTED", "USE_WITH_CAUTION"}
+        and item.get("initial_ipp2_value_log2") is not None
+    ]
+    fallback_rows = [item for item in rows if item.get("initial_ipp2_value_log2") is not None]
+    if strategy_key == "optimal_exposure" and reference_clip_id:
+        reference_row = next((item for item in fallback_rows if str(item.get("clip_id") or "") == str(reference_clip_id)), None)
+        if reference_row is not None:
+            return {
+                "target_log2": float(reference_row["initial_ipp2_value_log2"]),
+                "target_source": "reference_camera_initial_ipp2",
+                "reference_clip_id": str(reference_row.get("clip_id") or ""),
+            }
+    selected_rows = trusted_rows or fallback_rows
+    target = float(np.median(np.asarray([float(item["initial_ipp2_value_log2"]) for item in selected_rows], dtype=np.float32))) if selected_rows else 0.0
+    return {
+        "target_log2": target,
+        "target_source": "trusted_camera_median_initial_ipp2" if trusted_rows else "all_camera_median_initial_ipp2",
+        "reference_clip_id": str(reference_clip_id or ""),
+    }
+
+
+def _ipp2_closed_loop_iteration_path(
+    preview_root: Path,
+    *,
+    clip_id: str,
+    strategy_key: str,
+    run_id: str,
+    iteration: int,
+    correction_stops: float,
+) -> Path:
+    correction_token = f"{float(correction_stops):+.4f}".replace("+", "p").replace("-", "m").replace(".", "_")
+    filename = f"{clip_id}.both.review.{normalize_target_strategy_name(strategy_key)}.{run_id}.iter{iteration:02d}.{correction_token}.jpg"
+    return preview_root / filename
+
+
+def _ipp2_closed_loop_next_correction(
+    *,
+    current_correction: float,
+    current_residual: float,
+    previous_correction: Optional[float],
+    previous_residual: Optional[float],
+) -> float:
+    candidate = current_correction - (current_residual * IPP2_CLOSED_LOOP_DAMPING)
+    if previous_correction is not None and previous_residual is not None:
+        denominator = current_residual - previous_residual
+        if abs(denominator) > 1e-6 and abs(current_correction - previous_correction) > 1e-6:
+            secant_candidate = current_correction - (
+                current_residual * (current_correction - previous_correction) / denominator
+            )
+            candidate = current_correction + ((secant_candidate - current_correction) * IPP2_CLOSED_LOOP_DAMPING)
+    if abs(candidate - current_correction) < IPP2_CLOSED_LOOP_MIN_STEP_STOPS:
+        step = IPP2_CLOSED_LOOP_MIN_STEP_STOPS if abs(current_residual) < IPP2_CLOSED_LOOP_MIN_STEP_STOPS else min(abs(current_residual), 0.5)
+        candidate = current_correction - (np.sign(current_residual) * step)
+    return float(np.clip(candidate, -IPP2_CLOSED_LOOP_MAX_CORRECTION_STOPS, IPP2_CLOSED_LOOP_MAX_CORRECTION_STOPS))
+
+
+def _closed_loop_strategy_metrics(rows: List[Dict[str, object]]) -> Dict[str, object]:
+    abs_residuals = [abs(float(item.get("final_ipp2_residual_stops", 0.0) or 0.0)) for item in rows]
+    status_counts = {
+        status: sum(1 for item in rows if str(item.get("status") or "") == status)
+        for status in ("PASS", "REVIEW", "FAIL")
+    }
+    return {
+        "camera_count": len(rows),
+        "best_residual": min(abs_residuals) if abs_residuals else None,
+        "median_residual": float(np.median(np.asarray(abs_residuals, dtype=np.float32))) if abs_residuals else None,
+        "max_residual": max(abs_residuals) if abs_residuals else None,
+        "status_counts": status_counts,
+        "all_within_tolerance": all(value <= IPP2_VALIDATION_PASS_STOPS for value in abs_residuals) if abs_residuals else False,
+    }
+
+
+def _recommend_strategy_from_closed_loop(strategy_summaries: List[Dict[str, object]]) -> str:
+    if not strategy_summaries:
+        return ""
+    def rank(item: Dict[str, object]) -> tuple[float, float, float, int]:
+        metrics = dict(item.get("metrics") or {})
+        counts = dict(metrics.get("status_counts") or {})
+        priority = STRATEGY_ORDER.index(str(item.get("strategy_key") or "")) if str(item.get("strategy_key") or "") in STRATEGY_ORDER else len(STRATEGY_ORDER)
+        return (
+            float(counts.get("FAIL", 0) or 0),
+            float(metrics.get("max_residual", 0.0) or 0.0),
+            float(metrics.get("median_residual", 0.0) or 0.0),
+            priority,
+        )
+    winner = min(strategy_summaries, key=rank)
+    return str(winner.get("strategy_key") or "")
+
+
+def _run_ipp2_closed_loop_solver(
+    *,
+    input_path: str,
+    out_root: Path,
+    analysis_records: List[Dict[str, object]],
+    strategy_payloads: List[Dict[str, object]],
+    redline_capabilities: Dict[str, object],
+    run_id: str,
+) -> Dict[str, object]:
+    ipp2_preview_settings = _ipp2_validation_preview_settings()
+    preview_root = Path(input_path).expanduser().resolve() / "previews" / "_ipp2_closed_loop"
+    preview_root.mkdir(parents=True, exist_ok=True)
+    initial_preview_paths = generate_preview_stills(
+        input_path,
+        analysis_records=analysis_records,
+        previews_dir=str(preview_root),
+        preview_settings=ipp2_preview_settings,
+        redline_capabilities=redline_capabilities,
+        strategy_payloads=strategy_payloads,
+        run_id=f"{run_id}.closed_loop_init",
+        strategy_rmd_root=str(Path(input_path).expanduser().resolve() / "review_rmd" / "strategies_ipp2_closed_loop_init"),
+        render_originals=True,
+    )
+    redline_executable = _resolve_redline_executable()
+    record_by_clip = {str(record.get("clip_id") or ""): dict(record) for record in analysis_records}
+    original_measure_cache: Dict[str, Dict[str, object]] = {}
+    render_cache: Dict[tuple[str, str, float], Dict[str, object]] = {}
+    refined_payloads = copy.deepcopy(strategy_payloads)
+    closed_loop_strategy_summaries: List[Dict[str, object]] = []
+    preview_paths = copy.deepcopy(initial_preview_paths)
+
+    for strategy_payload in refined_payloads:
+        strategy_key = str(strategy_payload.get("strategy_key") or "")
+        strategy_exposure_summary = _exposure_summary(list(strategy_payload.get("clips") or []))
+        selection_diagnostics = dict(strategy_payload.get("selection_diagnostics") or {})
+        primary_cluster_indices = {int(index) for index in ((selection_diagnostics.get("primary_cluster") or {}).get("indices") or [])}
+        screened_candidates_by_clip = {
+            str(item.get("clip_id") or ""): dict(item)
+            for item in list(selection_diagnostics.get("screened_candidates") or [])
+            if str(item.get("clip_id") or "").strip()
+        }
+        initial_rows: List[Dict[str, object]] = []
+        for index, clip in enumerate(list(strategy_payload.get("clips") or [])):
+            clip_id = str(clip.get("clip_id") or "")
+            original_frame = str(initial_preview_paths.get(clip_id, {}).get("original") or "")
+            corrected_frame = str(initial_preview_paths.get(clip_id, {}).get("strategies", {}).get(strategy_key, {}).get("both") or "")
+            if original_frame and clip_id not in original_measure_cache and Path(original_frame).exists():
+                original_measure_cache[clip_id] = _measure_rendered_preview_roi_ipp2(original_frame, clip.get("calibration_roi"))
+            original_measure = dict(original_measure_cache.get(clip_id) or {})
+            corrected_measure = (
+                _measure_rendered_preview_roi_ipp2(corrected_frame, clip.get("calibration_roi"))
+                if corrected_frame and Path(corrected_frame).exists()
+                else {}
+            )
+            trust_details = _camera_trust_details(
+                clip_id=clip_id,
+                confidence=float(clip.get("confidence", 0.0) or 0.0),
+                sample_log2_spread=float(clip.get("neutral_sample_log2_spread", 0.0) or 0.0),
+                sample_chroma_spread=float(clip.get("neutral_sample_chromaticity_spread", 0.0) or 0.0),
+                measured_log2=float(clip.get("measured_log2_luminance_monitoring", clip.get("measured_log2_luminance", 0.0)) or 0.0),
+                final_offset=float(clip.get("exposure_offset_stops", 0.0) or 0.0),
+                exposure_summary=strategy_exposure_summary,
+                in_primary_cluster=(not primary_cluster_indices or index in primary_cluster_indices),
+                screened_reasons=[str(item) for item in (screened_candidates_by_clip.get(clip_id, {}) or {}).get("reasons", []) if str(item).strip()],
+            )
+            initial_rows.append(
+                {
+                    "clip_id": clip_id,
+                    "camera_id": _camera_id_from_clip_id(clip_id),
+                    "camera_label": _camera_label_for_reporting(clip_id),
+                    "source_path": str(clip.get("source_path") or ""),
+                    "frame_index": int((record_by_clip.get(clip_id, {}).get("sample_plan") or {}).get("start_frame", 0) or 0),
+                    "calibration_roi": clip.get("calibration_roi"),
+                    "trust_class": str(trust_details.get("trust_class") or "UNTRUSTED"),
+                    "reference_use": str(trust_details.get("reference_use") or "Included"),
+                    "trust_reason": str(trust_details.get("trust_reason") or ""),
+                    "initial_exposure_correction_stops": float(clip.get("exposure_offset_stops", 0.0) or 0.0),
+                    "initial_ipp2_value_log2": float(corrected_measure.get("measured_log2_luminance_monitoring", 0.0) or 0.0),
+                    "original_ipp2_value_log2": float(original_measure.get("measured_log2_luminance_monitoring", 0.0) or 0.0),
+                    "initial_image_path": corrected_frame,
+                    "color_cdl": copy.deepcopy(clip.get("color_cdl")),
+                }
+            )
+
+        target_summary = _ipp2_closed_loop_target(
+            strategy_key=strategy_key,
+            reference_clip_id=str(strategy_payload.get("reference_clip_id") or ""),
+            rows=initial_rows,
+        )
+        ipp2_target_log2 = float(target_summary["target_log2"])
+        row_results: List[Dict[str, object]] = []
+        clip_lookup = {str(item.get("clip_id") or ""): item for item in list(strategy_payload.get("clips") or [])}
+
+        for row in initial_rows:
+            clip_id = str(row["clip_id"])
+            clip_payload = clip_lookup[clip_id]
+            current_correction = float(row["initial_exposure_correction_stops"])
+            current_measure = float(row["initial_ipp2_value_log2"])
+            current_path = str(row["initial_image_path"] or "")
+            current_residual = current_measure - ipp2_target_log2
+            best_residual = current_residual
+            best_measure = current_measure
+            best_path = current_path
+            best_correction = current_correction
+            previous_correction: Optional[float] = None
+            previous_residual: Optional[float] = None
+            history: List[Dict[str, object]] = [
+                {
+                    "iteration": 0,
+                    "exposure_correction_stops": current_correction,
+                    "ipp2_value_log2": current_measure,
+                    "ipp2_residual_stops": current_residual,
+                    "image_path": current_path,
+                }
+            ]
+            for iteration in range(1, IPP2_CLOSED_LOOP_MAX_ITERATIONS + 1):
+                if abs(best_residual) <= IPP2_VALIDATION_PASS_STOPS:
+                    break
+                next_correction = _ipp2_closed_loop_next_correction(
+                    current_correction=current_correction,
+                    current_residual=current_residual,
+                    previous_correction=previous_correction,
+                    previous_residual=previous_residual,
+                )
+                cache_key = (clip_id, strategy_key, round(float(next_correction), 6))
+                cached = render_cache.get(cache_key)
+                if cached is None:
+                    iteration_path = _ipp2_closed_loop_iteration_path(
+                        preview_root,
+                        clip_id=clip_id,
+                        strategy_key=strategy_key,
+                        run_id=run_id,
+                        iteration=iteration,
+                        correction_stops=next_correction,
+                    )
+                    color_preview_enabled = bool(_color_preview_policy()["enabled"])
+                    render = render_preview_frame(
+                        row["source_path"],
+                        str(iteration_path),
+                        frame_index=int(row["frame_index"]),
+                        redline_executable=redline_executable,
+                        redline_capabilities=redline_capabilities,
+                        preview_settings=ipp2_preview_settings,
+                        use_as_shot_metadata=False,
+                        exposure=next_correction,
+                        color_cdl=copy.deepcopy(row.get("color_cdl")) if color_preview_enabled else None,
+                        color_method="cdl" if color_preview_enabled and not _is_identity_cdl_payload(row.get("color_cdl")) else None,
+                    )
+                    if int(render["returncode"]) != 0:
+                        raise RuntimeError(
+                            f"Closed-loop IPP2 render failed for {clip_id} ({strategy_key}) at iteration {iteration}. "
+                            f"Command: {shlex.join(render['command'])}. STDERR: {str(render['stderr']).strip()}"
+                        )
+                    measured = _measure_rendered_preview_roi_ipp2(str(render["output_path"]), row.get("calibration_roi"))
+                    cached = {
+                        "image_path": str(render["output_path"]),
+                        "measure": measured,
+                        "command": render["command"],
+                    }
+                    render_cache[cache_key] = cached
+                next_measure = float((cached.get("measure") or {}).get("measured_log2_luminance_monitoring", 0.0) or 0.0)
+                next_residual = next_measure - ipp2_target_log2
+                history.append(
+                    {
+                        "iteration": iteration,
+                        "exposure_correction_stops": float(next_correction),
+                        "ipp2_value_log2": next_measure,
+                        "ipp2_residual_stops": next_residual,
+                        "image_path": str(cached.get("image_path") or ""),
+                    }
+                )
+                if abs(next_residual) + IPP2_CLOSED_LOOP_MIN_IMPROVEMENT_STOPS < abs(best_residual):
+                    best_residual = next_residual
+                    best_measure = next_measure
+                    best_path = str(cached.get("image_path") or "")
+                    best_correction = float(next_correction)
+                if abs(next_residual) <= IPP2_VALIDATION_PASS_STOPS:
+                    best_residual = next_residual
+                    best_measure = next_measure
+                    best_path = str(cached.get("image_path") or "")
+                    best_correction = float(next_correction)
+                    break
+                previous_correction = current_correction
+                previous_residual = current_residual
+                current_correction = float(next_correction)
+                current_measure = next_measure
+                current_residual = next_residual
+
+            status = _ipp2_validation_status(abs(best_residual))
+            clip_payload["initial_exposure_offset_stops"] = float(row["initial_exposure_correction_stops"])
+            clip_payload["exposure_offset_stops"] = float(best_correction)
+            clip_payload["ipp2_closed_loop_target_log2"] = float(ipp2_target_log2)
+            clip_payload["ipp2_closed_loop_initial_residual_stops"] = float(row["initial_ipp2_value_log2"] - ipp2_target_log2)
+            clip_payload["ipp2_closed_loop_final_residual_stops"] = float(best_residual)
+            clip_payload["ipp2_closed_loop_iterations"] = copy.deepcopy(history)
+            preview_paths.setdefault(clip_id, {}).setdefault("strategies", {}).setdefault(strategy_key, {})
+            preview_paths[clip_id]["strategies"][strategy_key]["both"] = str(best_path)
+            if not _color_preview_policy()["enabled"]:
+                preview_paths[clip_id]["strategies"][strategy_key]["exposure"] = str(best_path)
+            row_results.append(
+                {
+                    "camera_id": row["camera_id"],
+                    "camera_label": row["camera_label"],
+                    "clip_id": clip_id,
+                    "strategy_key": strategy_key,
+                    "strategy_label": str(strategy_payload.get("strategy_label") or strategy_key),
+                    "reference_use": str(row["reference_use"]),
+                    "trust_class": str(row["trust_class"]),
+                    "trust_reason": str(row["trust_reason"]),
+                    "ipp2_original_value_log2": float(row["original_ipp2_value_log2"]),
+                    "ipp2_initial_value_log2": float(row["initial_ipp2_value_log2"]),
+                    "initial_ipp2_residual_stops": float(row["initial_ipp2_value_log2"] - ipp2_target_log2),
+                    "ipp2_value_log2": float(best_measure),
+                    "ipp2_target_log2": float(ipp2_target_log2),
+                    "ipp2_residual_stops": float(best_residual),
+                    "ipp2_residual_abs_stops": abs(float(best_residual)),
+                    "initial_exposure_correction_stops": float(row["initial_exposure_correction_stops"]),
+                    "applied_correction_stops": float(best_correction),
+                    "log_original_value_log2": float(clip_payload.get("measured_log2_luminance", 0.0) or 0.0),
+                    "log_target_value_log2": float(strategy_payload.get("target_log2_luminance", 0.0) or 0.0),
+                    "log_corrected_expected_log2": float(clip_payload.get("measured_log2_luminance", 0.0) or 0.0) + float(best_correction),
+                    "log_residual_stops": (
+                        float(clip_payload.get("measured_log2_luminance", 0.0) or 0.0)
+                        + float(best_correction)
+                        - float(strategy_payload.get("target_log2_luminance", 0.0) or 0.0)
+                    ),
+                    "ipp2_measurement_geometry": "refined_sphere_mask_in_rendered_ipp2_roi",
+                    "ipp2_sampling_method": str((render_cache.get((clip_id, strategy_key, round(float(best_correction), 6))) or {}).get("measure", {}).get("sampling_method") or "refined_interior_mask"),
+                    "ipp2_sampling_confidence": float((render_cache.get((clip_id, strategy_key, round(float(best_correction), 6))) or {}).get("measure", {}).get("sampling_confidence", 0.0) or 0.0),
+                    "ipp2_mask_fraction": float((render_cache.get((clip_id, strategy_key, round(float(best_correction), 6))) or {}).get("measure", {}).get("mask_fraction", 0.0) or 0.0),
+                    "original_image_path": str(initial_preview_paths.get(clip_id, {}).get("original") or ""),
+                    "corrected_image_path": str(best_path),
+                    "iteration_history": history,
+                    "status": str(status["status"]),
+                    "tone": str(status["tone"]),
+                    "target_source": str(target_summary["target_source"]),
+                }
+            )
+
+        metrics = _closed_loop_strategy_metrics(row_results)
+        closed_loop_strategy_summaries.append(
+            {
+                "strategy_key": strategy_key,
+                "strategy_label": str(strategy_payload.get("strategy_label") or strategy_key),
+                "target_log2": float(ipp2_target_log2),
+                "target_source": str(target_summary["target_source"]),
+                "reference_clip_id": str(target_summary.get("reference_clip_id") or strategy_payload.get("reference_clip_id") or ""),
+                "rows": row_results,
+                "metrics": metrics,
+            }
+        )
+
+    recommended_strategy_key = _recommend_strategy_from_closed_loop(closed_loop_strategy_summaries)
+    for payload in refined_payloads:
+        payload["recommended"] = str(payload.get("strategy_key") or "") == recommended_strategy_key
+        payload["ipp2_closed_loop"] = next(
+            (copy.deepcopy(item) for item in closed_loop_strategy_summaries if str(item.get("strategy_key") or "") == str(payload.get("strategy_key") or "")),
+            {},
+        )
+    summary = {
+        "schema_version": "r3dmatch_ipp2_closed_loop_trace_v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "validation_transform": _preview_transform_label(ipp2_preview_settings),
+        "tolerance_model": _ipp2_tolerance_model(),
+        "max_iterations": IPP2_CLOSED_LOOP_MAX_ITERATIONS,
+        "recommended_strategy_key": recommended_strategy_key,
+        "strategies": closed_loop_strategy_summaries,
+    }
+    output_path = out_root / "ipp2_closed_loop_trace.json"
+    output_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return {
+        "path": str(output_path),
+        "summary": summary,
+        "strategy_payloads": refined_payloads,
+        "preview_paths": preview_paths,
+        "preview_settings": ipp2_preview_settings,
+    }
+
+
+def _preview_settings_match(left: Dict[str, object], right: Dict[str, object]) -> bool:
+    keys = (
+        "preview_mode",
+        "output_space",
+        "output_gamma",
+        "highlight_rolloff",
+        "shadow_rolloff",
+        "lut_path",
+        "output_tonemap",
+    )
+    return all(left.get(key) == right.get(key) for key in keys)
+
+
+def _build_sampling_comparison(analysis_records: List[Dict[str, object]], *, out_root: Path) -> Optional[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for record in analysis_records:
+        diagnostics = dict(record.get("diagnostics") or {})
+        comparison = dict(diagnostics.get("sphere_sampling_comparison") or {})
+        legacy = dict(comparison.get("legacy") or {})
+        refined = dict(comparison.get("refined") or {})
+        if not legacy or not refined:
+            continue
+        rows.append(
+            {
+                "camera_id": _camera_id_from_clip_id(str(record.get("clip_id") or "")),
+                "clip_id": str(record.get("clip_id") or ""),
+                "legacy_measured_gray_log2": float(legacy.get("raw_log2", 0.0) or 0.0),
+                "refined_measured_gray_log2": float(refined.get("raw_log2", 0.0) or 0.0),
+                "delta_log2_stops": float(comparison.get("delta_raw_log2", 0.0) or 0.0),
+                "legacy_confidence": float(legacy.get("confidence", 0.0) or 0.0),
+                "refined_confidence": float(refined.get("confidence", 0.0) or 0.0),
+                "legacy_mask_fraction": float(legacy.get("mask_fraction", 1.0) or 0.0),
+                "refined_mask_fraction": float(refined.get("mask_fraction", 1.0) or 0.0),
+                "rejected_circle_fraction": max(0.0, 1.0 - float(refined.get("mask_fraction", 1.0) or 0.0)),
+                "legacy_sampling_method": str(legacy.get("sampling_method") or "legacy_circle_mask"),
+                "refined_sampling_method": str(refined.get("sampling_method") or "refined_interior_mask"),
+                "window_reference_raw_log2": float(comparison.get("window_reference_raw_log2", 0.0) or 0.0),
+            }
+        )
+    if not rows:
+        return None
+    delta_values = [abs(float(row["delta_log2_stops"])) for row in rows]
+    summary = {
+        "schema_version": "r3dmatch_sampling_comparison_v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "row_count": len(rows),
+        "median_absolute_delta_stops": float(np.median(np.asarray(delta_values, dtype=np.float32))) if delta_values else 0.0,
+        "max_absolute_delta_stops": max(delta_values) if delta_values else 0.0,
+        "rows": rows,
+    }
+    output_path = out_root / "sampling_comparison.json"
+    output_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return {"path": str(output_path), "summary": summary}
+
+
+def _analysis_records_for_sampling_variant(analysis_records: List[Dict[str, object]], *, variant: str) -> List[Dict[str, object]]:
+    updated_records: List[Dict[str, object]] = []
+    for record in analysis_records:
+        updated = copy.deepcopy(record)
+        diagnostics = dict(updated.get("diagnostics") or {})
+        comparison = dict(diagnostics.get("sphere_sampling_comparison") or {})
+        variant_payload = dict(comparison.get(variant) or {})
+        if variant_payload:
+            diagnostics["measured_log2_luminance_raw"] = float(variant_payload.get("raw_log2", diagnostics.get("measured_log2_luminance_raw", 0.0)) or 0.0)
+            diagnostics["measured_log2_luminance_monitoring"] = float(
+                variant_payload.get("monitoring_log2", diagnostics.get("measured_log2_luminance_monitoring", diagnostics.get("measured_log2_luminance", 0.0))) or 0.0
+            )
+            diagnostics["measured_log2_luminance"] = diagnostics["measured_log2_luminance_monitoring"]
+            diagnostics["measured_rgb_mean"] = [float(value) for value in (variant_payload.get("rgb_mean_raw") or diagnostics.get("measured_rgb_mean", [0.0, 0.0, 0.0]))]
+            diagnostics["measured_rgb_chromaticity"] = [
+                float(value)
+                for value in (variant_payload.get("rgb_chromaticity_raw") or diagnostics.get("measured_rgb_chromaticity", [1 / 3, 1 / 3, 1 / 3]))
+            ]
+            diagnostics["active_sampling_variant"] = variant
+        updated["diagnostics"] = diagnostics
+        updated_records.append(updated)
+    return updated_records
+
+
+def _strategy_snapshot(strategy_payloads: List[Dict[str, object]]) -> Dict[str, Dict[str, object]]:
+    snapshot: Dict[str, Dict[str, object]] = {}
+    for payload in strategy_payloads:
+        snapshot[str(payload["strategy_key"])] = {
+            "strategy_key": str(payload["strategy_key"]),
+            "strategy_label": str(payload["strategy_label"]),
+            "target_log2_luminance": float(payload["target_log2_luminance"]),
+            "reference_clip_id": payload.get("reference_clip_id"),
+            "clips": {
+                str(clip["clip_id"]): {
+                    "measured_log2_luminance": float(clip.get("measured_log2_luminance_raw", clip.get("measured_log2_luminance", 0.0)) or 0.0),
+                    "exposure_offset_stops": float(clip["exposure_offset_stops"]),
+                    "confidence": float(clip.get("confidence", 0.0) or 0.0),
+                }
+                for clip in payload.get("clips", [])
+            },
+        }
+    return snapshot
+
+
+def _build_solve_comparison(
+    analysis_records: List[Dict[str, object]],
+    *,
+    target_strategies: List[str],
+    reference_clip_id: Optional[str],
+    hero_clip_id: Optional[str],
+    target_type: Optional[str],
+    matching_domain: str,
+    quality_by_clip: Optional[Dict[str, Dict[str, object]]],
+    anchor_target_log2: Optional[float],
+    out_root: Path,
+) -> Optional[Dict[str, object]]:
+    if not any((record.get("diagnostics") or {}).get("sphere_sampling_comparison") for record in analysis_records):
+        return None
+    variants = {
+        "legacy": _analysis_records_for_sampling_variant(analysis_records, variant="legacy"),
+        "refined": _analysis_records_for_sampling_variant(analysis_records, variant="refined"),
+    }
+    snapshots: Dict[str, Dict[str, object]] = {}
+    for variant_key, variant_records in variants.items():
+        payloads = _build_strategy_payloads(
+            variant_records,
+            target_strategies=target_strategies,
+            reference_clip_id=reference_clip_id,
+            hero_clip_id=hero_clip_id,
+            target_type=target_type,
+            monitoring_measurements_by_clip=None,
+            matching_domain=matching_domain,
+            quality_by_clip=quality_by_clip,
+            anchor_target_log2=anchor_target_log2,
+        )
+        snapshots[variant_key] = _strategy_snapshot(payloads)
+    strategies: List[Dict[str, object]] = []
+    for strategy_key in sorted(set(snapshots["legacy"].keys()) | set(snapshots["refined"].keys()), key=lambda item: STRATEGY_ORDER.index(item) if item in STRATEGY_ORDER else 999):
+        legacy_strategy = dict(snapshots["legacy"].get(strategy_key) or {})
+        refined_strategy = dict(snapshots["refined"].get(strategy_key) or {})
+        legacy_clips = dict(legacy_strategy.get("clips") or {})
+        refined_clips = dict(refined_strategy.get("clips") or {})
+        clip_rows = []
+        for clip_id in sorted(set(legacy_clips.keys()) | set(refined_clips.keys())):
+            legacy_clip = dict(legacy_clips.get(clip_id) or {})
+            refined_clip = dict(refined_clips.get(clip_id) or {})
+            correction_delta = float(refined_clip.get("exposure_offset_stops", 0.0) or 0.0) - float(legacy_clip.get("exposure_offset_stops", 0.0) or 0.0)
+            clip_rows.append(
+                {
+                    "camera_id": _camera_id_from_clip_id(clip_id),
+                    "clip_id": clip_id,
+                    "legacy_measured_gray_log2": float(legacy_clip.get("measured_log2_luminance", 0.0) or 0.0),
+                    "refined_measured_gray_log2": float(refined_clip.get("measured_log2_luminance", 0.0) or 0.0),
+                    "legacy_correction_stops": float(legacy_clip.get("exposure_offset_stops", 0.0) or 0.0),
+                    "refined_correction_stops": float(refined_clip.get("exposure_offset_stops", 0.0) or 0.0),
+                    "correction_delta_stops": correction_delta,
+                    "stronger_brighten_with_refined": correction_delta > 1e-4,
+                }
+            )
+        strategies.append(
+            {
+                "strategy_key": strategy_key,
+                "strategy_label": str(refined_strategy.get("strategy_label") or legacy_strategy.get("strategy_label") or strategy_key),
+                "legacy_target_log2": float(legacy_strategy.get("target_log2_luminance", 0.0) or 0.0),
+                "refined_target_log2": float(refined_strategy.get("target_log2_luminance", 0.0) or 0.0),
+                "target_delta_stops": float(refined_strategy.get("target_log2_luminance", 0.0) or 0.0) - float(legacy_strategy.get("target_log2_luminance", 0.0) or 0.0),
+                "clips": clip_rows,
+            }
+        )
+    output_payload = {
+        "schema_version": "r3dmatch_solve_comparison_v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "strategies": strategies,
+    }
+    output_path = out_root / "solve_comparison.json"
+    output_path.write_text(json.dumps(output_payload, indent=2), encoding="utf-8")
+    return {"path": str(output_path), "summary": output_payload}
+
+
+def _build_corrected_residual_validation(
+    *,
+    strategies: List[Dict[str, object]],
+    out_root: Path,
+) -> Dict[str, object]:
+    tolerance = _corrected_residual_tolerance_model()
+    validation_rows: List[Dict[str, object]] = []
+    original_measure_cache: Dict[str, Dict[str, object]] = {}
+
+    for strategy in strategies:
+        raw_rows: List[Dict[str, object]] = []
+        corrected_values_for_target: List[float] = []
+        for clip in strategy.get("clips", []):
+            clip_id = str(clip.get("clip_id") or "")
+            calibration_roi = clip.get("calibration_roi")
+            original_frame = clip.get("original_frame")
+            corrected_frame = clip.get("both_corrected")
+            if original_frame and clip_id not in original_measure_cache and Path(str(original_frame)).exists():
+                original_measure_cache[clip_id] = _measure_rendered_preview_roi(str(original_frame), calibration_roi)
+            original_measure = dict(original_measure_cache.get(clip_id) or {})
+            corrected_measure = (
+                _measure_rendered_preview_roi(str(corrected_frame), calibration_roi)
+                if corrected_frame and Path(str(corrected_frame)).exists()
+                else {}
+            )
+            metrics = dict(clip.get("metrics") or {})
+            exposure_metrics = dict(metrics.get("exposure") or {})
+            trust_class = str(clip.get("trust_class") or "UNTRUSTED")
+            corrected_log2 = float(corrected_measure.get("measured_log2_luminance_monitoring", 0.0) or 0.0)
+            if trust_class in {"TRUSTED", "USE_WITH_CAUTION"} and corrected_measure:
+                corrected_values_for_target.append(corrected_log2)
+            raw_rows.append(
+                {
+                    "camera_id": _camera_id_from_clip_id(clip_id),
+                    "camera_label": _camera_label_for_reporting(clip_id),
+                    "clip_id": clip_id,
+                    "strategy_key": str(strategy.get("strategy_key") or ""),
+                    "strategy_label": str(strategy.get("strategy_label") or ""),
+                    "recommended": bool(strategy.get("recommended")),
+                    "analysis_target_log2": float(strategy.get("target_log2_luminance", 0.0) or 0.0),
+                    "original_measured_gray_log2": float(original_measure.get("measured_log2_luminance_monitoring", 0.0) or 0.0),
+                    "applied_correction_stops": float(exposure_metrics.get("final_offset_stops", 0.0) or 0.0),
+                    "corrected_measured_gray_log2": corrected_log2,
+                    "trust_class": trust_class,
+                    "reference_use": str(clip.get("reference_use") or "Included"),
+                    "trust_reason": str(clip.get("trust_reason") or ""),
+                    "measurement_geometry": str(corrected_measure.get("measurement_geometry") or "three_rect_windows_within_roi"),
+                    "corrected_image_path": str(corrected_frame or ""),
+                    "original_image_path": str(original_frame or ""),
+                }
+            )
+
+        if corrected_values_for_target:
+            render_target_log2 = float(np.median(np.asarray(corrected_values_for_target, dtype=np.float32)))
+        else:
+            fallback_values = [
+                float(item.get("corrected_measured_gray_log2", 0.0) or 0.0)
+                for item in raw_rows
+                if str(item.get("corrected_image_path") or "").strip()
+            ]
+            render_target_log2 = float(np.median(np.asarray(fallback_values, dtype=np.float32))) if fallback_values else 0.0
+
+        for row in raw_rows:
+            residual = float(row["corrected_measured_gray_log2"]) - render_target_log2
+            status = _corrected_residual_status(abs(residual))
+            row["render_target_gray_log2"] = render_target_log2
+            row["residual_error_stops"] = residual
+            row["residual_abs_error_stops"] = abs(residual)
+            row["residual_status"] = str(status["status"])
+            row["residual_label"] = str(status["label"])
+            row["residual_tone"] = str(status["tone"])
+            validation_rows.append(row)
+
+    recommended_rows = [row for row in validation_rows if bool(row.get("recommended"))]
+    if not recommended_rows:
+        recommended_strategy_key = next(
+            (str(item.get("strategy_key") or "") for item in strategies if bool(item.get("recommended"))),
+            str(strategies[0].get("strategy_key") or "") if strategies else "",
+        )
+        recommended_rows = [row for row in validation_rows if str(row.get("strategy_key") or "") == recommended_strategy_key]
+    abs_residuals = [float(row.get("residual_abs_error_stops", 0.0) or 0.0) for row in recommended_rows]
+    outside_rows = [row for row in recommended_rows if str(row.get("residual_status") or "") == "outside_tolerance"]
+    summary = {
+        "schema_version": "r3dmatch_corrected_residual_validation_v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "tolerance_model": tolerance,
+        "strategy_count": len(strategies),
+        "row_count": len(validation_rows),
+        "recommended_strategy_key": next(
+            (str(item.get("strategy_key") or "") for item in strategies if bool(item.get("recommended"))),
+            str(strategies[0].get("strategy_key") or "") if strategies else "",
+        ),
+        "best_residual_stops": min(abs_residuals) if abs_residuals else None,
+        "worst_residual_stops": max(abs_residuals) if abs_residuals else None,
+        "median_residual_stops": float(np.median(np.asarray(abs_residuals, dtype=np.float32))) if abs_residuals else None,
+        "outside_tolerance_cameras": [
+            {
+                "camera_id": row["camera_id"],
+                "clip_id": row["clip_id"],
+                "residual_error_stops": row["residual_error_stops"],
+                "trust_class": row["trust_class"],
+                "trust_reason": row["trust_reason"],
+            }
+            for row in outside_rows
+        ],
+        "rows": validation_rows,
+    }
+    output_path = out_root / "corrected_residual_validation.json"
+    output_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return {
+        "path": str(output_path),
+        "summary": summary,
+    }
+
+
+def _build_ipp2_validation(
+    *,
+    input_path: str,
+    out_root: Path,
+    analysis_records: List[Dict[str, object]],
+    strategy_payloads: List[Dict[str, object]],
+    strategies: List[Dict[str, object]],
+    redline_capabilities: Dict[str, object],
+    run_id: str,
+    display_preview_settings: Dict[str, object],
+    display_preview_paths: Dict[str, Dict[str, object]],
+    closed_loop_result: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    ipp2_preview_settings = dict((closed_loop_result or {}).get("preview_settings") or _ipp2_validation_preview_settings())
+    reuse_display_previews = _preview_settings_match(display_preview_settings, ipp2_preview_settings)
+    validation_rows: List[Dict[str, object]] = []
+    if closed_loop_result is not None:
+        recommended_strategy_key = str((closed_loop_result.get("summary") or {}).get("recommended_strategy_key") or "")
+        for strategy_summary in list(((closed_loop_result.get("summary") or {}).get("strategies") or [])):
+            strategy_key = str(strategy_summary.get("strategy_key") or "")
+            for item in list(strategy_summary.get("rows") or []):
+                row = copy.deepcopy(item)
+                row["recommended"] = strategy_key == recommended_strategy_key
+                row["used_contact_sheet_asset_for_validation"] = False
+                row["log_vs_ipp2_residual_delta_stops"] = float(row.get("ipp2_residual_stops", 0.0) or 0.0) - float(row.get("log_residual_stops", 0.0) or 0.0)
+                validation_rows.append(row)
+    else:
+        if reuse_display_previews:
+            ipp2_preview_paths = display_preview_paths
+        else:
+            ipp2_preview_paths = generate_preview_stills(
+                input_path,
+                analysis_records=analysis_records,
+                previews_dir=str(Path(input_path).expanduser().resolve() / "previews" / "_ipp2_validation"),
+                preview_settings=ipp2_preview_settings,
+                redline_capabilities=redline_capabilities,
+                strategy_payloads=strategy_payloads,
+                run_id=f"{run_id}.ipp2",
+                strategy_rmd_root=str(Path(input_path).expanduser().resolve() / "review_rmd" / "strategies_ipp2_validation"),
+                render_originals=True,
+            )
+
+        original_measure_cache: Dict[str, Dict[str, object]] = {}
+
+        for strategy in strategies:
+            raw_rows: List[Dict[str, object]] = []
+            trusted_values: List[float] = []
+            fallback_values: List[float] = []
+            for clip in strategy.get("clips", []):
+                clip_id = str(clip.get("clip_id") or "")
+                calibration_roi = clip.get("calibration_roi")
+                original_frame = str(ipp2_preview_paths.get(clip_id, {}).get("original") or "")
+                corrected_frame = str(
+                    ipp2_preview_paths.get(clip_id, {}).get("strategies", {}).get(str(strategy.get("strategy_key") or ""), {}).get("both") or ""
+                )
+                if original_frame and clip_id not in original_measure_cache and Path(original_frame).exists():
+                    original_measure_cache[clip_id] = _measure_rendered_preview_roi_ipp2(original_frame, calibration_roi)
+                original_measure = dict(original_measure_cache.get(clip_id) or {})
+                corrected_measure = (
+                    _measure_rendered_preview_roi_ipp2(corrected_frame, calibration_roi)
+                    if corrected_frame and Path(corrected_frame).exists()
+                    else {}
+                )
+                ipp2_value = float(corrected_measure.get("measured_log2_luminance_monitoring", 0.0) or 0.0)
+                if corrected_measure:
+                    fallback_values.append(ipp2_value)
+                    if str(clip.get("trust_class") or "") in {"TRUSTED", "USE_WITH_CAUTION"}:
+                        trusted_values.append(ipp2_value)
+                log_original = float((clip.get("metrics", {}).get("exposure", {}) or {}).get("measured_log2_luminance", 0.0) or 0.0)
+                applied_correction = float((clip.get("metrics", {}).get("exposure", {}) or {}).get("final_offset_stops", 0.0) or 0.0)
+                log_target = float(strategy.get("target_log2_luminance", 0.0) or 0.0)
+                log_corrected_expected = log_original + applied_correction
+                log_residual = log_corrected_expected - log_target
+                raw_rows.append(
+                    {
+                        "camera_id": _camera_id_from_clip_id(clip_id),
+                        "camera_label": _camera_label_for_reporting(clip_id),
+                        "clip_id": clip_id,
+                        "strategy_key": str(strategy.get("strategy_key") or ""),
+                        "strategy_label": str(strategy.get("strategy_label") or ""),
+                        "recommended": bool(strategy.get("recommended")),
+                        "reference_use": str(clip.get("reference_use") or "Included"),
+                        "trust_class": str(clip.get("trust_class") or "UNTRUSTED"),
+                        "trust_reason": str(clip.get("trust_reason") or ""),
+                        "ipp2_original_value_log2": float(original_measure.get("measured_log2_luminance_monitoring", 0.0) or 0.0),
+                        "ipp2_value_log2": ipp2_value,
+                        "applied_correction_stops": applied_correction,
+                        "log_original_value_log2": log_original,
+                        "log_target_value_log2": log_target,
+                        "log_corrected_expected_log2": log_corrected_expected,
+                        "log_residual_stops": log_residual,
+                        "ipp2_measurement_geometry": str(corrected_measure.get("measurement_geometry") or "refined_sphere_mask_in_rendered_ipp2_roi"),
+                        "ipp2_sampling_method": str(corrected_measure.get("sampling_method") or ""),
+                        "ipp2_sampling_confidence": float(corrected_measure.get("sampling_confidence", 0.0) or 0.0),
+                        "ipp2_mask_fraction": float(corrected_measure.get("mask_fraction", 0.0) or 0.0),
+                        "corrected_image_path": corrected_frame,
+                        "original_image_path": original_frame,
+                        "used_contact_sheet_asset_for_validation": bool(
+                            corrected_frame and corrected_frame == str(clip.get("both_corrected") or "")
+                        ),
+                    }
+                )
+
+            ipp2_target = (
+                float(np.median(np.asarray(trusted_values, dtype=np.float32)))
+                if trusted_values
+                else float(np.median(np.asarray(fallback_values, dtype=np.float32)))
+                if fallback_values
+                else 0.0
+            )
+
+            for row in raw_rows:
+                ipp2_residual = float(row["ipp2_value_log2"]) - ipp2_target
+                status = _ipp2_validation_status(abs(ipp2_residual))
+                row["ipp2_target_log2"] = ipp2_target
+                row["ipp2_residual_stops"] = ipp2_residual
+                row["ipp2_residual_abs_stops"] = abs(ipp2_residual)
+                row["status"] = str(status["status"])
+                row["tone"] = str(status["tone"])
+                row["log_vs_ipp2_residual_delta_stops"] = ipp2_residual - float(row["log_residual_stops"])
+                validation_rows.append(row)
+
+    recommended_rows = [row for row in validation_rows if bool(row.get("recommended"))]
+    if not recommended_rows:
+        recommended_strategy_key = next(
+            (str(item.get("strategy_key") or "") for item in strategies if bool(item.get("recommended"))),
+            str(strategies[0].get("strategy_key") or "") if strategies else "",
+        )
+        recommended_rows = [row for row in validation_rows if str(row.get("strategy_key") or "") == recommended_strategy_key]
+    residuals = [float(row.get("ipp2_residual_abs_stops", 0.0) or 0.0) for row in recommended_rows]
+    divergence_values = [abs(float(row.get("log_vs_ipp2_residual_delta_stops", 0.0) or 0.0)) for row in recommended_rows]
+    status_counts = {
+        status: sum(1 for row in recommended_rows if str(row.get("status") or "") == status)
+        for status in ("PASS", "REVIEW", "FAIL")
+    }
+    summary = {
+        "schema_version": "r3dmatch_ipp2_validation_v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "validation_transform": _preview_transform_label(ipp2_preview_settings),
+        "validation_preview_settings": ipp2_preview_settings,
+        "contact_sheet_preview_transform": _preview_transform_label(display_preview_settings),
+        "contact_sheet_preview_matches_validation": reuse_display_previews,
+        "tolerance_model": _ipp2_tolerance_model(),
+        "strategy_count": len(strategies),
+        "row_count": len(validation_rows),
+        "recommended_strategy_key": next(
+            (str(item.get("strategy_key") or "") for item in strategies if bool(item.get("recommended"))),
+            str(strategies[0].get("strategy_key") or "") if strategies else "",
+        ),
+        "max_residual": max(residuals) if residuals else None,
+        "median_residual": float(np.median(np.asarray(residuals, dtype=np.float32))) if residuals else None,
+        "best_residual": min(residuals) if residuals else None,
+        "all_within_tolerance": all(float(value) <= IPP2_VALIDATION_PASS_STOPS for value in residuals) if residuals else False,
+        "status_counts": status_counts,
+        "log_vs_ipp2_max_divergence_stops": max(divergence_values) if divergence_values else None,
+        "rows": validation_rows,
+    }
+    output_path = out_root / "ipp2_validation.json"
+    output_path.write_text(json.dumps({"cameras": validation_rows, "summary": summary}, indent=2), encoding="utf-8")
+    return {"path": str(output_path), "summary": summary}
+
+
+def _write_render_trace_artifacts(
+    *,
+    out_root: Path,
+    analysis_records: List[Dict[str, object]],
+    strategies: List[Dict[str, object]],
+    ipp2_validation_summary: Dict[str, object],
+    preview_manifest_payload: Dict[str, object],
+) -> Dict[str, str]:
+    recommended_strategy_key = str(
+        ipp2_validation_summary.get("recommended_strategy_key")
+        or next((item.get("strategy_key") for item in strategies if item.get("recommended")), "")
+        or ""
+    )
+    record_by_clip = {
+        str(record.get("clip_id") or ""): dict(record)
+        for record in analysis_records
+        if str(record.get("clip_id") or "").strip()
+    }
+    strategy_section = next(
+        (item for item in strategies if str(item.get("strategy_key") or "") == recommended_strategy_key),
+        strategies[0] if strategies else {},
+    )
+    preview_commands = list(preview_manifest_payload.get("commands") or [])
+    baseline_by_clip = {
+        str(item.get("clip_id") or ""): dict(item)
+        for item in preview_commands
+        if isinstance(item, dict) and str(item.get("variant") or "") == "original"
+    }
+    validation_rows = [
+        dict(item)
+        for item in list(ipp2_validation_summary.get("rows") or [])
+        if str(item.get("strategy_key") or "") == recommended_strategy_key
+    ]
+
+    render_input_rows: List[Dict[str, object]] = []
+    pre_render_rows: List[Dict[str, object]] = []
+    post_render_rows: List[Dict[str, object]] = []
+    comparison_rows: List[Dict[str, object]] = []
+
+    for clip in list(strategy_section.get("clips") or []):
+        clip_id = str(clip.get("clip_id") or "")
+        record = record_by_clip.get(clip_id, {})
+        metadata = dict(record.get("clip_metadata") or {})
+        baseline_command = dict(baseline_by_clip.get(clip_id) or {})
+        ipp2_row = next((item for item in validation_rows if str(item.get("clip_id") or "") == clip_id), {})
+        render_input_rows.append(
+            {
+                "clip_id": clip_id,
+                "camera_id": _camera_id_from_clip_id(clip_id),
+                "source_path": str(record.get("source_path") or clip.get("source_path") or ""),
+                "iso": metadata.get("iso"),
+                "kelvin": metadata.get("kelvin"),
+                "tint": metadata.get("tint"),
+                "color_space": metadata.get("color_space"),
+                "gamma_curve": metadata.get("gamma_curve"),
+                "original_render_command": baseline_command.get("command"),
+                "preview_transform": str((clip.get("metrics") or {}).get("preview_transform") or ""),
+                "corrected_state": {
+                    "initialExposureAdjust": float(((clip.get("metrics") or {}).get("exposure") or {}).get("initial_offset_stops", 0.0) or 0.0),
+                    "exposureAdjust": float(((clip.get("metrics") or {}).get("exposure") or {}).get("final_offset_stops", 0.0) or 0.0),
+                    "rgb_gains": (((clip.get("metrics") or {}).get("color") or {}).get("rgb_gains_diagnostic")
+                                  or ((clip.get("metrics") or {}).get("color") or {}).get("rgb_gains")),
+                    "cdl": (((clip.get("metrics") or {}).get("color") or {}).get("cdl")),
+                },
+            }
+        )
+        pre_render_rows.append(
+            {
+                "clip_id": clip_id,
+                "camera_id": _camera_id_from_clip_id(clip_id),
+                "log_pre_render": float(((clip.get("metrics") or {}).get("exposure") or {}).get("measured_log2_luminance", 0.0) or 0.0),
+                "log_pre_render_monitoring_proxy": float(((clip.get("metrics") or {}).get("exposure") or {}).get("measured_log2_luminance_monitoring", 0.0) or 0.0),
+            }
+        )
+        post_render_rows.append(
+            {
+                "clip_id": clip_id,
+                "camera_id": _camera_id_from_clip_id(clip_id),
+                "ipp2_original_value": float(ipp2_row.get("ipp2_original_value_log2", 0.0) or 0.0),
+                "ipp2_corrected_value": float(ipp2_row.get("ipp2_value_log2", 0.0) or 0.0),
+                "ipp2_target": float(ipp2_row.get("ipp2_target_log2", 0.0) or 0.0),
+                "ipp2_residual": float(ipp2_row.get("ipp2_residual_stops", 0.0) or 0.0),
+                "status": str(ipp2_row.get("status") or ""),
+                "original_image_path": ipp2_row.get("original_image_path"),
+                "corrected_image_path": ipp2_row.get("corrected_image_path"),
+            }
+        )
+        comparison_rows.append(
+            {
+                "clip_id": clip_id,
+                "camera_id": _camera_id_from_clip_id(clip_id),
+                "log_pre_render": float(((clip.get("metrics") or {}).get("exposure") or {}).get("measured_log2_luminance", 0.0) or 0.0),
+                "ipp2_original_value": float(ipp2_row.get("ipp2_original_value_log2", 0.0) or 0.0),
+                "ipp2_corrected_value": float(ipp2_row.get("ipp2_value_log2", 0.0) or 0.0),
+                "applied_correction": float(ipp2_row.get("applied_correction_stops", 0.0) or 0.0),
+                "delta_log_to_ipp2_original": float(ipp2_row.get("ipp2_original_value_log2", 0.0) or 0.0)
+                - float(((clip.get("metrics") or {}).get("exposure") or {}).get("measured_log2_luminance", 0.0) or 0.0),
+                "delta_log_residual_to_ipp2_residual": float(ipp2_row.get("log_vs_ipp2_residual_delta_stops", 0.0) or 0.0),
+            }
+        )
+
+    render_input_path = out_root / "render_input_state.json"
+    pre_render_path = out_root / "pre_render_log_values.json"
+    post_render_path = out_root / "post_render_ipp2_values.json"
+    comparison_path = out_root / "render_trace_comparison.json"
+    render_input_path.write_text(json.dumps({"cameras": render_input_rows}, indent=2), encoding="utf-8")
+    pre_render_path.write_text(json.dumps({"cameras": pre_render_rows}, indent=2), encoding="utf-8")
+    post_render_path.write_text(json.dumps({"cameras": post_render_rows}, indent=2), encoding="utf-8")
+    comparison_path.write_text(json.dumps({"cameras": comparison_rows}, indent=2), encoding="utf-8")
+    return {
+        "render_input_state_path": str(render_input_path),
+        "pre_render_log_values_path": str(pre_render_path),
+        "post_render_ipp2_values_path": str(post_render_path),
+        "render_trace_comparison_path": str(comparison_path),
     }
 
 
@@ -2978,15 +4185,16 @@ def render_preview_frame(
     red_gain: Optional[float] = None,
     green_gain: Optional[float] = None,
     blue_gain: Optional[float] = None,
+    color_cdl: Optional[Dict[str, object]] = None,
     rmd_path: Optional[str] = None,
     use_rmd_mode: int = 1,
     color_method: Optional[str] = None,
 ) -> Dict[str, object]:
     raise_if_cancelled("Run cancelled before preview render.")
-    color_cdl = None
+    resolved_color_cdl = copy.deepcopy(color_cdl) if color_cdl is not None else None
     resolved_color_method = color_method
     if red_gain is not None or green_gain is not None or blue_gain is not None:
-        color_cdl = {
+        resolved_color_cdl = {
             "slope": [
                 float(red_gain if red_gain is not None else 1.0),
                 float(green_gain if green_gain is not None else 1.0),
@@ -3003,7 +4211,7 @@ def render_preview_frame(
         output_path=output_path,
         frame_index=frame_index,
         exposure_stops=exposure,
-        color_cdl=color_cdl,
+        color_cdl=resolved_color_cdl,
         color_method=resolved_color_method,
         redline_executable=redline_executable,
         preview_settings=preview_settings,
@@ -3138,11 +4346,11 @@ def generate_preview_stills(
     selected_rmd_use_mode = 1
     color_preview_policy = _color_preview_policy()
     render_settings = _normalize_preview_settings(
-        preview_mode=str(DEFAULT_DISPLAY_REVIEW_PREVIEW["preview_mode"]),
-        preview_output_space=str(DEFAULT_DISPLAY_REVIEW_PREVIEW["output_space"]),
-        preview_output_gamma=str(DEFAULT_DISPLAY_REVIEW_PREVIEW["output_gamma"]),
-        preview_highlight_rolloff=str(DEFAULT_DISPLAY_REVIEW_PREVIEW["highlight_rolloff"]),
-        preview_shadow_rolloff=str(DEFAULT_DISPLAY_REVIEW_PREVIEW["shadow_rolloff"]),
+        preview_mode=str(preview_settings.get("preview_mode") or DEFAULT_DISPLAY_REVIEW_PREVIEW["preview_mode"]),
+        preview_output_space=str(preview_settings.get("output_space") or DEFAULT_DISPLAY_REVIEW_PREVIEW["output_space"]),
+        preview_output_gamma=str(preview_settings.get("output_gamma") or DEFAULT_DISPLAY_REVIEW_PREVIEW["output_gamma"]),
+        preview_highlight_rolloff=str(preview_settings.get("highlight_rolloff") or DEFAULT_DISPLAY_REVIEW_PREVIEW["highlight_rolloff"]),
+        preview_shadow_rolloff=str(preview_settings.get("shadow_rolloff") or DEFAULT_DISPLAY_REVIEW_PREVIEW["shadow_rolloff"]),
         preview_lut=str(preview_settings.get("lut_path")) if preview_settings.get("lut_path") else None,
     )
 
@@ -3490,6 +4698,7 @@ def build_contact_sheet_report(
     target_strategies: Optional[List[str]] = None,
     reference_clip_id: Optional[str] = None,
     hero_clip_id: Optional[str] = None,
+    require_real_redline: bool = False,
 ) -> Dict[str, object]:
     raise_if_cancelled("Run cancelled before report generation.")
     root = Path(input_path).expanduser().resolve()
@@ -3506,14 +4715,22 @@ def build_contact_sheet_report(
     run_id = resolved_run_label
     redline_executable = _resolve_redline_executable()
     redline_capabilities = _detect_redline_capabilities(redline_executable)
+    real_redline_validation = None
+    if require_real_redline:
+        real_redline_validation = _require_real_redline_validation(
+            input_path=input_path,
+            analysis_records=analysis_records,
+            redline_executable=redline_executable,
+            out_root=out_root,
+        )
     color_preview_policy = _color_preview_policy()
     measurement_preview_settings = _measurement_preview_settings_for_domain(resolved_matching_domain)
     display_preview_settings = _normalize_preview_settings(
-        preview_mode=str(DEFAULT_DISPLAY_REVIEW_PREVIEW["preview_mode"]),
-        preview_output_space=preview_output_space or str(DEFAULT_DISPLAY_REVIEW_PREVIEW["output_space"]),
-        preview_output_gamma=preview_output_gamma or str(DEFAULT_DISPLAY_REVIEW_PREVIEW["output_gamma"]),
-        preview_highlight_rolloff=preview_highlight_rolloff or str(DEFAULT_DISPLAY_REVIEW_PREVIEW["highlight_rolloff"]),
-        preview_shadow_rolloff=preview_shadow_rolloff or str(DEFAULT_DISPLAY_REVIEW_PREVIEW["shadow_rolloff"]),
+        preview_mode=preview_mode,
+        preview_output_space=preview_output_space,
+        preview_output_gamma=preview_output_gamma,
+        preview_highlight_rolloff=preview_highlight_rolloff,
+        preview_shadow_rolloff=preview_shadow_rolloff,
         preview_lut=preview_lut,
     )
     exposure = load_exposure_calibration(exposure_calibration_path) if exposure_calibration_path else None
@@ -3553,6 +4770,50 @@ def build_contact_sheet_report(
         quality_by_clip=quality_by_clip,
         anchor_target_log2=_anchor_target_log2_from_array_payload(array_calibration_payload),
     )
+    ipp2_closed_loop = _run_ipp2_closed_loop_solver(
+        input_path=input_path,
+        out_root=out_root,
+        analysis_records=analysis_records,
+        strategy_payloads=strategy_payloads,
+        redline_capabilities=redline_capabilities,
+        run_id=run_id,
+    )
+    strategy_payloads = list(ipp2_closed_loop.get("strategy_payloads") or strategy_payloads)
+    sampling_comparison = _build_sampling_comparison(analysis_records, out_root=out_root)
+    solve_comparison = _build_solve_comparison(
+        analysis_records,
+        target_strategies=resolved_strategies,
+        reference_clip_id=reference_clip_id,
+        hero_clip_id=hero_clip_id,
+        target_type=target_type,
+        matching_domain=resolved_matching_domain,
+        quality_by_clip=quality_by_clip,
+        anchor_target_log2=_anchor_target_log2_from_array_payload(array_calibration_payload),
+        out_root=out_root,
+    )
+    recommended_strategy_key = str((ipp2_closed_loop.get("summary") or {}).get("recommended_strategy_key") or "")
+    recommended_strategy = next(
+        (item for item in strategy_payloads if str(item.get("strategy_key") or "") == recommended_strategy_key),
+        _recommend_strategy(strategy_payloads) if strategy_payloads else None,
+    )
+    if recommended_strategy is not None:
+        closed_loop_strategy = next(
+            (item for item in list((ipp2_closed_loop.get("summary") or {}).get("strategies") or []) if str(item.get("strategy_key") or "") == str(recommended_strategy.get("strategy_key") or "")),
+            {},
+        )
+        closed_loop_metrics = dict(closed_loop_strategy.get("metrics") or {})
+        recommended_strategy = {
+            **dict(recommended_strategy),
+            "ipp2_closed_loop": copy.deepcopy(closed_loop_strategy),
+            "reason": (
+                f"{strategy_display_name(str(recommended_strategy.get('strategy_key') or 'median'))} is recommended because it produced the "
+                f"lowest IPP2 residual outcome after closed-loop refinement "
+                f"({float(closed_loop_metrics.get('median_residual', 0.0) or 0.0):.2f} median / "
+                f"{float(closed_loop_metrics.get('max_residual', 0.0) or 0.0):.2f} worst, "
+                f"{int((closed_loop_metrics.get('status_counts') or {}).get('PASS', 0) or 0)} pass)."
+            ),
+        }
+    recommended_strategy_key = str((recommended_strategy or {}).get("strategy_key") or "")
     preview_paths = generate_preview_stills(
         input_path,
         analysis_records=analysis_records,
@@ -3602,14 +4863,35 @@ def build_contact_sheet_report(
     strategies = []
     for strategy_payload in strategy_payloads:
         raise_if_cancelled("Run cancelled while assembling strategy report payloads.")
+        strategy_exposure_summary = _exposure_summary(strategy_payload["clips"])
+        selection_diagnostics = dict(strategy_payload.get("selection_diagnostics") or {})
+        primary_cluster_indices = {
+            int(index) for index in ((selection_diagnostics.get("primary_cluster") or {}).get("indices") or [])
+        }
+        screened_candidates_by_clip = {
+            str(item.get("clip_id") or ""): dict(item)
+            for item in list(selection_diagnostics.get("screened_candidates") or [])
+            if str(item.get("clip_id") or "").strip()
+        }
         strategy_clips = []
-        for record in analysis_records:
+        for index, record in enumerate(analysis_records):
             raise_if_cancelled("Run cancelled while assembling strategy report payloads.")
             group_key = str(record["group_key"])
             clip_id = str(record["clip_id"])
             exposure_entry = exposure_by_group.get(group_key)
             color_entry = color_by_group.get(group_key)
             strategy_clip = next(item for item in strategy_payload["clips"] if item["clip_id"] == clip_id)
+            trust_details = _camera_trust_details(
+                clip_id=clip_id,
+                confidence=float(strategy_clip.get("confidence", 0.0) or 0.0),
+                sample_log2_spread=float(strategy_clip.get("neutral_sample_log2_spread", 0.0) or 0.0),
+                sample_chroma_spread=float(strategy_clip.get("neutral_sample_chromaticity_spread", 0.0) or 0.0),
+                measured_log2=float(strategy_clip.get("measured_log2_luminance_monitoring", strategy_clip.get("measured_log2_luminance", 0.0)) or 0.0),
+                final_offset=float(strategy_clip.get("exposure_offset_stops", 0.0) or 0.0),
+                exposure_summary=strategy_exposure_summary,
+                in_primary_cluster=(not primary_cluster_indices or index in primary_cluster_indices),
+                screened_reasons=[str(item) for item in (screened_candidates_by_clip.get(clip_id, {}) or {}).get("reasons", []) if str(item).strip()],
+            )
             strategy_clips.append(
                 {
                     "clip_id": clip_id,
@@ -3630,9 +4912,17 @@ def build_contact_sheet_report(
                     ),
                     "calibration_roi": strategy_clip["calibration_roi"],
                     "is_hero_camera": strategy_clip["is_hero_camera"],
+                    "trust_class": str(trust_details["trust_class"]),
+                    "trust_score": float(trust_details["trust_score"]),
+                    "trust_reason": str(trust_details["trust_reason"]),
+                    "stability_label": str(trust_details["stability_label"]),
+                    "correction_confidence": str(trust_details["correction_confidence"]),
+                    "reference_use": str(trust_details["reference_use"]),
+                    "recommended": str(strategy_payload["strategy_key"]) == recommended_strategy_key,
                     "metrics": {
                         "exposure": {
                             "raw_offset_stops": record.get("raw_offset_stops"),
+                            "initial_offset_stops": strategy_clip.get("initial_exposure_offset_stops", strategy_clip["exposure_offset_stops"]),
                             "final_offset_stops": strategy_clip["exposure_offset_stops"],
                             "pre_residual_stops": strategy_clip.get("pre_exposure_residual_stops"),
                             "post_residual_stops": strategy_clip.get("post_exposure_residual_stops"),
@@ -3640,6 +4930,10 @@ def build_contact_sheet_report(
                             "measured_log2_luminance_monitoring": strategy_clip["measured_log2_luminance_monitoring"],
                             "measured_log2_luminance_raw": strategy_clip["measured_log2_luminance_raw"],
                             "measurement_domain": strategy_clip["exposure_measurement_domain"],
+                            "ipp2_closed_loop_target_log2": strategy_clip.get("ipp2_closed_loop_target_log2"),
+                            "ipp2_closed_loop_initial_residual_stops": strategy_clip.get("ipp2_closed_loop_initial_residual_stops"),
+                            "ipp2_closed_loop_final_residual_stops": strategy_clip.get("ipp2_closed_loop_final_residual_stops"),
+                            "ipp2_closed_loop_iterations": strategy_clip.get("ipp2_closed_loop_iterations"),
                         },
                         "color": {
                             "rgb_gains": strategy_clip["rgb_gains"],
@@ -3688,6 +4982,7 @@ def build_contact_sheet_report(
                 "target_saturation_fraction": strategy_payload.get("target_saturation_fraction"),
                 "strategy_summary": strategy_payload.get("strategy_summary"),
                 "calibration_roi": calibration_roi or (analysis_records[0].get("diagnostics", {}).get("calibration_roi") if analysis_records else None),
+                "recommended": str(strategy_payload["strategy_key"]) == recommended_strategy_key,
                 "clips": strategy_clips,
             }
         )
@@ -3706,6 +5001,47 @@ def build_contact_sheet_report(
         ),
         "color_preview_policy": preview_manifest_payload.get("color_preview_policy"),
     }
+    corrected_residual_validation = _build_corrected_residual_validation(
+        strategies=strategies,
+        out_root=out_root,
+    )
+    ipp2_validation = _build_ipp2_validation(
+        input_path=input_path,
+        out_root=out_root,
+        analysis_records=analysis_records,
+        strategy_payloads=strategy_payloads,
+        strategies=strategies,
+        redline_capabilities=redline_capabilities,
+        run_id=run_id,
+        display_preview_settings=display_preview_settings,
+        display_preview_paths=preview_paths,
+        closed_loop_result=ipp2_closed_loop,
+    )
+    render_trace_artifacts = _write_render_trace_artifacts(
+        out_root=out_root,
+        analysis_records=analysis_records,
+        strategies=strategies,
+        ipp2_validation_summary=ipp2_validation["summary"],
+        preview_manifest_payload=preview_manifest_payload,
+    )
+    residual_lookup = {
+        (str(item.get("strategy_key") or ""), str(item.get("clip_id") or "")): dict(item)
+        for item in list((corrected_residual_validation.get("summary") or {}).get("rows") or [])
+        if str(item.get("strategy_key") or "").strip() and str(item.get("clip_id") or "").strip()
+    }
+    ipp2_lookup = {
+        (str(item.get("strategy_key") or ""), str(item.get("clip_id") or "")): dict(item)
+        for item in list((ipp2_validation.get("summary") or {}).get("rows") or [])
+        if str(item.get("strategy_key") or "").strip() and str(item.get("clip_id") or "").strip()
+    }
+    for strategy in strategies:
+        for clip in strategy.get("clips", []):
+            clip["corrected_residual_validation"] = dict(
+                residual_lookup.get((str(strategy.get("strategy_key") or ""), str(clip.get("clip_id") or ""))) or {}
+            )
+            clip["ipp2_validation"] = dict(
+                ipp2_lookup.get((str(strategy.get("strategy_key") or ""), str(clip.get("clip_id") or ""))) or {}
+            )
 
     payload = {
         "report_kind": "full_contact_sheet",
@@ -3739,6 +5075,9 @@ def build_contact_sheet_report(
         "preview_settings": display_preview_settings,
         "measurement_preview_settings": measurement_preview_settings,
         "redline_capabilities": redline_capabilities,
+        "real_redline_validation_required": bool(require_real_redline),
+        "real_redline_validation": real_redline_validation["summary"] if real_redline_validation else None,
+        "real_redline_validation_path": real_redline_validation["path"] if real_redline_validation else None,
         "calibration_roi": calibration_roi or (analysis_records[0].get("diagnostics", {}).get("calibration_roi") if analysis_records else None),
         "run_id": run_id,
         "selected_clip_ids": [str(item) for item in (selected_clip_ids or []) if str(item).strip()],
@@ -3749,9 +5088,20 @@ def build_contact_sheet_report(
         "clip_count": len(analysis_records),
         "shared_originals": shared_originals,
         "strategies": strategies,
-        "clips": strategies[0]["clips"] if strategies else [],
+        "clips": next((item["clips"] for item in strategies if str(item.get("strategy_key") or "") == recommended_strategy_key), strategies[0]["clips"] if strategies else []),
         "strategy_review_rmd_root": str((root / "review_rmd" / "strategies").resolve()),
         "render_truth_summary": payload_render_truth,
+        "sampling_comparison": sampling_comparison["summary"] if sampling_comparison else None,
+        "sampling_comparison_path": sampling_comparison["path"] if sampling_comparison else None,
+        "solve_comparison": solve_comparison["summary"] if solve_comparison else None,
+        "solve_comparison_path": solve_comparison["path"] if solve_comparison else None,
+        "corrected_residual_validation": corrected_residual_validation["summary"],
+        "corrected_residual_validation_path": corrected_residual_validation["path"],
+        "ipp2_closed_loop": ipp2_closed_loop["summary"],
+        "ipp2_closed_loop_trace_path": ipp2_closed_loop["path"],
+        "ipp2_validation": ipp2_validation["summary"],
+        "ipp2_validation_path": ipp2_validation["path"],
+        **render_trace_artifacts,
     }
     strategy_summaries = [
         {
@@ -3765,12 +5115,16 @@ def build_contact_sheet_report(
         }
         for item in strategy_payloads
     ]
-    payload["recommended_strategy"] = _recommend_strategy(strategy_payloads) if strategy_payloads else None
+    payload["recommended_strategy"] = recommended_strategy
     payload["hero_recommendation"] = _hero_candidate_summary(strategy_payloads)
-    payload["exposure_summary"] = _exposure_summary(strategies[0]["clips"] if strategies else [])
+    recommended_strategy_section = next(
+        (item for item in strategies if str(item.get("strategy_key") or "") == recommended_strategy_key),
+        strategies[0] if strategies else None,
+    )
+    payload["exposure_summary"] = _exposure_summary((recommended_strategy_section or {}).get("clips", []))
     payload["strategy_comparison"] = strategy_summaries
     payload["visuals"] = {
-        "exposure_plot_svg": _build_exposure_plot_svg(strategies[0]["clips"] if strategies else []),
+        "exposure_plot_svg": _build_exposure_plot_svg((recommended_strategy_section or {}).get("clips", [])),
         "strategy_chart_svg": _build_strategy_chart_svg(strategy_summaries),
     }
     if strategy_payloads:
@@ -3865,6 +5219,12 @@ def build_contact_sheet_report(
         "preview_settings": payload["preview_settings"],
         "measurement_preview_settings": payload["measurement_preview_settings"],
         "redline_capabilities": payload["redline_capabilities"],
+        "real_redline_validation_required": payload["real_redline_validation_required"],
+        "real_redline_validation_path": payload["real_redline_validation_path"],
+        "render_input_state_path": payload["render_input_state_path"],
+        "pre_render_log_values_path": payload["pre_render_log_values_path"],
+        "post_render_ipp2_values_path": payload["post_render_ipp2_values_path"],
+        "render_trace_comparison_path": payload["render_trace_comparison_path"],
     }
 
 
@@ -3915,6 +5275,7 @@ def build_review_package(
     target_strategies: Optional[List[str]] = None,
     reference_clip_id: Optional[str] = None,
     hero_clip_id: Optional[str] = None,
+    require_real_redline: bool = False,
 ) -> Dict[str, object]:
     raise_if_cancelled("Run cancelled before review package assembly.")
     root = Path(out_dir).expanduser().resolve()
@@ -3969,6 +5330,7 @@ def build_review_package(
             reference_clip_id=reference_clip_id,
             hero_clip_id=hero_clip_id,
             clear_cache=True,
+            require_real_redline=require_real_redline,
         )
     if resolved_review_mode == "lightweight_analysis":
         rmd_manifest = {
@@ -4038,11 +5400,13 @@ def render_contact_sheet_pdf(
         except OSError:
             return ImageFont.load_default()
 
-    title_font = load_font(38, bold=True)
-    section_font = load_font(24, bold=True)
-    clip_font = load_font(18, bold=True)
-    body_font = load_font(15, bold=False)
-    caption_font = load_font(13, bold=False)
+    residual_validation = dict(payload.get("corrected_residual_validation") or {})
+    ipp2_validation = dict(payload.get("ipp2_validation") or {})
+    title_font = load_font(44, bold=True)
+    section_font = load_font(28, bold=True)
+    clip_font = load_font(22, bold=True)
+    body_font = load_font(17, bold=False)
+    caption_font = load_font(15, bold=False)
     pages = []
     page_width = 1700
     page_height = 2200
@@ -4051,9 +5415,9 @@ def render_contact_sheet_pdf(
     logo_max_width = 150
     logo_max_height = 84
     tile_gap_x = 20
-    tile_gap_y = 36
-    metadata_line_height = 22
-    section_gap = 38
+    tile_gap_y = 48
+    metadata_line_height = 28
+    section_gap = 44
 
     logo_image = None
     if LOGO_PATH.exists():
@@ -4081,15 +5445,15 @@ def render_contact_sheet_pdf(
             f"Matching domain: {payload.get('matching_domain_label')}",
             f"Preview transform: {payload.get('preview_transform')}",
             f"Measurement transform: {payload.get('measurement_preview_transform')}",
-            f"Calibration ROI: {payload.get('calibration_roi')}",
-            f"Selected clip groups: {payload.get('selected_clip_groups') or 'all'}",
-            f"Selected clip count: {len(payload.get('selected_clip_ids') or []) or payload.get('clip_count')}",
-            f"Target strategies: {', '.join(strategy_display_name(item) for item in payload.get('target_strategies', []))}",
+            f"IPP2 validation transform: {ipp2_validation.get('validation_transform')}",
+            f"Tolerance: +/-{float((ipp2_validation.get('tolerance_model') or {}).get('pass_threshold_stops', 0.0) or 0.0):.2f} stops pass",
+            f"Worst IPP2 residual: {float(ipp2_validation.get('max_residual', 0.0) or 0.0):.2f}",
+            f"IPP2 failures: {int((ipp2_validation.get('status_counts') or {}).get('FAIL', 0) or 0)}",
         ]
         summary_y = y + 74
         for line in summary_lines:
             draw.text((text_x, summary_y), line, fill="black", font=body_font)
-            summary_y += 20
+            summary_y += 24
         if timestamp_label:
             draw.text((page_width - margin_x - 420, y + 8), timestamp_label, fill="black", font=body_font)
         header_bottom = max(summary_y, y + (logo_image.height if logo_image is not None else 96))
@@ -4120,11 +5484,11 @@ def render_contact_sheet_pdf(
         section_meta: Optional[List[str]] = None,
     ) -> int:
         nonlocal page, draw, y
-        columns = _report_grid_columns(len(tiles))
+        columns = min(_report_grid_columns(len(tiles)), 3)
         tile_width = int((page_width - (2 * margin_x) - (tile_gap_x * (columns - 1))) / max(columns, 1))
         tile_width = max(180, tile_width)
         image_height = max(120, int(tile_width * 0.62))
-        metadata_block_height = 128
+        metadata_block_height = 184
         tile_block_height = image_height + metadata_block_height
         tiles_per_page = _report_tiles_per_page(columns)
         paged_tiles = _chunk_tiles(tiles, tiles_per_page)
@@ -4165,11 +5529,13 @@ def render_contact_sheet_pdf(
                 correction_text = str(tile.get("correction_text", "Exposure: n/a"))
                 correction_fill = {"lift": "#15803d", "lower": "#b91c1c", "neutral": "#475569"}.get(str(tile.get("correction_tone") or ""), "#475569")
                 draw.text((tile_x, meta_y + metadata_line_height), correction_text, fill=correction_fill, font=body_font)
-                draw.text((tile_x, meta_y + metadata_line_height * 2), f"Commit: {tile.get('rgb_gains_text', 'n/a')}", fill="black", font=body_font)
-                draw.text((tile_x, meta_y + metadata_line_height * 3), f"Confidence: {tile.get('confidence', 'n/a')} | log2: {tile.get('raw_log2', 'n/a')}", fill="#475569", font=caption_font)
+                draw.text((tile_x, meta_y + metadata_line_height * 2), str(tile.get("residual_text", "Residual: n/a")), fill="black", font=body_font)
+                draw.text((tile_x, meta_y + metadata_line_height * 3), str(tile.get("status_text", "Status: n/a")), fill="#1e293b", font=caption_font)
+                draw.text((tile_x, meta_y + metadata_line_height * 4), f"Commit: {tile.get('rgb_gains_text', 'n/a')}", fill="black", font=body_font)
+                draw.text((tile_x, meta_y + metadata_line_height * 5), f"Confidence: {tile.get('confidence', 'n/a')} | gray: {tile.get('raw_log2', 'n/a')}", fill="#475569", font=caption_font)
                 render_note = str(tile.get("render_truth_note") or "")
                 if render_note:
-                    draw.text((tile_x, meta_y + metadata_line_height * 4), render_note, fill="#1e293b", font=caption_font)
+                    draw.text((tile_x, meta_y + metadata_line_height * 6), render_note, fill="#1e293b", font=caption_font)
             y += needed_height + section_gap
             if page_index < len(paged_tiles) - 1:
                 pages.append(page)
@@ -4188,6 +5554,8 @@ def render_contact_sheet_pdf(
             "raw_log2": clip.get("measured_log2_luminance_raw"),
             "correction_text": "Exposure: original",
             "correction_tone": "neutral",
+            "residual_text": "Residual: baseline",
+            "status_text": "Status: Original reference",
         }
         for clip in payload.get("shared_originals", [])
     ]
@@ -4203,6 +5571,9 @@ def render_contact_sheet_pdf(
         for clip in strategy.get("clips", []):
             gains_text = _format_cdl_gain_saturation(clip["metrics"]["color"])
             exposure_present = _exposure_correction_presentation(float(clip["metrics"]["exposure"]["final_offset_stops"]))
+            residual_validation_row = dict(clip.get("corrected_residual_validation") or {})
+            ipp2_validation_row = dict(clip.get("ipp2_validation") or {})
+            residual_present = _ipp2_validation_presentation(ipp2_validation_row or residual_validation_row)
             render_validation = dict(clip.get("render_validation") or {})
             render_note = (
                 f"Render proof: changed pixels ({float(render_validation.get('pixel_diff_from_baseline', 0.0) or 0.0):.2f} mean delta)"
@@ -4216,9 +5587,11 @@ def render_contact_sheet_pdf(
                     "exposure_offset_stops": clip["metrics"]["exposure"]["final_offset_stops"],
                     "rgb_gains_text": f"K {int((clip['metrics'].get('commit_values') or {}).get('kelvin', 5600) or 5600)} | Tint {float((clip['metrics'].get('commit_values') or {}).get('tint', 0.0) or 0.0):.1f}",
                     "confidence": clip["metrics"]["confidence"],
-                    "raw_log2": clip["metrics"]["exposure"]["measured_log2_luminance_raw"],
+                    "raw_log2": f"{float((ipp2_validation_row.get('ipp2_value_log2', residual_validation_row.get('corrected_measured_gray_log2', 0.0)) or 0.0)):.2f}",
                     "correction_text": exposure_present["label"],
                     "correction_tone": exposure_present["tone"],
+                    "residual_text": residual_present["label"],
+                    "status_text": f"{residual_present['summary']} | {str(clip.get('trust_class') or 'TRUSTED').replace('_', ' ')}",
                     "render_truth_note": render_note,
                 }
             )
@@ -4226,9 +5599,9 @@ def render_contact_sheet_pdf(
             f"Summary: {strategy.get('strategy_summary')}",
             f"Reference clip: {strategy.get('reference_clip_id')}",
             f"Hero clip: {strategy.get('hero_clip_id')}",
-            f"Target log2 luminance: {strategy.get('target_log2_luminance')}",
+            f"Gray target: {strategy.get('target_log2_luminance')}",
             f"Matching domain: {payload.get('matching_domain_label')} | Preview transform: {payload.get('preview_transform')}",
-            f"Calibration ROI: {strategy.get('calibration_roi')}",
+            f"Worst IPP2 residual: {max((float((item.get('ipp2_validation') or {}).get('ipp2_residual_abs_stops', 0.0) or 0.0) for item in strategy.get('clips', [])), default=0.0):.2f}",
         ]
         if payload.get("color_preview_note"):
             section_meta.append(f"Color preview note: {payload['color_preview_note']}")
@@ -4284,6 +5657,37 @@ def _exposure_correction_presentation(offset_stops: float) -> Dict[str, str]:
     }
 
 
+def _corrected_residual_presentation(validation: Dict[str, object]) -> Dict[str, str]:
+    residual = float(validation.get("residual_error_stops", 0.0) or 0.0)
+    label = f"Residual after correction: {residual:+.2f} stops"
+    tone = {
+        "within_tolerance": "good",
+        "review": "warning",
+        "outside_tolerance": "danger",
+    }.get(str(validation.get("residual_status") or ""), "warning")
+    summary = str(validation.get("residual_label") or "Needs review")
+    return {
+        "label": label,
+        "summary": summary,
+        "tone": tone,
+    }
+
+
+def _ipp2_validation_presentation(validation: Dict[str, object]) -> Dict[str, str]:
+    residual = float(validation.get("ipp2_residual_stops", 0.0) or 0.0)
+    status = str(validation.get("status") or "REVIEW")
+    tone = {
+        "PASS": "good",
+        "REVIEW": "warning",
+        "FAIL": "danger",
+    }.get(status, "warning")
+    return {
+        "label": f"IPP2 residual after correction: {residual:+.2f} stops",
+        "summary": status,
+        "tone": tone,
+    }
+
+
 def render_contact_sheet_html(payload: Dict[str, object]) -> str:
     recommended_strategy = payload.get("recommended_strategy") or {}
     recommended_key = str(recommended_strategy.get("strategy_key") or "")
@@ -4291,6 +5695,19 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
     exposure_summary = payload.get("exposure_summary") or {}
     hero_summary = payload.get("hero_recommendation") or {}
     strategy_comparison = payload.get("strategy_comparison") or []
+    residual_validation = dict(payload.get("corrected_residual_validation") or {})
+    ipp2_validation = dict(payload.get("ipp2_validation") or {})
+    tolerance_model = dict((ipp2_validation.get("tolerance_model") or {}) or (residual_validation.get("tolerance_model") or {}))
+    recommended_residual_rows = [
+        item
+        for item in list((ipp2_validation.get("rows") or residual_validation.get("rows") or []))
+        if str(item.get("strategy_key") or "") == recommended_key
+    ]
+    recommended_outside_rows = [
+        item
+        for item in recommended_residual_rows
+        if str(item.get("status") or item.get("residual_status") or "") in {"FAIL", "outside_tolerance"}
+    ]
     logo_markup = (
         f"<img class='brand-logo' src='{LOGO_PATH.as_posix()}' alt='R3DMatch logo' />"
         if LOGO_PATH.exists()
@@ -4304,8 +5721,8 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
             "<article class='strategy-card'>"
             f"<div class='strategy-card-top'><h3>{html.escape(str(strategy['strategy_label']))}</h3>{recommended_badge}</div>"
             f"<p>{html.escape(str(strategy.get('summary') or ''))}</p>"
-            f"<div class='strategy-metrics'>Target {float(strategy['target_log2_luminance']):.2f} log2</div>"
-            f"<div class='strategy-metrics'>Mean {float(strategy['correction_metrics']['mean_abs_offset']):.2f} / Max {float(strategy['correction_metrics']['max_abs_offset']):.2f} stops</div>"
+            f"<div class='strategy-metrics'>Gray target: {float(strategy['target_log2_luminance']):.2f} derived brightness</div>"
+            f"<div class='strategy-metrics'>Mean correction {float(strategy['correction_metrics']['mean_abs_offset']):.2f} / Max {float(strategy['correction_metrics']['max_abs_offset']):.2f} stops</div>"
             f"<div class='strategy-metrics subtle'>Anchor: {html.escape(str(reference_label))}</div>"
             "</article>"
         )
@@ -4313,25 +5730,24 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
     for clip in (recommended_payload or {}).get("clips", []):
         metrics = clip["metrics"]
         commit_values = metrics.get("commit_values") or {}
-        sample_spread = float(metrics["exposure"].get("neutral_sample_log2_spread", 0.0) or 0.0)
-        outlier_marker = "Outlier" if sample_spread > 0.12 else ""
-        hero_marker = "Hero" if clip.get("is_hero_camera") else ""
-        flags = " | ".join(item for item in [hero_marker, outlier_marker] if item)
+        residual_row = dict(clip.get("corrected_residual_validation") or {})
+        ipp2_row = dict(clip.get("ipp2_validation") or {})
+        residual_present = _ipp2_validation_presentation(ipp2_row or residual_row)
         calibration_rows.append(
             "<tr>"
-            f"<td><div class='camera-cell'><strong>{html.escape(_camera_label_for_reporting(str(clip['clip_id'])))}</strong><span>{html.escape(str(clip['clip_id']))}</span></div></td>"
+            f"<td><div class='camera-cell'><strong>{html.escape(_camera_label_for_reporting(str(clip['clip_id'])))}</strong><span>{html.escape(str(clip['clip_id']))}</span><span>{html.escape(str(clip.get('trust_reason') or 'Stable gray sample'))}</span></div></td>"
             f"<td>{float(metrics['exposure']['measured_log2_luminance_monitoring']):.2f}</td>"
-            f"<td>{float(commit_values.get('exposureAdjust', 0.0) or 0.0):.3f}</td>"
+            f"<td>{float(commit_values.get('exposureAdjust', 0.0) or 0.0):+.3f}</td>"
             f"<td>{int(commit_values.get('kelvin', 5600) or 5600)}</td>"
-            f"<td>{float(commit_values.get('tint', 0.0) or 0.0):.1f}</td>"
+            f"<td>{float(commit_values.get('tint', 0.0) or 0.0):+.1f}</td>"
             f"<td>{float(metrics.get('confidence', 0.0) or 0.0):.2f}</td>"
-            f"<td>{sample_spread:.3f}</td>"
-            f"<td>{html.escape(flags or 'Normal')}</td>"
+            f"<td><span class='status-chip {html.escape(residual_present['tone'])}'>{html.escape(str(clip.get('trust_class') or 'TRUSTED').replace('_', ' '))}</span><div class='subtle'>{html.escape(str(clip.get('reference_use') or 'Included'))}</div></td>"
+            f"<td>{html.escape(residual_present['label'])}<div class='subtle'>{html.escape(residual_present['summary'])}</div></td>"
             "</tr>"
         )
     render_truth_summary = dict(payload.get("render_truth_summary") or {})
     total_originals = len(payload.get("shared_originals", []))
-    original_columns = _report_grid_columns(total_originals)
+    original_columns = min(_report_grid_columns(total_originals), 3)
     original_cards = []
     for clip in payload.get("shared_originals", []):
         path = clip.get("original_frame")
@@ -4346,27 +5762,38 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
             f"{hero_badge}"
             f"{image_html}"
             f"<div class='clip-label'>{clip['clip_id']}</div>"
-            f"<div class='clip-meta'>Measured log2: {float(clip.get('measured_log2_luminance_monitoring', 0.0) or 0.0):.2f}</div>"
-            f"<div class='clip-meta subtle'>Group: {clip['group_key']}</div>"
+            f"<div class='state-line'>Original reference still</div>"
+            f"<div class='clip-meta'><strong>Measured gray:</strong> {float(clip.get('measured_log2_luminance_monitoring', 0.0) or 0.0):.2f} log2</div>"
+            f"<div class='clip-meta subtle'>Group {html.escape(str(clip['group_key']))}</div>"
             "</article>"
         )
     strategy_sections = []
     for strategy in payload.get("strategies", []):
-        columns = _report_grid_columns(len(strategy.get("clips", [])))
+        columns = min(_report_grid_columns(len(strategy.get("clips", []))), 3)
+        strategy_rows = [
+            item
+            for item in list(residual_validation.get("rows") or [])
+            if str(item.get("strategy_key") or "") == str(strategy.get("strategy_key") or "")
+        ]
+        strategy_outside = [
+            item
+            for item in strategy_rows
+            if str(item.get("residual_status") or "") == "outside_tolerance"
+        ]
+        strategy_best = min((float(item.get("residual_abs_error_stops", 0.0) or 0.0) for item in strategy_rows), default=0.0)
+        strategy_worst = max((float(item.get("residual_abs_error_stops", 0.0) or 0.0) for item in strategy_rows), default=0.0)
         cards = []
         for clip in strategy["clips"]:
             metrics = clip["metrics"]
             image_path = clip.get("both_corrected")
             render_validation = dict(clip.get("render_validation") or {})
             exposure_present = _exposure_correction_presentation(float((metrics.get("exposure") or {}).get("final_offset_stops", 0.0) or 0.0))
+            residual_row = dict(clip.get("corrected_residual_validation") or {})
+            ipp2_row = dict(clip.get("ipp2_validation") or {})
+            residual_present = _ipp2_validation_presentation(ipp2_row or residual_row)
             hero_badge_html = "<div class='hero-badge'>Hero Camera</div>" if clip.get("is_hero_camera") else ""
-            preview_note_html = (
-                f"<div class='clip-meta subtle'>Preview note: {html.escape(str(metrics.get('color_preview_note')))}</div>"
-                if metrics.get("color_preview_note")
-                else ""
-            )
             thumbs_html = (
-                f"<figure><img src='../previews/{Path(image_path).name}' alt='{clip['clip_id']} Corrected' /><figcaption>Proposed corrected still</figcaption></figure>"
+                f"<figure><img src='../previews/{Path(image_path).name}' alt='{clip['clip_id']} Corrected' /><figcaption>Corrected review still</figcaption></figure>"
                 if image_path else "<p class='subtle'>No preview still available.</p>"
             )
             commit_values = metrics.get("commit_values") or {}
@@ -4375,21 +5802,29 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
                 f"{hero_badge_html}"
                 f"<div class='thumb-single'>{thumbs_html}</div>"
                 f"<div class='clip-label'>{clip['clip_id']}</div>"
-                f"<div class='correction-cue {html.escape(exposure_present['tone'])}'>{html.escape(exposure_present['short_reason'])}</div>"
+                f"<div class='tile-summary'>"
+                f"<span class='status-chip {html.escape(residual_present['tone'])}'>{html.escape(residual_present['summary'])}</span>"
+                f"<span class='status-chip trust'>{html.escape(str(clip.get('trust_class') or 'TRUSTED').replace('_', ' '))}</span>"
+                f"</div>"
                 f"<div class='clip-meta'><strong>{html.escape(exposure_present['label'])}</strong></div>"
-                f"<div class='clip-meta'>Commit: K {int(commit_values.get('kelvin', 5600) or 5600)} | Tint {float(commit_values.get('tint', 0.0) or 0.0):.1f}</div>"
-                f"<div class='clip-meta'>Confidence: {float(metrics.get('confidence', 0.0) or 0.0):.2f} | sample spread {float(metrics['exposure'].get('neutral_sample_log2_spread', 0.0) or 0.0):.3f}</div>"
-                f"<div class='clip-meta advanced subtle'>CDL gain/sat: {html.escape(_format_cdl_gain_saturation(metrics['color']))}</div>"
+                f"<div class='clip-meta'><strong>{html.escape(residual_present['label'])}</strong></div>"
+                f"<div class='clip-meta'>Current recommendation: K {int(commit_values.get('kelvin', 5600) or 5600)} | Tint {float(commit_values.get('tint', 0.0) or 0.0):+.1f}</div>"
+                f"<div class='clip-meta'>Reference use: {html.escape(str(clip.get('reference_use') or 'Included'))} | Stability: {html.escape(str(clip.get('stability_label') or 'Stable gray sample'))}</div>"
+                f"<div class='clip-meta subtle'>Measured gray before correction {float(metrics['exposure'].get('measured_log2_luminance_monitoring', 0.0) or 0.0):.2f} log2 | IPP2 corrected gray {float((ipp2_row.get('ipp2_value_log2', residual_row.get('corrected_measured_gray_log2', 0.0)) or 0.0)):.2f} log2 | IPP2 target {float((ipp2_row.get('ipp2_target_log2', residual_row.get('render_target_gray_log2', 0.0)) or 0.0)):.2f} log2</div>"
                 f"<div class='render-proof'><strong>Render proof:</strong> "
                 f"{'Corrected preview changed pixels relative to the original.' if render_validation.get('pixel_output_changed') else 'No visible pixel change was expected.'} "
                 f"Mean delta: {float(render_validation.get('pixel_diff_from_baseline', 0.0) or 0.0):.2f}. "
                 f"Asset: {html.escape(Path(str(image_path)).name if image_path else 'n/a')}</div>"
-                f"{preview_note_html}"
                 "</article>"
             )
         strategy_sections.append(
             f"<section class='report-section'>"
-            f"<div class='section-top'><h2>{strategy['strategy_label']}</h2><p class='section-meta'>{html.escape(str(strategy.get('strategy_summary') or ''))}</p></div>"
+            f"<div class='section-top'><div><h2>{strategy['strategy_label']}</h2><p class='section-meta'>{html.escape(str(strategy.get('strategy_summary') or ''))}</p></div>"
+            f"<div class='section-kpis'>"
+            f"<div><span>Best residual</span><strong>{strategy_best:.2f}</strong></div>"
+            f"<div><span>Worst residual</span><strong>{strategy_worst:.2f}</strong></div>"
+            f"<div><span>Outside tolerance</span><strong>{len(strategy_outside)}</strong></div>"
+            f"</div></div>"
             f"<div class='grid cols-{columns}'>{''.join(cards)}</div></section>"
         )
     color_preview_line = (
@@ -4405,62 +5840,68 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
   <title>R3DMatch Review Contact Sheet</title>
   <style>
     body {{ margin: 0; background: #eef2f7; color: #111827; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
-    .page {{ max-width: 1560px; margin: 0 auto; padding: 34px; }}
-    .shell {{ display: grid; gap: 20px; }}
+    .page {{ max-width: 1680px; margin: 0 auto; padding: 38px; }}
+    .shell {{ display: grid; gap: 24px; }}
     .hero, .panel, .report-section {{ background: rgba(255,255,255,0.98); border: 1px solid #d8dee8; border-radius: 24px; box-shadow: 0 18px 44px rgba(15,23,42,0.06); }}
-    .hero {{ padding: 34px; }}
+    .hero {{ padding: 40px; }}
     .hero-top {{ display: flex; align-items: flex-start; gap: 20px; }}
     .brand-logo {{ width: 150px; height: auto; object-fit: contain; }}
     .brand-logo-text {{ font-size:30px; font-weight: 800; }}
     .eyebrow {{ font-size: 12px; font-weight: 800; letter-spacing: 0.12em; text-transform: uppercase; color: #64748b; }}
-    h1 {{ margin: 6px 0 10px 0; font-size: 38px; line-height: 1.05; }}
-    .hero-subtitle {{ margin: 0; font-size: 20px; color: #334155; }}
-    .synopsis {{ margin-top: 20px; font-size: 22px; line-height: 1.7; color: #1e293b; max-width: 74ch; font-weight: 700; }}
+    h1 {{ margin: 6px 0 10px 0; font-size: 46px; line-height: 1.02; }}
+    .hero-subtitle {{ margin: 0; font-size: 22px; color: #334155; }}
+    .synopsis {{ margin-top: 24px; font-size: 24px; line-height: 1.65; color: #1e293b; max-width: 76ch; font-weight: 700; }}
     .meta-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 22px; }}
     .meta-card {{ background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 18px; padding: 16px; }}
     .meta-card dt {{ font-size: 11px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b; }}
-    .meta-card dd {{ margin: 8px 0 0 0; font-size: 17px; font-weight: 800; }}
+    .meta-card dd {{ margin: 8px 0 0 0; font-size: 18px; font-weight: 800; }}
     .two-up {{ display: grid; grid-template-columns: 1.25fr 1fr; gap: 20px; }}
-    .panel {{ padding: 22px; }}
-    .panel h2, .report-section h2 {{ margin: 0 0 10px 0; font-size: 30px; line-height: 1.08; }}
-    .panel p.lead, .section-meta {{ margin: 0 0 16px 0; color: #475569; font-size: 18px; line-height: 1.75; }}
+    .panel {{ padding: 28px; }}
+    .panel h2, .report-section h2 {{ margin: 0 0 10px 0; font-size: 34px; line-height: 1.06; }}
+    .panel p.lead, .section-meta {{ margin: 0 0 16px 0; color: #475569; font-size: 19px; line-height: 1.72; }}
     .stats {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px; }}
     .stat {{ border-radius: 18px; background: #f8fafc; border: 1px solid #e2e8f0; padding: 16px; }}
     .stat .label {{ font-size: 11px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b; }}
-    .stat .value {{ margin-top: 8px; font-size: 26px; font-weight: 800; }}
+    .stat .value {{ margin-top: 8px; font-size: 30px; font-weight: 800; }}
     .strategy-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; }}
     .strategy-card {{ border-radius: 18px; background: #f8fafc; border: 1px solid #dbe3ee; padding: 16px; }}
     .strategy-card-top {{ display: flex; justify-content: space-between; gap: 12px; align-items: center; }}
-    .strategy-card h3 {{ margin: 0; font-size:20px; }}
-    .strategy-metrics {{ font-size: 15px; margin-top: 8px; color: #1e293b; }}
+    .strategy-card h3 {{ margin: 0; font-size:22px; }}
+    .strategy-metrics {{ font-size: 16px; margin-top: 8px; color: #1e293b; }}
     .recommended-badge {{ display: inline-flex; align-items: center; padding: 4px 8px; border-radius: 999px; background: #dbeafe; color: #1d4ed8; font-size: 11px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; }}
     .chart-frame {{ border-radius: 18px; background: #f8fafc; border: 1px solid #dbe3ee; padding: 18px; margin-top: 16px; overflow: auto; }}
     .chart-frame svg {{ display: block; width: 100%; height: auto; min-height: 520px; }}
     table {{ width: 100%; border-collapse: collapse; margin-top: 14px; }}
-    th, td {{ padding: 16px 12px; border-bottom: 1px solid #e5e7eb; text-align: left; vertical-align: top; font-size: 16px; }}
+    th, td {{ padding: 18px 14px; border-bottom: 1px solid #e5e7eb; text-align: left; vertical-align: top; font-size: 17px; }}
     th {{ font-size: 12px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b; }}
     .camera-cell {{ display: flex; flex-direction: column; gap: 4px; }}
     .camera-cell span {{ font-size: 12px; color: #64748b; }}
-    .report-section {{ padding: 22px; }}
+    .report-section {{ padding: 28px; }}
     .section-top {{ display: flex; justify-content: space-between; gap: 18px; align-items: baseline; margin-bottom: 14px; flex-wrap: wrap; }}
+    .section-kpis {{ display: flex; gap: 12px; flex-wrap: wrap; }}
+    .section-kpis div {{ min-width: 150px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 14px; padding: 10px 12px; }}
+    .section-kpis span {{ display: block; font-size: 11px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b; }}
+    .section-kpis strong {{ display: block; margin-top: 6px; font-size: 24px; }}
     .grid {{ display: grid; gap: 18px; align-items: start; }}
     .grid.cols-3 {{ grid-template-columns: repeat(3, minmax(0,1fr)); }}
     .grid.cols-4 {{ grid-template-columns: repeat(4, minmax(0,1fr)); }}
     .grid.cols-6 {{ grid-template-columns: repeat(6, minmax(0,1fr)); }}
     .grid.cols-8 {{ grid-template-columns: repeat(8, minmax(0,1fr)); }}
-    .clip-card {{ background: white; border-radius: 20px; padding: 18px; border: 1px solid #e2e8f0; }}
+    .clip-card {{ background: white; border-radius: 20px; padding: 22px; border: 1px solid #e2e8f0; }}
     .clip-card.hero {{ border: 2px solid #b91c1c; }}
     .hero-badge {{ display: inline-flex; align-items: center; padding: 5px 9px; border-radius: 999px; background: #b91c1c; color: white; font-size: 11px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 10px; }}
     .thumb-single figure, figure {{ margin: 0; }}
-    .thumb-single img, figure img {{ width: 100%; display: block; border-radius: 12px; background: #d7dce4; aspect-ratio: 16 / 10; object-fit: cover; }}
-    figcaption {{ margin-top: 8px; font-size: 13px; color: #64748b; }}
-    .clip-label {{ font-size: 20px; font-weight: 800; margin-top: 14px; line-height: 1.2; }}
-    .clip-meta {{ font-size: 15px; line-height: 1.65; margin-top: 8px; }}
-    .clip-meta.advanced {{ font-size: 13px; }}
-    .correction-cue {{ margin-top: 10px; display: inline-flex; align-items: center; padding: 6px 10px; border-radius: 999px; font-size: 13px; font-weight: 800; letter-spacing: 0.05em; text-transform: uppercase; }}
-    .correction-cue.lift {{ background: #dcfce7; color: #166534; }}
-    .correction-cue.lower {{ background: #fee2e2; color: #991b1b; }}
-    .correction-cue.neutral {{ background: #e2e8f0; color: #475569; }}
+    .thumb-single img, figure img {{ width: 100%; display: block; border-radius: 14px; background: #d7dce4; aspect-ratio: 16 / 10; object-fit: cover; }}
+    figcaption {{ margin-top: 10px; font-size: 15px; color: #64748b; }}
+    .clip-label {{ font-size: 24px; font-weight: 800; margin-top: 16px; line-height: 1.18; }}
+    .state-line {{ margin-top: 10px; font-size: 14px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; color: #475569; }}
+    .clip-meta {{ font-size: 17px; line-height: 1.68; margin-top: 10px; }}
+    .tile-summary {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }}
+    .status-chip {{ display: inline-flex; align-items: center; padding: 7px 11px; border-radius: 999px; font-size: 12px; font-weight: 800; letter-spacing: 0.05em; text-transform: uppercase; }}
+    .status-chip.good {{ background: #dcfce7; color: #166534; }}
+    .status-chip.warning {{ background: #fef3c7; color: #92400e; }}
+    .status-chip.danger {{ background: #fee2e2; color: #991b1b; }}
+    .status-chip.trust {{ background: #e2e8f0; color: #334155; }}
     .render-proof {{ margin-top: 10px; padding-top: 10px; border-top: 1px solid #e2e8f0; font-size: 13px; line-height: 1.6; color: #334155; }}
     .truth-panel {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 18px; }}
     .truth-card {{ background: #f8fafc; border: 1px solid #dbe3ee; border-radius: 16px; padding: 14px 16px; }}
@@ -4479,7 +5920,7 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
           <div>
             <div class="eyebrow">Multi-Camera RED Calibration Review</div>
             <h1>R3DMatch Decision Report</h1>
-            <p class="hero-subtitle">A customer-facing review of exposure consistency, strategy behavior, and proposed per-camera commit values.</p>
+            <p class="hero-subtitle">A client-facing calibration proof showing whether corrected stills converge to a common gray target and which cameras remain outside tolerance.</p>
             <p class="section-meta">Hero clip: {html.escape(str(payload.get('hero_clip_id') or 'None selected'))} | {color_preview_line}</p>
           </div>
         </div>
@@ -4488,6 +5929,8 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
           <div class="truth-card"><div class="eyebrow">Corrected Renders</div><strong>{int(render_truth_summary.get('corrected_render_count', 0) or 0)}</strong></div>
           <div class="truth-card"><div class="eyebrow">Changed Pixels</div><strong>{int(render_truth_summary.get('changed_render_count', 0) or 0)}</strong></div>
           <div class="truth-card"><div class="eyebrow">Unexpected No-Change</div><strong>{int(render_truth_summary.get('unchanged_non_identity_count', 0) or 0)}</strong></div>
+          <div class="truth-card"><div class="eyebrow">Worst IPP2 Residual</div><strong>{float(ipp2_validation.get('max_residual', residual_validation.get('worst_residual_stops', 0.0)) or 0.0):.2f}</strong></div>
+          <div class="truth-card"><div class="eyebrow">IPP2 Failures</div><strong>{int((ipp2_validation.get('status_counts') or {}).get('FAIL', len(recommended_outside_rows)) or 0)}</strong></div>
         </div>
         <dl class="meta-grid">
           <div class="meta-card"><dt>Run Label</dt><dd>{html.escape(str(payload.get('run_label')))}</dd></div>
@@ -4495,19 +5938,19 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
           <div class="meta-card"><dt>Target Type</dt><dd>{html.escape(str(payload.get('target_type')))}</dd></div>
           <div class="meta-card"><dt>Matching Domain</dt><dd>{html.escape(str(payload.get('matching_domain_label')))}</dd></div>
           <div class="meta-card"><dt>Chosen Method</dt><dd>{html.escape(str((recommended_strategy or {}).get('strategy_label') or 'Pending'))}</dd></div>
-          <div class="meta-card"><dt>Created</dt><dd>{html.escape(str(payload.get('created_at')))}</dd></div>
+          <div class="meta-card"><dt>Tolerance</dt><dd>&plusmn;{float(tolerance_model.get('pass_threshold_stops', 0.0) or 0.0):.2f} stops pass</dd></div>
         </dl>
       </section>
 
       <div class="two-up">
         <section class="panel">
-          <h2>Exposure Consistency Summary</h2>
-          <p class="lead">Exposure remains the most trustworthy review layer on this build. This panel shows how tightly the array is grouped before approval.</p>
+          <h2>Exposure Convergence Summary</h2>
+          <p class="lead">The corrected stills below are remeasured in IPP2 monitoring space using the gray sphere ROI. This panel is the acceptance test for whether the rendered results actually converge.</p>
           <div class="stats">
-            <div class="stat"><div class="label">Median</div><div class="value">{float(exposure_summary.get('median', 0.0) or 0.0):.2f}</div></div>
-            <div class="stat"><div class="label">Range</div><div class="value">{float(exposure_summary.get('spread', 0.0) or 0.0):.2f}</div></div>
-            <div class="stat"><div class="label">Min / Max</div><div class="value">{float(exposure_summary.get('minimum', 0.0) or 0.0):.2f} / {float(exposure_summary.get('maximum', 0.0) or 0.0):.2f}</div></div>
-            <div class="stat"><div class="label">Outliers</div><div class="value">{int(exposure_summary.get('outlier_count', 0) or 0)}</div></div>
+            <div class="stat"><div class="label">Pre-Correction Spread</div><div class="value">{float(exposure_summary.get('spread', 0.0) or 0.0):.2f}</div></div>
+            <div class="stat"><div class="label">Best IPP2 Residual</div><div class="value">{float(ipp2_validation.get('best_residual', residual_validation.get('best_residual_stops', 0.0)) or 0.0):.2f}</div></div>
+            <div class="stat"><div class="label">Median IPP2 Residual</div><div class="value">{float(ipp2_validation.get('median_residual', residual_validation.get('median_residual_stops', 0.0)) or 0.0):.2f}</div></div>
+            <div class="stat"><div class="label">Worst IPP2 Residual</div><div class="value">{float(ipp2_validation.get('max_residual', residual_validation.get('worst_residual_stops', 0.0)) or 0.0):.2f}</div></div>
           </div>
           <div class="chart-frame">{payload.get('visuals', {}).get('exposure_plot_svg', '')}</div>
         </section>
@@ -4518,24 +5961,24 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
           <div class="strategy-grid">{''.join(strategy_cards)}</div>
           <div class="chart-frame">{payload.get('visuals', {}).get('strategy_chart_svg', '')}</div>
           <p class="lead" style="margin-top:12px;"><strong>Hero recommendation:</strong> {html.escape(str(hero_summary.get('candidate_clip_id') or 'No clear hero'))}. {html.escape(str(hero_summary.get('reason') or ''))}</p>
-          <p class="section-meta">Preview policy: exposure previews are active; color/CDL is computed and exported, but preview color remains conservatively disabled on this build.</p>
+          <p class="section-meta">{html.escape(str(tolerance_model.get('rationale') or ''))}</p>
         </section>
       </div>
 
       <section class="panel">
-        <h2>Per-Camera Calibration Table</h2>
-        <p class="lead">Commit values are centered on exposureAdjust, kelvin, and tint so the operator can review the exact proposed calibration package at a glance.</p>
+        <h2>Per-Camera Correction Table</h2>
+        <p class="lead">This table shows the actual correction package and whether each corrected still landed within the post-correction gray-match tolerance.</p>
         <table>
           <thead>
             <tr>
               <th>Camera / Clip</th>
-              <th>Measured</th>
-              <th>exposureAdjust</th>
+              <th>Measured Gray</th>
+              <th>Exposure Correction</th>
               <th>Kelvin</th>
               <th>Tint</th>
               <th>Confidence</th>
-              <th>Sample Spread</th>
-              <th>Note</th>
+              <th>Trust / Reference</th>
+              <th>Residual</th>
             </tr>
           </thead>
           <tbody>{''.join(calibration_rows)}</tbody>
@@ -4543,7 +5986,7 @@ def render_contact_sheet_html(payload: Dict[str, object]) -> str:
       </section>
 
       <section class="report-section">
-        <div class="section-top"><h2>Visual Confirmation Stills</h2><p class="section-meta">Original frames are shown once as the baseline reference. The strategy sections below use strategy-specific corrected assets.</p></div>
+        <div class="section-top"><div><h2>Original Reference Stills</h2><p class="section-meta">These are the original frames before any correction. The corrected sections below use the actual strategy-specific render assets written for this report.</p></div></div>
         <div class="grid cols-{original_columns}">{''.join(original_cards)}</div>
       </section>
 

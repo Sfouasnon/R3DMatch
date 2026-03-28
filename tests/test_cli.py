@@ -37,7 +37,7 @@ from r3dmatch.rcp2_websocket import (
     expected_websocket_accept,
     extract_parameter_state,
 )
-from r3dmatch.report import _build_strategy_payloads, _compute_image_difference_metrics, _report_grid_columns, _report_tiles_per_page, build_contact_sheet_report, build_lightweight_analysis_report, build_review_package, preview_filename_for_clip_id, render_contact_sheet_html, render_contact_sheet_pdf, render_preview_frame
+from r3dmatch.report import _build_strategy_payloads, _compute_image_difference_metrics, _ipp2_closed_loop_next_correction, _report_grid_columns, _report_tiles_per_page, _resolve_redline_executable, build_contact_sheet_report, build_lightweight_analysis_report, build_review_package, preview_filename_for_clip_id, render_contact_sheet_html, render_contact_sheet_pdf, render_preview_frame
 from r3dmatch.rmd import render_rmd_xml, rmd_filename_for_clip_id, write_rmd_for_clip_with_metadata, write_rmds_from_analysis
 from r3dmatch.ui import build_table_rows, load_review_bundle
 from r3dmatch.sdk import MockR3DBackend, RedSdkDecoder, resolve_backend
@@ -87,6 +87,21 @@ def test_extract_parameter_state_uses_edit_info_divider_and_display() -> None:
     assert state.divider == 1000
     assert state.value == pytest.approx(0.012)
     assert state.display == "0.012"
+
+
+def test_ipp2_closed_loop_next_correction_moves_against_residual() -> None:
+    assert _ipp2_closed_loop_next_correction(
+        current_correction=0.5,
+        current_residual=-0.4,
+        previous_correction=None,
+        previous_residual=None,
+    ) > 0.5
+    assert _ipp2_closed_loop_next_correction(
+        current_correction=0.5,
+        current_residual=0.4,
+        previous_correction=None,
+        previous_residual=None,
+    ) < 0.5
 
 
 def test_parameter_specs_use_documented_fallback_dividers() -> None:
@@ -2722,6 +2737,47 @@ def test_measure_sphere_roi_applies_masking_and_percentile_trimming() -> None:
     image[:, 5, 5] = 0.01
     measurement = measure_sphere_from_roi(image, SphereROI(cx=4.5, cy=4.5, r=2.5), low_percentile=10.0, high_percentile=90.0)
     assert measurement["measured_sphere_log2"] == pytest.approx(np.log2(0.25), abs=0.15)
+    assert measurement["sampling_method"] in {"refined_interior_mask", "interior_circle_fallback"}
+    assert measurement["interior_radius_ratio"] < 1.0
+
+
+def test_measure_sphere_roi_prefers_interior_pixels_over_edge_contamination() -> None:
+    image = np.full((3, 32, 32), 0.05, dtype=np.float32)
+    yy, xx = np.meshgrid(np.arange(32, dtype=np.float32), np.arange(32, dtype=np.float32), indexing="ij")
+    circle = ((xx - 16.0) ** 2 + (yy - 16.0) ** 2) <= 10.0 ** 2
+    interior = ((xx - 16.0) ** 2 + (yy - 16.0) ** 2) <= 7.5 ** 2
+    edge_ring = circle & ~interior
+    image[:, circle] = 0.25
+    image[:, edge_ring] = 0.55
+    measurement = measure_sphere_from_roi(image, SphereROI(cx=16.0, cy=16.0, r=10.0), low_percentile=5.0, high_percentile=95.0)
+    assert measurement["measured_sphere_log2"] == pytest.approx(np.log2(0.25), abs=0.12)
+    assert measurement["sampling_method"] == "refined_interior_mask"
+    assert measurement["mask_fraction"] < 0.9
+
+
+def test_measure_frame_color_and_exposure_uses_refined_sphere_sampling_for_gray_sphere() -> None:
+    image = np.full((3, 48, 48), 0.05, dtype=np.float32)
+    yy, xx = np.meshgrid(np.arange(48, dtype=np.float32), np.arange(48, dtype=np.float32), indexing="ij")
+    cx = cy = 24.0
+    outer = ((xx - cx) ** 2 + (yy - cy) ** 2) <= 11.0 ** 2
+    inner = ((xx - cx) ** 2 + (yy - cy) ** 2) <= 7.0 ** 2
+    edge_ring = outer & ~inner
+    image[:, 12:36, 12:36] = 0.2
+    image[:, outer] = 0.25
+    image[0, edge_ring] = 0.70
+    image[1, edge_ring] = 0.18
+    image[2, edge_ring] = 0.12
+    measurement = measure_frame_color_and_exposure(
+        image,
+        mode="scene",
+        lut=None,
+        calibration_roi={"x": 12 / 48, "y": 12 / 48, "w": 24 / 48, "h": 24 / 48},
+        target_type="gray_sphere",
+    )
+    assert measurement["measured_log2_luminance_raw"] == pytest.approx(np.log2(0.25), abs=0.12)
+    comparison = measurement["sphere_sampling_comparison"]
+    assert comparison["legacy"]["raw_log2"] > comparison["refined"]["raw_log2"]
+    assert measurement["calibration_measurement_mode"] == "gray_sphere_refined_circle"
 
 
 def test_sphere_calibration_grouping_uses_group_key(tmp_path: Path) -> None:
@@ -3466,7 +3522,13 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert report_json["shared_originals"][0]["original_frame"].endswith("G007_D060_0324M6_001.original.review.analysis-out.jpg")
     assert report_json["strategies"][0]["clips"][0]["both_corrected"].endswith("G007_D060_0324M6_001.both.review.median.analysis-out.jpg")
     assert "render_truth_summary" in report_json
+    assert Path(report_json["ipp2_validation_path"]).exists()
+    assert Path(report_json["ipp2_closed_loop_trace_path"]).exists()
+    assert report_json["ipp2_validation"]["contact_sheet_preview_matches_validation"] is False
     assert report_json["strategies"][0]["clips"][0]["metrics"]["preview_transform"] == report_json["preview_transform"]
+    assert report_json["strategies"][0]["clips"][0]["ipp2_validation"]["status"] in {"PASS", "REVIEW", "FAIL"}
+    assert "initial_offset_stops" in report_json["strategies"][0]["clips"][0]["metrics"]["exposure"]
+    assert "ipp2_closed_loop_iterations" in report_json["strategies"][0]["clips"][0]["metrics"]["exposure"]
     assert "measured_log2_luminance_monitoring" in report_json["strategies"][0]["clips"][0]["metrics"]["exposure"]
     assert "measured_log2_luminance_raw" in report_json["strategies"][0]["clips"][0]["metrics"]["exposure"]
     assert Path(report_json["clips"][0]["original_frame"]).exists()
@@ -3493,6 +3555,7 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert report_json["color_preview_status"] == "disabled_unverified"
     html = Path(payload["report_html"]).read_text(encoding="utf-8")
     assert "Color preview" in html
+    assert "IPP2 residual after correction" in html
     assert "G007_D060_0324M6_001" in html
     assert "Render proof" in html
     assert "../previews/G007_D060_0324M6_001.original.review.analysis-out.jpg" in html
@@ -3501,6 +3564,77 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert payload["preview_settings"]["lut_path"].endswith("show.cube")
     assert payload["measurement_preview_settings"]["preview_mode"] == "calibration"
     assert payload["redline_capabilities"]["supports_lut"] is True
+
+
+def test_resolve_redline_executable_uses_project_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_path = tmp_path / "redline.json"
+    config_path.write_text(json.dumps({"redline_executable": "/usr/local/bin/REDLine"}), encoding="utf-8")
+    monkeypatch.delenv("R3DMATCH_REDLINE_EXECUTABLE", raising=False)
+    monkeypatch.setattr("r3dmatch.report.REDLINE_CONFIG_PATH", config_path)
+    monkeypatch.setattr("r3dmatch.report.shutil.which", lambda command: command if command == "/usr/local/bin/REDLine" else None)
+    assert _resolve_redline_executable() == "/usr/local/bin/REDLine"
+
+
+def test_report_contact_sheet_requires_real_redline_for_strict_validation(tmp_path: Path) -> None:
+    clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
+    clip_path.write_bytes(b"")
+    analyze_path(
+        str(tmp_path),
+        out_dir=str(tmp_path / "analysis-out"),
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+        calibration_roi={"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+    )
+    with pytest.raises(RuntimeError, match="real media, not the mock backend"):
+        build_contact_sheet_report(
+            str(tmp_path / "analysis-out"),
+            out_dir=str(tmp_path / "report"),
+            target_type="gray_sphere",
+            processing_mode="both",
+            target_strategies=["median"],
+            require_real_redline=True,
+        )
+
+
+def test_contact_sheet_report_honors_requested_calibration_preview_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
+    clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
+    clip_path.write_bytes(b"")
+    analyze_path(
+        str(tmp_path),
+        out_dir=str(tmp_path / "analysis-out"),
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+        calibration_roi={"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+    )
+    payload = build_contact_sheet_report(
+        str(tmp_path / "analysis-out"),
+        out_dir=str(tmp_path / "report"),
+        target_type="gray_sphere",
+        processing_mode="both",
+        target_strategies=["median"],
+        preview_mode="calibration",
+    )
+    report_json = json.loads(Path(payload["report_json"]).read_text(encoding="utf-8"))
+    preview_commands = json.loads((tmp_path / "analysis-out" / "previews" / "preview_commands.json").read_text(encoding="utf-8"))
+    original_command = next(command for command in preview_commands["commands"] if command["variant"] == "original")
+    assert report_json["preview_mode"] == "calibration"
+    assert report_json["preview_settings"]["output_space"] == "REDWideGamutRGB"
+    assert report_json["preview_settings"]["output_gamma"] == "Log3G10"
+    assert report_json["ipp2_validation"]["contact_sheet_preview_matches_validation"] is False
+    assert Path(report_json["ipp2_validation_path"]).exists()
+    assert "--colorSpace" in original_command["command"]
+    assert original_command["command"][original_command["command"].index("--colorSpace") + 1] == "25"
+    assert "--gammaCurve" in original_command["command"]
+    assert original_command["command"][original_command["command"].index("--gammaCurve") + 1] == "34"
 
 
 def test_lightweight_analysis_report_generates_customer_facing_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3912,10 +4046,11 @@ def test_render_contact_sheet_html_uses_logo_and_dynamic_grid(tmp_path: Path) ->
     assert "grid cols-3" in html
     assert "../previews/CAM001.original.review.run01.jpg" in html
     assert "../previews/CAM001.both.review.median.run01.jpg" in html
-    assert "correction-cue" in html
+    assert "status-chip" in html
+    assert "IPP2 residual after correction" in html
     assert "Render proof" in html
     assert "font-size:30px" in html
-    assert "font-size:20px" in html
+    assert "font-size: 24px" in html
 
 
 def test_render_contact_sheet_pdf_paginates_large_camera_counts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4170,6 +4305,96 @@ def test_contact_sheet_strategy_clip_uses_corrected_asset_and_render_truth(tmp_p
     assert strategy_clip["render_validation"]["pixel_output_changed"] is True
     assert float(strategy_clip["render_validation"]["pixel_diff_from_baseline"]) > 0.0
     assert Path(strategy_clip["both_corrected"]).name == Path(str(strategy_clip["render_validation"]["output"])).name
+
+
+def test_contact_sheet_report_writes_corrected_residual_validation_from_corrected_assets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
+    clip_a = tmp_path / "G007_B057_0324YT_001.R3D"
+    clip_b = tmp_path / "G007_C057_0324YT_001.R3D"
+    clip_a.write_bytes(b"")
+    clip_b.write_bytes(b"")
+    analyze_path(
+        str(tmp_path),
+        out_dir=str(tmp_path / "analysis-out"),
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+        calibration_roi={"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+    )
+    payload = build_contact_sheet_report(
+        str(tmp_path / "analysis-out"),
+        out_dir=str(tmp_path / "report"),
+        target_type="gray_sphere",
+        processing_mode="both",
+        target_strategies=["median"],
+    )
+    report_json = json.loads(Path(payload["report_json"]).read_text(encoding="utf-8"))
+    residual_path = Path(report_json["corrected_residual_validation_path"])
+    ipp2_path = Path(report_json["ipp2_validation_path"])
+    assert residual_path.exists()
+    assert ipp2_path.exists()
+    residual_payload = json.loads(residual_path.read_text(encoding="utf-8"))
+    ipp2_payload = json.loads(ipp2_path.read_text(encoding="utf-8"))
+    assert residual_payload["tolerance_model"]["pass_threshold_stops"] == pytest.approx(0.10)
+    assert ipp2_payload["summary"]["tolerance_model"]["pass_threshold_stops"] == pytest.approx(0.05)
+    assert residual_payload["rows"]
+    row = next(item for item in residual_payload["rows"] if abs(float(item["applied_correction_stops"])) > 1e-6)
+    assert row["measurement_geometry"] == "three_rect_windows_within_roi"
+    assert Path(row["corrected_image_path"]).exists()
+    strategy_clip = next(
+        clip
+        for clip in report_json["strategies"][0]["clips"]
+        if clip["clip_id"] == row["clip_id"]
+    )
+    assert strategy_clip["corrected_residual_validation"]["clip_id"] == row["clip_id"]
+    assert strategy_clip["ipp2_validation"]["clip_id"] == row["clip_id"]
+    assert "log_vs_ipp2_residual_delta_stops" in strategy_clip["ipp2_validation"]
+    html = Path(payload["report_html"]).read_text(encoding="utf-8")
+    assert "IPP2 residual after correction" in html
+    assert "PASS" in html or "REVIEW" in html or "FAIL" in html
+
+
+def test_contact_sheet_report_writes_sampling_and_solve_comparison_for_gray_sphere(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
+    for name in [
+        "G007_A064_0325AA_001.R3D",
+        "G007_B064_0325BB_001.R3D",
+        "G007_C064_0325CC_001.R3D",
+        "I007_A064_0325XY_001.R3D",
+    ]:
+        (tmp_path / name).write_bytes(b"")
+    analyze_path(
+        str(tmp_path),
+        out_dir=str(tmp_path / "analysis-out"),
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        target_type="gray_sphere",
+        sample_count=4,
+        sampling_strategy="uniform",
+        calibration_roi={"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
+    )
+    payload = build_contact_sheet_report(
+        str(tmp_path / "analysis-out"),
+        out_dir=str(tmp_path / "report"),
+        target_type="gray_sphere",
+        processing_mode="both",
+        target_strategies=["median", "optimal_exposure"],
+    )
+    report_json = json.loads(Path(payload["report_json"]).read_text(encoding="utf-8"))
+    sampling_path = Path(report_json["sampling_comparison_path"])
+    solve_path = Path(report_json["solve_comparison_path"])
+    assert sampling_path.exists()
+    assert solve_path.exists()
+    sampling_payload = json.loads(sampling_path.read_text(encoding="utf-8"))
+    solve_payload = json.loads(solve_path.read_text(encoding="utf-8"))
+    assert sampling_payload["row_count"] == 4
+    assert any(abs(float(row["delta_log2_stops"])) > 1e-6 for row in sampling_payload["rows"])
+    assert any(strategy["strategy_key"] == "median" for strategy in solve_payload["strategies"])
 
 
 def test_multi_strategy_review_includes_manual_reference_and_shared_originals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

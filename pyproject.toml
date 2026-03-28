@@ -11,6 +11,7 @@ requires-python = ">=3.9"
 dependencies = [
   "typer>=0.12",
   "numpy>=1.26",
+  "scikit-image>=0.23",
   "streamlit>=1.32",
   "Pillow>=10.0",
   "Flask>=3.0",

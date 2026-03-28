@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from skimage import measure, morphology
 
 from .color import chromaticity_variance, compute_chromaticity_medians, solve_neutral_gains
 from .commit_values import solve_white_balance_model_for_records
@@ -34,6 +35,9 @@ from .sdk import resolve_backend
 DEFAULT_CENTER_CROP_WIDTH_RATIO = 0.4
 DEFAULT_CENTER_CROP_HEIGHT_RATIO = 0.4
 LOW_CONFIDENCE_THRESHOLD = 0.35
+SPHERE_INTERIOR_RADIUS_RATIO = 0.78
+SPHERE_MAX_SATURATION = 0.08
+SPHERE_MIN_COMPONENT_FRACTION = 0.12
 
 
 @dataclass
@@ -631,12 +635,129 @@ def extract_rect_pixels(image: np.ndarray, roi: GrayCardROI) -> Tuple[np.ndarray
     return pixels, {"area_fraction": area_fraction}
 
 
-def extract_circle_pixels(image: np.ndarray, roi: SphereROI) -> Tuple[np.ndarray, Dict[str, float]]:
-    yy, xx = np.meshgrid(np.arange(image.shape[1], dtype=np.float32), np.arange(image.shape[2], dtype=np.float32), indexing="ij")
-    mask = ((xx - roi.cx) ** 2 + (yy - roi.cy) ** 2) <= roi.r ** 2
+def extract_circle_pixels(
+    image: np.ndarray,
+    roi: SphereROI,
+    *,
+    sampling_variant: str = "refined",
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    mask, metadata = build_sphere_sampling_mask(image, roi, sampling_variant=sampling_variant)
     pixels = np.moveaxis(image, 0, -1)[mask]
     area_fraction = float(mask.sum()) / float(max(mask.size, 1))
-    return pixels, {"area_fraction": area_fraction}
+    info = {
+        "area_fraction": area_fraction,
+        "sampling_confidence": metadata["sampling_confidence"],
+        "sampling_method": metadata["sampling_method"],
+        "mask_fraction": metadata["mask_fraction"],
+        "interior_fraction": metadata["interior_fraction"],
+        "interior_radius_ratio": metadata["interior_radius_ratio"],
+    }
+    return pixels, info
+
+
+def build_sphere_sampling_mask(
+    image: np.ndarray,
+    roi: SphereROI,
+    *,
+    interior_radius_ratio: float = SPHERE_INTERIOR_RADIUS_RATIO,
+    max_saturation: float = SPHERE_MAX_SATURATION,
+    sampling_variant: str = "refined",
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    if image.ndim != 3:
+        raise ValueError("build_sphere_sampling_mask expects image shape (C, H, W)")
+    height = image.shape[1]
+    width = image.shape[2]
+    yy, xx = np.meshgrid(np.arange(height, dtype=np.float32), np.arange(width, dtype=np.float32), indexing="ij")
+    base_mask = ((xx - roi.cx) ** 2 + (yy - roi.cy) ** 2) <= roi.r ** 2
+    if not np.any(base_mask):
+        raise ValueError("sphere ROI does not intersect the image")
+    if str(sampling_variant).strip().lower() == "legacy":
+        return base_mask, {
+            "sampling_method": "legacy_circle_mask",
+            "mask_fraction": 1.0,
+            "interior_fraction": 1.0,
+            "interior_radius_ratio": 1.0,
+            "sampling_confidence": 1.0,
+            "saturation_threshold": max_saturation,
+            "luminance_low": 0.0,
+            "luminance_high": 1.0,
+        }
+
+    erosion_radius = max(1, int(round(max(roi.r * (1.0 - interior_radius_ratio), 1.0))))
+    interior_mask = morphology.binary_erosion(base_mask, morphology.disk(erosion_radius))
+    if not np.any(interior_mask):
+        interior_mask = base_mask.copy()
+
+    luminance = compute_luminance(image)
+    saturation = image.max(axis=0) - image.min(axis=0)
+    interior_luminance = luminance[interior_mask]
+    interior_saturation = saturation[interior_mask]
+
+    luminance_low = float(np.quantile(interior_luminance, 0.05))
+    luminance_high = float(np.quantile(interior_luminance, 0.95))
+    saturation_threshold = _robust_saturation_threshold(interior_saturation, max_saturation=max_saturation)
+
+    candidate_mask = interior_mask & (saturation <= saturation_threshold) & (luminance >= luminance_low) & (luminance <= luminance_high)
+    min_component_size = max(8, int(round(float(interior_mask.sum()) * SPHERE_MIN_COMPONENT_FRACTION)))
+    candidate_mask = morphology.remove_small_objects(candidate_mask, min_size=min_component_size)
+    candidate_mask = morphology.binary_opening(candidate_mask, morphology.disk(1))
+    candidate_mask = morphology.binary_closing(candidate_mask, morphology.disk(1))
+
+    selected_mask = _select_sphere_component(candidate_mask, roi, interior_area=float(interior_mask.sum()))
+    sampling_method = "refined_interior_mask"
+    if selected_mask is None:
+        selected_mask = interior_mask
+        sampling_method = "interior_circle_fallback"
+
+    selected_area = float(selected_mask.sum())
+    interior_area = float(max(interior_mask.sum(), 1))
+    mask_fraction = selected_area / float(max(base_mask.sum(), 1))
+    coverage = min(selected_area / interior_area, 1.0)
+    sampling_confidence = combine_confidence(mask_fraction, coverage)
+    return selected_mask, {
+        "sampling_method": sampling_method,
+        "mask_fraction": mask_fraction,
+        "interior_fraction": interior_area / float(max(base_mask.sum(), 1)),
+        "interior_radius_ratio": float(interior_radius_ratio),
+        "sampling_confidence": sampling_confidence,
+        "saturation_threshold": saturation_threshold,
+        "luminance_low": luminance_low,
+        "luminance_high": luminance_high,
+    }
+
+
+def _robust_saturation_threshold(values: np.ndarray, *, max_saturation: float) -> float:
+    if values.size == 0:
+        return max_saturation
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    robust_ceiling = median + max(2.5 * 1.4826 * mad, 0.01)
+    upper_quantile = float(np.quantile(values, 0.75))
+    return float(min(max_saturation, max(upper_quantile, robust_ceiling)))
+
+
+def _select_sphere_component(candidate_mask: np.ndarray, roi: SphereROI, *, interior_area: float) -> Optional[np.ndarray]:
+    if not np.any(candidate_mask):
+        return None
+    labels = measure.label(candidate_mask)
+    best_score = -1.0
+    best_label: Optional[int] = None
+    radius = max(roi.r * SPHERE_INTERIOR_RADIUS_RATIO, 1.0)
+    for component in measure.regionprops(labels):
+        area_fraction = float(component.area) / float(max(interior_area, 1.0))
+        if area_fraction < SPHERE_MIN_COMPONENT_FRACTION:
+            continue
+        cy, cx = component.centroid
+        center_distance = float(np.hypot(cx - roi.cx, cy - roi.cy)) / radius
+        solidity = float(getattr(component, "solidity", 1.0))
+        eccentricity = float(getattr(component, "eccentricity", 0.0))
+        score = (area_fraction * 2.0) + solidity + (1.0 - min(center_distance, 1.0)) - (eccentricity * 0.25)
+        if score > best_score:
+            best_score = score
+            best_label = int(component.label)
+    if best_label is None:
+        return None
+    return labels == best_label
 
 
 def measure_exposure_region(image: np.ndarray, region: SamplingRegion, *, low_percentile: float = 5.0, high_percentile: float = 95.0) -> Dict[str, float]:
@@ -650,9 +771,60 @@ def measure_exposure_region(image: np.ndarray, region: SamplingRegion, *, low_pe
         measurement["confidence"],
         variance_penalty,
         info["area_fraction"],
+        info.get("sampling_confidence"),
     )
     measurement["stddev_logY"] = float(np.std(log_values))
+    if "sampling_method" in info:
+        measurement["sampling_method"] = info["sampling_method"]
+        measurement["mask_fraction"] = info.get("mask_fraction", info["area_fraction"])
+        measurement["interior_fraction"] = info.get("interior_fraction", info["area_fraction"])
+        measurement["interior_radius_ratio"] = info.get("interior_radius_ratio", 1.0)
     return measurement
+
+
+def measure_sphere_region_statistics(
+    image: np.ndarray,
+    roi: SphereROI,
+    *,
+    sampling_variant: str = "refined",
+    low_percentile: float = 5.0,
+    high_percentile: float = 95.0,
+) -> Dict[str, object]:
+    pixels, info = extract_circle_pixels(image, roi, sampling_variant=sampling_variant)
+    luminance = np.clip(pixels[:, 0] * 0.2126 + pixels[:, 1] * 0.7152 + pixels[:, 2] * 0.0722, 1e-6, 1.0)
+    measurement = trimmed_luminance_measurement(luminance, low_percentile=low_percentile, high_percentile=high_percentile)
+    valid_mask = np.all((pixels > 0.002) & (pixels < 0.998), axis=1)
+    valid_pixels = pixels[valid_mask]
+    if valid_pixels.size == 0:
+        valid_pixels = pixels
+    valid_luminance = np.clip(valid_pixels[:, 0] * 0.2126 + valid_pixels[:, 1] * 0.7152 + valid_pixels[:, 2] * 0.0722, 1e-6, 1.0)
+    trimmed_luminance = percentile_clip(valid_luminance, low_percentile, high_percentile)
+    low = float(trimmed_luminance.min())
+    high = float(trimmed_luminance.max())
+    trimmed_pixels = valid_pixels[(valid_luminance >= low) & (valid_luminance <= high)]
+    if trimmed_pixels.size == 0:
+        trimmed_pixels = valid_pixels
+    rgb_mean = np.median(trimmed_pixels, axis=0)
+    chroma_denominator = max(float(np.sum(rgb_mean)), 1e-6)
+    chroma = rgb_mean / chroma_denominator
+    log_values = np.log2(np.clip(trimmed_luminance, 1e-6, 1.0))
+    return {
+        "measured_log2_luminance": float(measurement["measured_log2_luminance"]),
+        "measured_rgb_mean": [float(rgb_mean[0]), float(rgb_mean[1]), float(rgb_mean[2])],
+        "measured_rgb_chromaticity": [float(chroma[0]), float(chroma[1]), float(chroma[2])],
+        "valid_pixel_count": int(trimmed_pixels.shape[0]),
+        "saturation_fraction": float(np.mean(np.max(valid_pixels, axis=1) >= 0.998)) if valid_pixels.size else 0.0,
+        "black_fraction": float(np.mean(np.min(valid_pixels, axis=1) <= 0.002)) if valid_pixels.size else 0.0,
+        "roi_variance": float(np.var(trimmed_luminance)) if trimmed_luminance.size else 0.0,
+        "gray_log2_stddev": float(np.std(log_values)) if log_values.size else 0.0,
+        "clipped_fraction": float(measurement["clipped_fraction"]),
+        "retained_fraction": float(measurement["retained_fraction"]),
+        "confidence": combine_confidence(float(measurement["confidence"]), info.get("sampling_confidence")),
+        "sampling_method": info.get("sampling_method", "circle_mask"),
+        "mask_fraction": float(info.get("mask_fraction", 1.0)),
+        "interior_fraction": float(info.get("interior_fraction", 1.0)),
+        "interior_radius_ratio": float(info.get("interior_radius_ratio", 1.0)),
+    }
 
 
 def measure_color_region(image: np.ndarray, region: SamplingRegion, *, low_percentile: float = 5.0, high_percentile: float = 95.0) -> Dict[str, object]:
@@ -715,10 +887,18 @@ def combine_confidence(*values: Optional[float]) -> float:
     return float(np.prod(filtered) ** (1.0 / len(filtered)))
 
 
-def measure_sphere_from_roi(image: np.ndarray, roi: SphereROI, *, low_percentile: float = 5.0, high_percentile: float = 95.0) -> Dict[str, float]:
-    result = measure_exposure_region(
+def measure_sphere_from_roi(
+    image: np.ndarray,
+    roi: SphereROI,
+    *,
+    sampling_variant: str = "refined",
+    low_percentile: float = 5.0,
+    high_percentile: float = 95.0,
+) -> Dict[str, float]:
+    result = measure_sphere_region_statistics(
         image,
-        SamplingRegion(sampling_mode="detected_roi", roi=roi_to_dict(roi), detection_confidence=1.0),
+        roi,
+        sampling_variant=sampling_variant,
         low_percentile=low_percentile,
         high_percentile=high_percentile,
     )
@@ -727,6 +907,10 @@ def measure_sphere_from_roi(image: np.ndarray, roi: SphereROI, *, low_percentile
         "clipped_fraction": result["clipped_fraction"],
         "confidence": result["confidence"],
         "retained_fraction": result["retained_fraction"],
+        "sampling_method": result.get("sampling_method", "circle_mask"),
+        "mask_fraction": result.get("mask_fraction", 0.0),
+        "interior_fraction": result.get("interior_fraction", 0.0),
+        "interior_radius_ratio": result.get("interior_radius_ratio", 1.0),
     }
 
 

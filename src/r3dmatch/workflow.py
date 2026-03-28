@@ -1402,6 +1402,7 @@ def review_calibration(
     preview_highlight_rolloff: Optional[str] = None,
     preview_shadow_rolloff: Optional[str] = None,
     preview_lut: Optional[str] = None,
+    require_real_redline: bool = False,
 ) -> Dict[str, object]:
     resolved_source_mode = normalize_source_mode(source_mode)
     subset_definition = _load_clip_subset_definition(clip_subset_file) if clip_subset_file else None
@@ -1455,6 +1456,7 @@ def review_calibration(
         sample_count=sample_count,
         sampling_strategy=sampling_strategy,
         calibration_roi=calibration_roi,
+        target_type=target_type,
         selected_clip_ids=merged_clip_ids,
         selected_clip_groups=merged_clip_groups,
     )
@@ -1481,6 +1483,7 @@ def review_calibration(
         target_strategies=target_strategies,
         reference_clip_id=reference_clip_id,
         hero_clip_id=hero_clip_id,
+        require_real_redline=require_real_redline,
         source_mode=resolved_source_mode,
         source_mode_label_value=source_mode_label(resolved_source_mode),
         source_input_path=source_input_path,
