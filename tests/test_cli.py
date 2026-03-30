@@ -4208,7 +4208,7 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert "aperture" in html
     assert "Digital correction applied" in html
     assert "What To Look For" in html
-    assert "Exposure Summary" in html
+    assert "Original Array Synopsis" in html
     assert "Recommended Action" in html
     assert "G007_D060_0324M6_001" in html
     assert "./review_detection_overlays/G007_D060_0324M6_001.original_detection.png" in html
