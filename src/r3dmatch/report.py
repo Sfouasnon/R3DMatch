@@ -5,9 +5,12 @@ import html
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import subprocess
+import time
+import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -30,6 +33,7 @@ from .execution import CancellationError, raise_if_cancelled, run_cancellable_su
 from .ftps_ingest import source_mode_label
 from .matching import _measure_three_sample_statistics
 from .models import SphereROI
+from .progress import emit_review_progress
 from .rmd import write_rmd_for_clip_with_metadata, write_rmds_from_analysis
 
 
@@ -102,12 +106,17 @@ SAFE_CORRECTION_STOPS = 2.0
 WARNING_CORRECTION_STOPS = 3.0
 REDLINE_DIRECT_EXPOSURE_PARAMETER = "exposureAdjust"
 SPHERE_PROFILE_ZONE_ORDER = ("bright_side", "center", "dark_side")
-SPHERE_PROFILE_ZONE_DISPLAY = {"bright_side": "Bright", "center": "Center", "dark_side": "Dark"}
+SPHERE_PROFILE_ZONE_DISPLAY = {"bright_side": "Sample 1", "center": "Sample 2", "dark_side": "Sample 3"}
 SPHERE_PROFILE_ZONE_WEIGHTS = {"bright_side": 0.3, "center": 0.5, "dark_side": 0.2}
 PROFILE_AUDIT_CONSISTENT_STOPS = 0.10
 PROFILE_AUDIT_REVIEW_STOPS = 0.25
 PROFILE_AUDIT_CONSISTENT_SPREAD_IRE = 1.5
 PROFILE_AUDIT_REVIEW_SPREAD_IRE = 3.0
+SPHERE_PROFILE_SAMPLE_FIELD_MAP = {
+    "bright_side": "sample_1_ire",
+    "center": "sample_2_ire",
+    "dark_side": "sample_3_ire",
+}
 
 
 def normalize_review_mode(value: str) -> str:
@@ -170,14 +179,45 @@ def _measurement_values_for_record(
     clip_id = str(record["clip_id"])
     monitoring = (monitoring_measurements_by_clip or {}).get(clip_id, {})
     resolved_domain = _normalize_matching_domain(matching_domain)
+    diagnostics_are_rendered_ipp2 = str(diagnostics.get("exposure_measurement_domain") or "").strip() == "rendered_preview_ipp2"
     if resolved_domain == "perceptual":
-        return {
-            "log2_luminance": float(
+        if not monitoring and diagnostics_are_rendered_ipp2:
+            monitoring = {
+                "measured_log2_luminance_monitoring": diagnostics.get("measured_log2_luminance_monitoring", diagnostics.get("measured_log2_luminance", 0.0)),
+                "measured_rgb_chromaticity_monitoring": diagnostics.get("measured_rgb_chromaticity", [1 / 3, 1 / 3, 1 / 3]),
+                "measured_saturation_fraction_monitoring": diagnostics.get("saturation_fraction", 0.0),
+                "gray_exposure_summary": diagnostics.get("gray_exposure_summary", diagnostics.get("aggregate_sphere_profile", "n/a")),
+                "zone_measurements": diagnostics.get("zone_measurements", diagnostics.get("neutral_samples", [])),
+                "neutral_sample_log2_spread": diagnostics.get("neutral_sample_log2_spread", 0.0),
+                "neutral_sample_chromaticity_spread": diagnostics.get("neutral_sample_chromaticity_spread", 0.0),
+                "sphere_detection_confidence": diagnostics.get("sphere_detection_confidence", 0.0),
+                "sphere_detection_label": diagnostics.get("sphere_detection_label", ""),
+                "detection_failed": diagnostics.get("detection_failed", False),
+            }
+        zone_measurements = [dict(item) for item in list(monitoring.get("zone_measurements") or [])]
+        if not zone_measurements:
+            zone_measurements = [dict(item) for item in list(diagnostics.get("zone_measurements") or diagnostics.get("neutral_samples") or [])]
+        sample_display_scalar = _sample_scalar_display_from_profile(zone_measurements)
+        resolved_log2 = (
+            float(sample_display_scalar.get("sample_scalar_display_log2", 0.0) or 0.0)
+            if float(sample_display_scalar.get("sample_count", 0.0) or 0.0) > 0.0
+            else float(
                 monitoring.get(
                     "measured_log2_luminance_monitoring",
                     diagnostics.get("measured_log2_luminance_monitoring", diagnostics.get("measured_log2_luminance", 0.0)),
                 )
-            ),
+                or 0.0
+            )
+        )
+        resolved_ire = (
+            float(sample_display_scalar.get("sample_scalar_display_ire", 0.0) or 0.0)
+            if float(sample_display_scalar.get("sample_count", 0.0) or 0.0) > 0.0
+            else float(_ire_from_log2_luminance(resolved_log2))
+        )
+        return {
+            "display_scalar_log2": resolved_log2,
+            "display_scalar_ire": resolved_ire,
+            "log2_luminance": resolved_log2,
             "rgb_chromaticity": [
                 float(value)
                 for value in monitoring.get(
@@ -191,7 +231,30 @@ def _measurement_values_for_record(
                     diagnostics.get("saturation_fraction", 0.0) or 0.0,
                 )
             ),
-            "source": "rendered_preview" if monitoring else "analysis_diagnostic",
+            "gray_exposure_summary": str(
+                monitoring.get(
+                    "gray_exposure_summary",
+                    diagnostics.get("gray_exposure_summary", diagnostics.get("aggregate_sphere_profile", "n/a")),
+                )
+                or "n/a"
+            ),
+            "zone_measurements": zone_measurements,
+            "neutral_sample_log2_spread": float(
+                monitoring.get(
+                    "neutral_sample_log2_spread",
+                    diagnostics.get("neutral_sample_log2_spread", 0.0) or 0.0,
+                )
+            ),
+            "neutral_sample_chromaticity_spread": float(
+                monitoring.get(
+                    "neutral_sample_chromaticity_spread",
+                    diagnostics.get("neutral_sample_chromaticity_spread", 0.0) or 0.0,
+                )
+            ),
+            "sphere_detection_confidence": float(monitoring.get("sphere_detection_confidence", 0.0) or 0.0),
+            "sphere_detection_label": str(monitoring.get("sphere_detection_label") or ""),
+            "detection_failed": bool(monitoring.get("detection_failed")),
+            "source": "rendered_preview_ipp2" if monitoring else "analysis_diagnostic",
         }
     return {
         "log2_luminance": float(
@@ -207,7 +270,135 @@ def _measurement_values_for_record(
         "saturation_fraction": float(
             diagnostics.get("raw_saturation_fraction", diagnostics.get("saturation_fraction", 0.0) or 0.0)
         ),
+        "gray_exposure_summary": str(diagnostics.get("gray_exposure_summary", diagnostics.get("aggregate_sphere_profile", "n/a")) or "n/a"),
+        "zone_measurements": [dict(item) for item in list(diagnostics.get("neutral_samples") or [])],
+        "neutral_sample_log2_spread": float(diagnostics.get("neutral_sample_log2_spread", 0.0) or 0.0),
+        "neutral_sample_chromaticity_spread": float(diagnostics.get("neutral_sample_chromaticity_spread", 0.0) or 0.0),
+        "sphere_detection_confidence": 0.0,
+        "sphere_detection_label": "",
+        "detection_failed": False,
         "source": "scene_referred_analysis",
+    }
+
+
+def _sample_ire_fields_from_profile(zone_measurements: List[Dict[str, object]]) -> Dict[str, float]:
+    zone_map = _zone_profile_by_label(zone_measurements)
+    result: Dict[str, float] = {}
+    for label in SPHERE_PROFILE_ZONE_ORDER:
+        field_name = SPHERE_PROFILE_SAMPLE_FIELD_MAP[label]
+        zone = zone_map.get(label)
+        if zone is None:
+            result[field_name] = 0.0
+            continue
+        result[field_name] = float(
+            zone.get(
+                "measured_ire",
+                _ire_from_log2_luminance(float(zone.get("measured_log2_luminance", 0.0) or 0.0)),
+            )
+            or 0.0
+        )
+    return result
+
+
+def _sample_scalar_display_from_profile(zone_measurements: List[Dict[str, object]]) -> Dict[str, float]:
+    ordered = _ordered_zone_profile(zone_measurements)
+    if not ordered:
+        return {
+            "sample_scalar_display_log2": 0.0,
+            "sample_scalar_display_ire": 0.0,
+            "sample_count": 0.0,
+            "scalar_domain": "display_ipp2",
+        }
+    log2_values = np.asarray(
+        [float(item.get("measured_log2_luminance", 0.0) or 0.0) for item in ordered],
+        dtype=np.float32,
+    )
+    ire_values = np.asarray(
+        [
+            float(
+                item.get(
+                    "measured_ire",
+                    _ire_from_log2_luminance(float(item.get("measured_log2_luminance", 0.0) or 0.0)),
+                )
+                or 0.0
+            )
+            for item in ordered
+        ],
+        dtype=np.float32,
+    )
+    return {
+        "sample_scalar_display_log2": float(np.median(log2_values)) if log2_values.size else 0.0,
+        "sample_scalar_display_ire": float(np.median(ire_values)) if ire_values.size else 0.0,
+        "sample_count": float(log2_values.size),
+        "scalar_domain": "display_ipp2",
+    }
+
+
+def _rendered_measurement_from_diagnostics(record: Dict[str, object]) -> Dict[str, object]:
+    diagnostics = dict(record.get("diagnostics", {}) or {})
+    zone_measurements = [dict(item) for item in list(diagnostics.get("zone_measurements") or diagnostics.get("neutral_samples") or [])]
+    sample_ire_fields = _sample_ire_fields_from_profile(zone_measurements)
+    sample_display_scalar = _sample_scalar_display_from_profile(zone_measurements)
+    resolved_log2 = (
+        float(sample_display_scalar.get("sample_scalar_display_log2", 0.0) or 0.0)
+        if float(sample_display_scalar.get("sample_count", 0.0) or 0.0) > 0.0
+        else float(diagnostics.get("measured_log2_luminance_monitoring", diagnostics.get("measured_log2_luminance", 0.0)) or 0.0)
+    )
+    return {
+        "sample_scalar_display_log2": resolved_log2,
+        "sample_scalar_display_ire": (
+            float(sample_display_scalar.get("sample_scalar_display_ire", 0.0) or 0.0)
+            if float(sample_display_scalar.get("sample_count", 0.0) or 0.0) > 0.0
+            else float(_ire_from_log2_luminance(resolved_log2))
+        ),
+        "sample_scalar_display_domain": "display_ipp2",
+        "measured_log2_luminance_monitoring": resolved_log2,
+        "measured_rgb_mean": [float(value) for value in diagnostics.get("measured_rgb_mean", [0.0, 0.0, 0.0])],
+        "measured_rgb_chromaticity_monitoring": [float(value) for value in diagnostics.get("measured_rgb_chromaticity", [1 / 3, 1 / 3, 1 / 3])],
+        "measured_saturation_fraction_monitoring": float(diagnostics.get("saturation_fraction", 0.0) or 0.0),
+        "gray_exposure_summary": str(diagnostics.get("gray_exposure_summary") or diagnostics.get("aggregate_sphere_profile") or "n/a"),
+        "zone_measurements": zone_measurements,
+        "neutral_sample_log2_spread": float(diagnostics.get("neutral_sample_log2_spread", 0.0) or 0.0),
+        "neutral_sample_chromaticity_spread": float(diagnostics.get("neutral_sample_chromaticity_spread", 0.0) or 0.0),
+        "sphere_detection_confidence": float(diagnostics.get("sphere_detection_confidence", 0.0) or 0.0),
+        "sphere_detection_label": str(diagnostics.get("sphere_detection_label") or ""),
+        "sphere_roi_source": str(diagnostics.get("sphere_detection_source") or diagnostics.get("sphere_roi_source") or ""),
+        "sphere_detection_details": dict(diagnostics.get("sphere_detection_details") or {}),
+        "detected_sphere_roi": dict(diagnostics.get("detected_sphere_roi") or {}),
+        "measurement_crop_bounds": dict(diagnostics.get("measurement_crop_bounds") or {}),
+        "measurement_crop_size": dict(diagnostics.get("measurement_crop_size") or {}),
+        "detection_failed": bool(diagnostics.get("detection_failed")),
+        "dominant_gradient_axis": dict(diagnostics.get("dominant_gradient_axis") or {}),
+        "rendered_preview_path": str(diagnostics.get("rendered_measurement_preview_path") or ""),
+        **sample_ire_fields,
+    }
+
+
+def _monitoring_quality_for_measurement(measurement: Dict[str, object]) -> Dict[str, object]:
+    if not measurement:
+        return {}
+    detection_failed = bool(measurement.get("detection_failed"))
+    detection_confidence = float(measurement.get("sphere_detection_confidence", 0.0) or 0.0)
+    has_sphere_profile = bool(list(measurement.get("zone_measurements") or []))
+    sample_log2_spread = 0.0 if has_sphere_profile else float(measurement.get("neutral_sample_log2_spread", 0.0) or 0.0)
+    sample_chroma_spread = 0.0 if has_sphere_profile else float(measurement.get("neutral_sample_chromaticity_spread", 0.0) or 0.0)
+    spread_penalty = min(sample_log2_spread / max(OPTIMAL_EXPOSURE_MAX_SAMPLE_LOG2_SPREAD, 1e-6), 2.0) * 0.35
+    chroma_penalty = min(sample_chroma_spread / max(OPTIMAL_EXPOSURE_MAX_SAMPLE_CHROMA_SPREAD, 1e-6), 2.0) * 0.15
+    confidence = 0.0 if detection_failed else max(0.0, min(1.0, detection_confidence * (1.0 - spread_penalty - chroma_penalty)))
+    flags: List[str] = []
+    if detection_failed:
+        flags.append("sphere_detection_failed")
+    if sample_log2_spread > OPTIMAL_EXPOSURE_MAX_SAMPLE_LOG2_SPREAD:
+        flags.append("neutral_sample_exposure_spread_high")
+    if sample_chroma_spread > OPTIMAL_EXPOSURE_MAX_SAMPLE_CHROMA_SPREAD:
+        flags.append("neutral_sample_chromaticity_spread_high")
+    return {
+        "confidence": confidence,
+        "neutral_sample_log2_spread": sample_log2_spread,
+        "neutral_sample_chromaticity_spread": sample_chroma_spread,
+        "flags": flags,
+        "sphere_detection_confidence": detection_confidence,
+        "sphere_detection_label": str(measurement.get("sphere_detection_label") or ""),
     }
 
 
@@ -464,7 +655,12 @@ def preview_filename_for_clip_id(
     )
 
 
-def clear_preview_cache(input_path: str, *, report_dir: Optional[str] = None) -> Dict[str, object]:
+def clear_preview_cache(
+    input_path: str,
+    *,
+    report_dir: Optional[str] = None,
+    preserve_measurement_previews: bool = False,
+) -> Dict[str, object]:
     root = Path(input_path).expanduser().resolve()
     preview_root = root / "previews"
     report_root = Path(report_dir).expanduser().resolve() if report_dir else root / "report"
@@ -474,7 +670,7 @@ def clear_preview_cache(input_path: str, *, report_dir: Optional[str] = None) ->
             path.unlink()
             removed.append(str(path))
         measurement_dir = preview_root / "_measurement"
-        if measurement_dir.exists():
+        if measurement_dir.exists() and not preserve_measurement_previews:
             shutil.rmtree(measurement_dir)
             removed.append(str(measurement_dir))
         ipp2_dir = preview_root / "_ipp2_validation"
@@ -603,7 +799,9 @@ def _require_real_redline_validation(
     analysis_records: List[Dict[str, object]],
     redline_executable: str,
     out_root: Path,
+    progress_path: Optional[str] = None,
 ) -> Dict[str, object]:
+    validation_started_at = time.perf_counter()
     summary = _load_summary_payload(input_path) or {}
     backend_name = str(summary.get("backend") or "").strip().lower()
     if backend_name == "mock":
@@ -614,7 +812,16 @@ def _require_real_redline_validation(
     invalid_sources: List[str] = []
     probe_root = out_root / "_real_redline_probe"
     probe_root.mkdir(parents=True, exist_ok=True)
-    for record in analysis_records:
+    emit_review_progress(
+        progress_path,
+        phase="real_redline_validation_start",
+        detail="Starting real REDLine source validation.",
+        stage_label="Validating REDLine",
+        clip_count=len(analysis_records),
+        elapsed_seconds=0.0,
+        review_mode="full_contact_sheet",
+    )
+    for probe_index, record in enumerate(analysis_records, start=1):
         source_path = str(record.get("source_path") or "").strip()
         if not source_path or not _is_real_red_source_path(source_path):
             invalid_sources.append(source_path or "<missing>")
@@ -630,6 +837,17 @@ def _require_real_redline_validation(
                 f"Real REDLine validation requires decodable source media. Render probe failed for {source_path}. "
                 f"STDERR: {str(probe.get('stderr') or '').strip()}"
             )
+        emit_review_progress(
+            progress_path,
+            phase="real_redline_validation_probe",
+            detail="Validated REDLine source renderability.",
+            stage_label="Validating REDLine",
+            clip_index=probe_index,
+            clip_count=len(analysis_records),
+            current_clip_id=str(record.get("clip_id") or ""),
+            elapsed_seconds=time.perf_counter() - validation_started_at,
+            review_mode="full_contact_sheet",
+        )
     if invalid_sources:
         formatted = ", ".join(sorted(set(invalid_sources)))
         raise RuntimeError(
@@ -645,6 +863,15 @@ def _require_real_redline_validation(
     }
     output_path = out_root / "real_redline_validation.json"
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    emit_review_progress(
+        progress_path,
+        phase="real_redline_validation_complete",
+        detail=f"Validated {len(source_probes)} real REDLine source(s).",
+        stage_label="Validating REDLine",
+        clip_count=len(source_probes),
+        elapsed_seconds=time.perf_counter() - validation_started_at,
+        review_mode="full_contact_sheet",
+    )
     return {"path": str(output_path), "summary": payload}
 
 
@@ -830,6 +1057,71 @@ def _sphere_roi_for_region_hwc(region: np.ndarray) -> SphereROI:
         cy=(float(height) - 1.0) / 2.0,
         r=float(radius),
     )
+
+
+def _tight_sphere_crop_bounds(region: np.ndarray, roi: SphereROI, *, margin_ratio: float = 1.35) -> Dict[str, int]:
+    height, width = region.shape[:2]
+    margin = max(float(roi.r) * float(margin_ratio), float(roi.r) + 4.0)
+    x0 = max(0, int(math.floor(float(roi.cx) - margin)))
+    x1 = min(width, int(math.ceil(float(roi.cx) + margin)))
+    y0 = max(0, int(math.floor(float(roi.cy) - margin)))
+    y1 = min(height, int(math.ceil(float(roi.cy) + margin)))
+    if x1 <= x0:
+        x0, x1 = 0, width
+    if y1 <= y0:
+        y0, y1 = 0, height
+    return {"x0": int(x0), "x1": int(x1), "y0": int(y0), "y1": int(y1)}
+
+
+def _offset_zone_measurements_to_parent(
+    zone_measurements: List[Dict[str, object]],
+    *,
+    offset_x: int,
+    offset_y: int,
+    parent_width: int,
+    parent_height: int,
+) -> List[Dict[str, object]]:
+    adjusted: List[Dict[str, object]] = []
+    for measurement in list(zone_measurements or []):
+        item = copy.deepcopy(dict(measurement))
+        bounds = dict(item.get("bounds") or {})
+        pixel = dict(bounds.get("pixel") or {})
+        if pixel:
+            pixel = {
+                "x0": int(pixel.get("x0", 0) or 0) + int(offset_x),
+                "y0": int(pixel.get("y0", 0) or 0) + int(offset_y),
+                "x1": int(pixel.get("x1", 0) or 0) + int(offset_x),
+                "y1": int(pixel.get("y1", 0) or 0) + int(offset_y),
+            }
+            bounds["pixel"] = pixel
+            bounds["normalized_within_roi"] = {
+                "x": float(pixel["x0"]) / float(max(parent_width, 1)),
+                "y": float(pixel["y0"]) / float(max(parent_height, 1)),
+                "w": float(max(pixel["x1"] - pixel["x0"], 1)) / float(max(parent_width, 1)),
+                "h": float(max(pixel["y1"] - pixel["y0"], 1)) / float(max(parent_height, 1)),
+            }
+        polygon = dict(bounds.get("polygon") or {})
+        pixel_polygon = []
+        for point in list(polygon.get("pixel") or []):
+            pixel_polygon.append(
+                {
+                    "x": float(point.get("x", 0.0) or 0.0) + float(offset_x),
+                    "y": float(point.get("y", 0.0) or 0.0) + float(offset_y),
+                }
+            )
+        if pixel_polygon:
+            polygon["pixel"] = pixel_polygon
+            polygon["normalized_within_roi"] = [
+                {
+                    "x": float(point["x"]) / float(max(parent_width, 1)),
+                    "y": float(point["y"]) / float(max(parent_height, 1)),
+                }
+                for point in pixel_polygon
+            ]
+            bounds["polygon"] = polygon
+        item["bounds"] = bounds
+        adjusted.append(item)
+    return adjusted
 
 
 def _sphere_detection_label(confidence: float) -> str:
@@ -1112,8 +1404,13 @@ def _measure_rendered_preview_roi_ipp2(
     *,
     sphere_roi_override: Optional[Dict[str, float]] = None,
 ) -> Dict[str, object]:
+    measurement_started_at = time.perf_counter()
+    phase_started_at = measurement_started_at
     image = np.asarray(Image.open(preview_path).convert("RGB"), dtype=np.float32) / 255.0
+    image_load_seconds = time.perf_counter() - phase_started_at
+    phase_started_at = time.perf_counter()
     region = _extract_normalized_roi_region_hwc(image, calibration_roi)
+    roi_extract_seconds = time.perf_counter() - phase_started_at
     if region.size == 0:
         stats = _measure_rendered_preview_roi(preview_path, calibration_roi)
         return {
@@ -1124,12 +1421,24 @@ def _measure_rendered_preview_roi_ipp2(
             "mask_fraction": 0.0,
             "gray_exposure_summary": "n/a",
             "zone_measurements": [],
+            "render_width": int(image.shape[1]),
+            "render_height": int(image.shape[0]),
+            "measurement_runtime": {
+                "image_load_seconds": float(image_load_seconds),
+                "roi_extract_seconds": float(roi_extract_seconds),
+                "sphere_detection_seconds": 0.0,
+                "gradient_axis_seconds": 0.0,
+                "zone_stat_seconds": 0.0,
+                "profile_measurement_seconds": 0.0,
+                "total_measurement_seconds": float(time.perf_counter() - measurement_started_at),
+            },
         }
     sphere_roi = _coerce_sphere_roi(sphere_roi_override)
     sphere_roi_source = "reused_from_original" if sphere_roi is not None else "failed"
     detection_confidence = 1.0 if sphere_roi is not None else 0.0
     detection_label = "HIGH" if sphere_roi is not None else "FAILED"
     detection_details: Dict[str, object] = {}
+    detection_started_at = time.perf_counter()
     if sphere_roi is None:
         if calibration_roi is None:
             detected = _detect_sphere_roi_in_region_hwc(region)
@@ -1143,6 +1452,7 @@ def _measure_rendered_preview_roi_ipp2(
             detection_confidence = 1.0
             detection_label = "HIGH"
             sphere_roi = _sphere_roi_for_region_hwc(region)
+    sphere_detection_seconds = time.perf_counter() - detection_started_at
     if sphere_roi is None:
         failed_payload = {
             "measured_log2_luminance": 0.0,
@@ -1167,6 +1477,9 @@ def _measure_rendered_preview_roi_ipp2(
             "bright_ire": 0.0,
             "center_ire": 0.0,
             "dark_ire": 0.0,
+            "sample_1_ire": 0.0,
+            "sample_2_ire": 0.0,
+            "sample_3_ire": 0.0,
             "top_ire": 0.0,
             "mid_ire": 0.0,
             "bottom_ire": 0.0,
@@ -1178,16 +1491,48 @@ def _measure_rendered_preview_roi_ipp2(
             "sphere_detection_details": detection_details,
             "detected_sphere_roi": {},
             "detection_failed": True,
+            "render_width": int(image.shape[1]),
+            "render_height": int(image.shape[0]),
+            "measurement_runtime": {
+                "image_load_seconds": float(image_load_seconds),
+                "roi_extract_seconds": float(roi_extract_seconds),
+                "sphere_detection_seconds": float(sphere_detection_seconds),
+                "gradient_axis_seconds": 0.0,
+                "zone_stat_seconds": 0.0,
+                "profile_measurement_seconds": 0.0,
+                "total_measurement_seconds": float(time.perf_counter() - measurement_started_at),
+            },
         }
         return failed_payload
-    stats = measure_sphere_zone_profile_statistics(np.transpose(region, (2, 0, 1)), sphere_roi, sampling_variant="refined")
+    crop_started_at = time.perf_counter()
+    crop_bounds = _tight_sphere_crop_bounds(region, sphere_roi)
+    cropped_region = region[crop_bounds["y0"]:crop_bounds["y1"], crop_bounds["x0"]:crop_bounds["x1"], :]
+    cropped_roi = SphereROI(
+        cx=float(sphere_roi.cx) - float(crop_bounds["x0"]),
+        cy=float(sphere_roi.cy) - float(crop_bounds["y0"]),
+        r=float(sphere_roi.r),
+    )
+    crop_seconds = time.perf_counter() - crop_started_at
+    profile_started_at = time.perf_counter()
+    stats = measure_sphere_zone_profile_statistics(np.transpose(cropped_region, (2, 0, 1)), cropped_roi, sampling_variant="refined")
+    profile_measurement_seconds = time.perf_counter() - profile_started_at
     pixels = region.reshape(-1, 3)
     saturation_fraction = float(np.mean(np.max(pixels, axis=1) >= 0.998)) if pixels.size else 0.0
+    timing = dict(stats.get("timing") or {})
+    zone_measurements = _offset_zone_measurements_to_parent(
+        [dict(item) for item in (stats.get("zone_measurements") or [])],
+        offset_x=int(crop_bounds["x0"]),
+        offset_y=int(crop_bounds["y0"]),
+        parent_width=int(region.shape[1]),
+        parent_height=int(region.shape[0]),
+    )
+    dominant_gradient_axis = dict(stats.get("dominant_gradient_axis") or {})
     return {
         "measured_log2_luminance": float(stats["measured_log2_luminance"]),
         "measured_log2_luminance_monitoring": float(stats["measured_log2_luminance"]),
         "measured_rgb_mean": [float(value) for value in stats["measured_rgb_mean"]],
         "measured_rgb_chromaticity": [float(value) for value in stats["measured_rgb_chromaticity"]],
+        "measured_rgb_chromaticity_monitoring": [float(value) for value in stats["measured_rgb_chromaticity"]],
         "valid_pixel_count": int(stats["valid_pixel_count"]),
         "roi_variance": float(stats["roi_variance"]),
         "monitoring_roi_variance": float(stats["roi_variance"]),
@@ -1200,24 +1545,43 @@ def _measure_rendered_preview_roi_ipp2(
         "neutral_sample_count": int(stats.get("neutral_sample_count", 0) or 0),
         "neutral_sample_log2_spread": float(stats.get("neutral_sample_log2_spread", 0.0) or 0.0),
         "neutral_sample_chromaticity_spread": float(stats.get("neutral_sample_chromaticity_spread", 0.0) or 0.0),
-        "neutral_samples": [dict(item) for item in (stats.get("zone_measurements") or [])],
-        "zone_measurements": [dict(item) for item in (stats.get("zone_measurements") or [])],
+        "neutral_samples": [dict(item) for item in zone_measurements],
+        "zone_measurements": [dict(item) for item in zone_measurements],
         "gray_exposure_summary": str(stats.get("aggregate_sphere_profile") or "n/a"),
         "bright_ire": float(stats.get("bright_ire", 0.0) or 0.0),
         "center_ire": float(stats.get("center_ire", 0.0) or 0.0),
         "dark_ire": float(stats.get("dark_ire", 0.0) or 0.0),
+        "sample_1_ire": float(stats.get("sample_1_ire", stats.get("bright_ire", 0.0)) or 0.0),
+        "sample_2_ire": float(stats.get("sample_2_ire", stats.get("center_ire", 0.0)) or 0.0),
+        "sample_3_ire": float(stats.get("sample_3_ire", stats.get("dark_ire", 0.0)) or 0.0),
         "top_ire": float(stats.get("top_ire", 0.0) or 0.0),
         "mid_ire": float(stats.get("mid_ire", 0.0) or 0.0),
         "bottom_ire": float(stats.get("bottom_ire", 0.0) or 0.0),
         "zone_spread_ire": float(stats.get("zone_spread_ire", 0.0) or 0.0),
         "zone_spread_stops": float(stats.get("zone_spread_stops", 0.0) or 0.0),
-        "dominant_gradient_axis": dict(stats.get("dominant_gradient_axis") or {}),
+        "dominant_gradient_axis": dominant_gradient_axis,
         "sphere_roi_source": sphere_roi_source,
         "sphere_detection_confidence": detection_confidence,
         "sphere_detection_label": detection_label,
         "sphere_detection_details": detection_details,
         "detected_sphere_roi": {"cx": float(sphere_roi.cx), "cy": float(sphere_roi.cy), "r": float(sphere_roi.r)},
         "detection_failed": False,
+        "render_width": int(image.shape[1]),
+        "render_height": int(image.shape[0]),
+        "measurement_crop_bounds": dict(crop_bounds),
+        "measurement_crop_size": {"width": int(cropped_region.shape[1]), "height": int(cropped_region.shape[0])},
+        "measurement_runtime": {
+            "image_load_seconds": float(image_load_seconds),
+            "roi_extract_seconds": float(roi_extract_seconds),
+            "sphere_detection_seconds": float(sphere_detection_seconds),
+            "crop_seconds": float(crop_seconds),
+            "build_mask_seconds": float(timing.get("build_mask_seconds", 0.0) or 0.0),
+            "gradient_axis_seconds": float(timing.get("gradient_axis_seconds", 0.0) or 0.0),
+            "zone_geometry_seconds": float(timing.get("zone_geometry_seconds", 0.0) or 0.0),
+            "zone_stat_seconds": float(timing.get("zone_measurement_seconds", 0.0) or 0.0),
+            "profile_measurement_seconds": float(profile_measurement_seconds),
+            "total_measurement_seconds": float(time.perf_counter() - measurement_started_at),
+        },
     }
 
 
@@ -1369,39 +1733,31 @@ def _shift_zone_profile(zone_measurements: List[Dict[str, object]], delta_stops:
 
 
 def _derived_profile_scalar(zone_measurements: List[Dict[str, object]]) -> Dict[str, object]:
-    zone_map = _zone_profile_by_label(zone_measurements)
-    weighted_values: List[float] = []
-    weights: List[float] = []
-    weighted_ires: List[float] = []
-    for label in SPHERE_PROFILE_ZONE_ORDER:
-        zone = zone_map.get(label)
-        if zone is None:
-            continue
-        weight = float(SPHERE_PROFILE_ZONE_WEIGHTS.get(label, 0.0))
-        if weight <= 0.0:
-            continue
-        measured_log2 = float(zone.get("measured_log2_luminance", 0.0) or 0.0)
-        measured_ire = float(zone.get("measured_ire", _ire_from_log2_luminance(measured_log2)) or 0.0)
-        weighted_values.append(measured_log2 * weight)
-        weighted_ires.append(measured_ire * weight)
-        weights.append(weight)
-    weight_total = float(sum(weights))
-    if weight_total <= 0.0:
+    sample_display_scalar = _sample_scalar_display_from_profile(zone_measurements)
+    if float(sample_display_scalar.get("sample_count", 0.0) or 0.0) <= 0.0:
         return {
+            "derived_display_scalar_log2": 0.0,
+            "derived_display_scalar_ire": 0.0,
             "derived_exposure_value": 0.0,
             "derived_exposure_value_log2": 0.0,
             "derived_exposure_ire": 0.0,
             "zone_weights": dict(SPHERE_PROFILE_ZONE_WEIGHTS),
             "weight_total": 0.0,
+            "derivation_method": "median_sample_log2",
+            "derivation_domain": "display_ipp2",
         }
-    derived_log2 = float(sum(weighted_values) / weight_total)
-    derived_ire = float(sum(weighted_ires) / weight_total)
+    derived_log2 = float(sample_display_scalar.get("sample_scalar_display_log2", 0.0) or 0.0)
+    derived_ire = float(sample_display_scalar.get("sample_scalar_display_ire", 0.0) or 0.0)
     return {
+        "derived_display_scalar_log2": derived_log2,
+        "derived_display_scalar_ire": derived_ire,
         "derived_exposure_value": derived_log2,
         "derived_exposure_value_log2": derived_log2,
         "derived_exposure_ire": derived_ire,
         "zone_weights": dict(SPHERE_PROFILE_ZONE_WEIGHTS),
-        "weight_total": weight_total,
+        "weight_total": float(sum(float(SPHERE_PROFILE_ZONE_WEIGHTS.get(label, 0.0)) for label in SPHERE_PROFILE_ZONE_ORDER)),
+        "derivation_method": "median_sample_log2",
+        "derivation_domain": "display_ipp2",
     }
 
 
@@ -1424,7 +1780,7 @@ def _profile_audit_summary(zone_residuals: List[Dict[str, object]], zone_measure
     elif worst_label == "dark_side" and worst_abs <= PROFILE_AUDIT_REVIEW_STOPS and abs(spread_delta) <= PROFILE_AUDIT_REVIEW_SPREAD_IRE:
         status = "PROFILE NEEDS REVIEW"
         label = "Profile needs review"
-        note = "Dark-side band differs slightly"
+        note = "Sample 3 differs slightly"
         tone = "warning"
     elif worst_abs <= PROFILE_AUDIT_REVIEW_STOPS and abs(spread_delta) <= PROFILE_AUDIT_REVIEW_SPREAD_IRE:
         status = "PROFILE NEEDS REVIEW"
@@ -1864,7 +2220,11 @@ def _run_ipp2_closed_loop_solver(
     redline_capabilities: Dict[str, object],
     run_id: str,
     explicit_anchor_strategy_key: Optional[str] = None,
+    progress_path: Optional[str] = None,
+    original_preview_by_clip: Optional[Dict[str, str]] = None,
+    original_measurements_by_clip: Optional[Dict[str, Dict[str, object]]] = None,
 ) -> Dict[str, object]:
+    solver_started_at = time.perf_counter()
     ipp2_preview_settings = _ipp2_validation_preview_settings()
     preview_root = Path(input_path).expanduser().resolve() / "previews" / "_ipp2_closed_loop"
     preview_root.mkdir(parents=True, exist_ok=True)
@@ -1879,19 +2239,60 @@ def _run_ipp2_closed_loop_solver(
         strategy_payloads=strategy_payloads,
         run_id=f"{run_id}.closed_loop_init",
         strategy_rmd_root=str(Path(input_path).expanduser().resolve() / "review_rmd" / "strategies_ipp2_closed_loop_init"),
-        render_originals=True,
+        render_originals=False,
+        original_preview_by_clip=original_preview_by_clip,
+    )
+    for clip_id, original_path in dict(original_preview_by_clip or {}).items():
+        initial_preview_paths.setdefault(str(clip_id), {}).setdefault("strategies", {})
+        initial_preview_paths[str(clip_id)]["original"] = str(original_path)
+    emit_review_progress(
+        progress_path,
+        phase="closed_loop_initial_previews",
+        detail="Prepared initial IPP2 closed-loop previews.",
+        stage_label="Rendering previews",
+        clip_count=len(analysis_records),
+        elapsed_seconds=time.perf_counter() - solver_started_at,
+        review_mode="full_contact_sheet",
     )
     redline_executable = _resolve_redline_executable()
     record_by_clip = {str(record.get("clip_id") or ""): dict(record) for record in analysis_records}
-    original_measure_cache: Dict[str, Dict[str, object]] = {}
+    original_measure_cache: Dict[str, Dict[str, object]] = {
+        str(clip_id): copy.deepcopy(dict(measurement))
+        for clip_id, measurement in dict(original_measurements_by_clip or {}).items()
+        if measurement
+    }
     detected_sphere_roi_cache: Dict[str, Dict[str, float]] = {}
+    for clip_id, measurement in original_measure_cache.items():
+        detected_roi = dict(measurement.get("detected_sphere_roi") or {})
+        if detected_roi:
+            detected_sphere_roi_cache[clip_id] = detected_roi
     render_cache: Dict[tuple[str, str, float], Dict[str, object]] = {}
     refined_payloads = copy.deepcopy(strategy_payloads)
     closed_loop_strategy_summaries: List[Dict[str, object]] = []
     preview_paths = copy.deepcopy(initial_preview_paths)
 
-    for strategy_payload in refined_payloads:
+    emit_review_progress(
+        progress_path,
+        phase="closed_loop_solver_start",
+        detail=f"Starting IPP2 closed-loop solver for {len(refined_payloads)} strategy payload(s).",
+        stage_label="Closed-loop solve",
+        clip_count=len(analysis_records),
+        elapsed_seconds=time.perf_counter() - solver_started_at,
+        review_mode="full_contact_sheet",
+    )
+    for strategy_index, strategy_payload in enumerate(refined_payloads, start=1):
         strategy_key = str(strategy_payload.get("strategy_key") or "")
+        emit_review_progress(
+            progress_path,
+            phase="closed_loop_strategy_start",
+            detail=f"Solving strategy {strategy_key}.",
+            stage_label="Closed-loop solve",
+            clip_index=strategy_index,
+            clip_count=len(refined_payloads),
+            current_clip_id=strategy_key,
+            elapsed_seconds=time.perf_counter() - solver_started_at,
+            review_mode="full_contact_sheet",
+        )
         strategy_exposure_summary = _exposure_summary(list(strategy_payload.get("clips") or []))
         selection_diagnostics = dict(strategy_payload.get("selection_diagnostics") or {})
         primary_cluster_indices = {int(index) for index in ((selection_diagnostics.get("primary_cluster") or {}).get("indices") or [])}
@@ -1982,8 +2383,20 @@ def _run_ipp2_closed_loop_solver(
         row_results: List[Dict[str, object]] = []
         clip_lookup = {str(item.get("clip_id") or ""): item for item in list(strategy_payload.get("clips") or [])}
 
-        for row in initial_rows:
+        for row_index, row in enumerate(initial_rows, start=1):
             clip_id = str(row["clip_id"])
+            emit_review_progress(
+                progress_path,
+                phase="closed_loop_clip_start",
+                detail=f"Evaluating {clip_id} for {strategy_key}.",
+                stage_label="Closed-loop solve",
+                clip_index=row_index,
+                clip_count=len(initial_rows),
+                current_clip_id=clip_id,
+                elapsed_seconds=time.perf_counter() - solver_started_at,
+                review_mode="full_contact_sheet",
+                extra={"strategy_key": strategy_key},
+            )
             clip_payload = clip_lookup[clip_id]
             current_correction = float(row["initial_exposure_correction_stops"])
             current_path = str(row["initial_image_path"] or "")
@@ -2141,11 +2554,29 @@ def _run_ipp2_closed_loop_solver(
             clip_payload["profile_audit_status"] = str(best_summary.get("profile_audit_status") or "PROFILE NEEDS REVIEW")
             clip_payload["profile_note"] = str(best_summary.get("profile_note") or "Profile needs review")
             clip_payload["ipp2_closed_loop_iterations"] = copy.deepcopy(history)
+            emit_review_progress(
+                progress_path,
+                phase="closed_loop_clip_complete",
+                detail=f"Closed-loop result ready for {clip_id}.",
+                stage_label="Closed-loop solve",
+                clip_index=row_index,
+                clip_count=len(initial_rows),
+                current_clip_id=clip_id,
+                elapsed_seconds=time.perf_counter() - solver_started_at,
+                review_mode="full_contact_sheet",
+                extra={
+                    "strategy_key": strategy_key,
+                    "final_residual_stops": float(best_summary.get("derived_residual_stops", 0.0) or 0.0),
+                },
+            )
             clip_payload["gray_exposure_summary"] = str(best_summary.get("gray_exposure_summary") or row.get("initial_gray_exposure_summary") or "n/a")
             clip_payload["sphere_zone_profile_monitoring"] = copy.deepcopy(best_zone_profile)
             clip_payload["bright_ire"] = _zone_ire_from_profile(best_zone_profile, "bright_side")
             clip_payload["center_ire"] = _zone_ire_from_profile(best_zone_profile, "center")
             clip_payload["dark_ire"] = _zone_ire_from_profile(best_zone_profile, "dark_side")
+            clip_payload["sample_1_ire"] = float(clip_payload["bright_ire"])
+            clip_payload["sample_2_ire"] = float(clip_payload["center_ire"])
+            clip_payload["sample_3_ire"] = float(clip_payload["dark_ire"])
             clip_payload["top_ire"] = float(clip_payload["bright_ire"])
             clip_payload["mid_ire"] = float(clip_payload["center_ire"])
             clip_payload["bottom_ire"] = float(clip_payload["dark_ire"])
@@ -2209,6 +2640,9 @@ def _run_ipp2_closed_loop_solver(
                     "weighted_zone_components": copy.deepcopy(best_summary.get("weighted_zone_components") or []),
                     "weighted_residual_stops": float(best_summary.get("weighted_residual_stops", best_summary.get("derived_residual_stops", 0.0)) or 0.0),
                     "zone_weights": dict(SPHERE_PROFILE_ZONE_WEIGHTS),
+                    "sample_1_ire": float(clip_payload.get("sample_1_ire", 0.0) or 0.0),
+                    "sample_2_ire": float(clip_payload.get("sample_2_ire", 0.0) or 0.0),
+                    "sample_3_ire": float(clip_payload.get("sample_3_ire", 0.0) or 0.0),
                     "top_ire": float(clip_payload.get("top_ire", 0.0) or 0.0),
                     "mid_ire": float(clip_payload.get("mid_ire", 0.0) or 0.0),
                     "bottom_ire": float(clip_payload.get("bottom_ire", 0.0) or 0.0),
@@ -2264,6 +2698,17 @@ def _run_ipp2_closed_loop_solver(
                 "rows": row_results,
                 "metrics": metrics,
             }
+        )
+        emit_review_progress(
+            progress_path,
+            phase="closed_loop_strategy_complete",
+            detail=f"Completed strategy {strategy_key}.",
+            stage_label="Closed-loop solve",
+            clip_index=strategy_index,
+            clip_count=len(refined_payloads),
+            current_clip_id=strategy_key,
+            elapsed_seconds=time.perf_counter() - solver_started_at,
+            review_mode="full_contact_sheet",
         )
 
     recommended_strategy_key = (
@@ -2984,7 +3429,8 @@ def _build_strategy_payloads(
 ) -> List[Dict[str, object]]:
     if not analysis_records:
         return []
-    resolved_matching_domain = _normalize_matching_domain(matching_domain)
+    requested_matching_domain = _normalize_matching_domain(matching_domain)
+    resolved_matching_domain = requested_matching_domain
     resolved_anchor_mode = normalize_exposure_anchor_mode(exposure_anchor_mode)
     manual_target_log2, manual_target_input_domain, manual_target_input_value = _manual_anchor_target_log2(
         manual_target_stops=manual_target_stops,
@@ -2992,21 +3438,39 @@ def _build_strategy_payloads(
     )
     saturation_supported = _target_supports_saturation(target_type)
     resolved_quality_by_clip = quality_by_clip or {}
+    resolved_measurement_cache: Dict[str, Dict[str, object]] = {}
+
+    def measurement_for_record(record: Dict[str, object]) -> Dict[str, object]:
+        clip_id = str(record["clip_id"])
+        cached = resolved_measurement_cache.get(clip_id)
+        if cached is None:
+            cached = _measurement_values_for_record(
+                record,
+                matching_domain=resolved_matching_domain,
+                monitoring_measurements_by_clip=monitoring_measurements_by_clip,
+            )
+            resolved_measurement_cache[clip_id] = cached
+        return cached
 
     def quality_for_record(record: Dict[str, object]) -> Dict[str, object]:
-        return dict(resolved_quality_by_clip.get(str(record["clip_id"]), {}) or {})
+        clip_id = str(record["clip_id"])
+        if resolved_matching_domain == "perceptual":
+            monitoring_quality = _monitoring_quality_for_measurement(measurement_for_record(record))
+            if monitoring_quality:
+                return monitoring_quality
+        return dict(resolved_quality_by_clip.get(clip_id, {}) or {})
 
     def confidence_for_record(record: Dict[str, object]) -> float:
         quality = quality_for_record(record)
         return float(quality.get("confidence", record.get("confidence", 0.0)) or 0.0)
 
     def sample_log2_spread_for_record(record: Dict[str, object]) -> float:
-        measured = record.get("diagnostics", {})
+        measured = measurement_for_record(record) if resolved_matching_domain == "perceptual" else record.get("diagnostics", {})
         quality = quality_for_record(record)
         return float(quality.get("neutral_sample_log2_spread", measured.get("neutral_sample_log2_spread", 0.0)) or 0.0)
 
     def sample_chroma_spread_for_record(record: Dict[str, object]) -> float:
-        measured = record.get("diagnostics", {})
+        measured = measurement_for_record(record) if resolved_matching_domain == "perceptual" else record.get("diagnostics", {})
         quality = quality_for_record(record)
         return float(
             quality.get(
@@ -3158,32 +3622,14 @@ def _build_strategy_payloads(
         return int(chosen["index"]), diagnostics
 
     def measured_log2_for_record(record: Dict[str, object]) -> float:
-        return float(
-            _measurement_values_for_record(
-                record,
-                matching_domain=resolved_matching_domain,
-                monitoring_measurements_by_clip=monitoring_measurements_by_clip,
-            )["log2_luminance"]
-        )
+        measurement = measurement_for_record(record)
+        return float(measurement.get("display_scalar_log2", measurement["log2_luminance"]) or 0.0)
 
     def measured_rgb_for_record(record: Dict[str, object]) -> List[float]:
-        return [
-            float(value)
-            for value in _measurement_values_for_record(
-                record,
-                matching_domain=resolved_matching_domain,
-                monitoring_measurements_by_clip=monitoring_measurements_by_clip,
-            )["rgb_chromaticity"]
-        ]
+        return [float(value) for value in measurement_for_record(record)["rgb_chromaticity"]]
 
     def measured_saturation_for_record(record: Dict[str, object]) -> float:
-        return float(
-            _measurement_values_for_record(
-                record,
-                matching_domain=resolved_matching_domain,
-                monitoring_measurements_by_clip=monitoring_measurements_by_clip,
-            )["saturation_fraction"]
-        )
+        return float(measurement_for_record(record)["saturation_fraction"])
 
     measured_log2 = np.array(
         [measured_log2_for_record(record) for record in analysis_records],
@@ -3303,11 +3749,7 @@ def _build_strategy_payloads(
         wb_requests = []
         for record in analysis_records:
             measured = record.get("diagnostics", {})
-            resolved_measurement = _measurement_values_for_record(
-                record,
-                matching_domain=resolved_matching_domain,
-                monitoring_measurements_by_clip=monitoring_measurements_by_clip,
-            )
+            resolved_measurement = measurement_for_record(record)
             measured_rgb = measured_rgb_for_record(record)
             measured_monitoring_log2 = measured_log2_for_record(record)
             measured_saturation_fraction = measured_saturation_for_record(record)
@@ -3345,11 +3787,16 @@ def _build_strategy_payloads(
                     "clip_id": str(record["clip_id"]),
                     "group_key": str(record["group_key"]),
                     "source_path": record.get("source_path"),
+                    "clip_metadata": record.get("clip_metadata"),
+                    "display_scalar_log2": measured_monitoring_log2,
+                    "display_scalar_domain": "display_ipp2" if resolved_matching_domain == "perceptual" else "scene_analysis",
                     "measured_log2_luminance": measured_monitoring_log2,
                     "measured_log2_luminance_monitoring": measured_monitoring_log2,
                     "measured_log2_luminance_raw": float(measured.get("measured_log2_luminance_raw", measured.get("measured_log2_luminance", 0.0))),
                     "measured_rgb_chromaticity": [float(value) for value in measured_rgb],
                     "monitoring_measurement_source": str(resolved_measurement["source"]),
+                    "gray_exposure_summary": str(resolved_measurement.get("gray_exposure_summary") or measured.get("gray_exposure_summary") or "n/a"),
+                    "zone_measurements": [dict(item) for item in list(resolved_measurement.get("zone_measurements") or [])],
                     "exposure_offset_stops": 0.0 if is_hero_camera else float(target_log2 - measured_monitoring_log2),
                     "camera_offset_from_anchor": 0.0 if is_hero_camera else float(target_log2 - measured_monitoring_log2),
                     "pre_exposure_residual_stops": pre_exposure_residual,
@@ -4833,12 +5280,34 @@ def _render_lightweight_analysis_html(payload: Dict[str, object]) -> str:
     hero_summary = payload["hero_recommendation"]
     run_assessment = dict(payload.get("run_assessment") or {})
     anchor_summary = str(payload.get("exposure_anchor_summary") or "Exposure Anchor: Automatic recommendation")
+    per_camera_rows = [dict(item) for item in list(payload.get("per_camera_analysis") or [])]
+    retained_rows = [row for row in per_camera_rows if str(row.get("reference_use") or "").strip().lower() != "excluded"]
+
+    retained_sample_2_values = [
+        float(row.get("sample_2_ire"))
+        for row in retained_rows
+        if row.get("sample_2_ire") is not None
+    ]
+    best_reference = None
+    best_reference_profile_text = ""
+    if retained_rows:
+        best_reference = min(
+            retained_rows,
+            key=lambda row: (
+                abs(float(row.get("camera_offset_from_anchor", row.get("final_offset_stops", 0.0)) or 0.0)),
+                -float(row.get("trust_score", 0.0) or 0.0),
+                -float(row.get("confidence", 0.0) or 0.0),
+                str(row.get("camera_label") or row.get("clip_id") or ""),
+            ),
+        )
+        best_reference_profile_text = f"({str(best_reference.get('measured_gray_exposure_summary') or 'n/a')})"
+    run_state = str(run_assessment.get("status") or "")
     readiness_label = {
-        "READY": "SAFE TO COMMIT",
-        "READY_WITH_WARNINGS": "COMMIT WITH WARNINGS",
-        "REVIEW_REQUIRED": "REVIEW REQUIRED",
-        "DO_NOT_PUSH": "DO NOT PUSH",
-    }.get(str(run_assessment.get("status") or ""), "COMMIT WITH WARNINGS")
+        "READY": "ARRAY WITHIN CALIBRATION TOLERANCE",
+        "READY_WITH_WARNINGS": "ARRAY NEEDS CALIBRATION REVIEW",
+        "REVIEW_REQUIRED": "ARRAY OUT OF CALIBRATION",
+        "DO_NOT_PUSH": "ARRAY OUT OF CALIBRATION",
+    }.get(run_state, "ARRAY NEEDS CALIBRATION REVIEW")
     readiness_tone = "success" if str(run_assessment.get("status") or "") == "READY" else "danger" if str(run_assessment.get("status") or "") == "DO_NOT_PUSH" else "warning"
     summary_sentence = _lightweight_summary_sentence(
         exposure_summary=exposure_summary,
@@ -4850,11 +5319,9 @@ def _render_lightweight_analysis_html(payload: Dict[str, object]) -> str:
         strategy_summaries=payload["strategy_comparison"],
     )
     banner_subline = (
-        f"{int(exposure_summary.get('outlier_count', 0) or 0)} camera excluded from reference, corrections still applied."
-        if int(exposure_summary.get("outlier_count", 0) or 0) == 1
-        else f"{int(exposure_summary.get('outlier_count', 0) or 0)} cameras excluded from reference, corrections still applied."
-        if int(exposure_summary.get("outlier_count", 0) or 0) > 1
-        else "No cameras excluded from reference in this subset."
+        f"Retained gray sphere Sample 2 values span {min(retained_sample_2_values):.0f} IRE to {max(retained_sample_2_values):.0f} IRE."
+        if retained_sample_2_values
+        else "Retained gray sphere Sample 2 range is not available yet."
     )
     strategy_cards = []
     for strategy in payload["strategy_comparison"]:
@@ -5015,16 +5482,16 @@ def _render_lightweight_analysis_html(payload: Dict[str, object]) -> str:
       </div>
       <p class="synopsis">{html.escape(summary_sentence)}</p>
       <div class="decision-banner {readiness_tone}">
-        <div class="decision-banner-kicker">Calibration Decision</div>
+        <div class="decision-banner-kicker">Array Calibration Review</div>
         <div class="decision-banner-title">{html.escape(readiness_label)}</div>
         <p class="decision-banner-copy">{html.escape(str(payload['operator_recommendation']))}</p>
         <p class="decision-banner-copy" style="margin-top:8px;font-size:15px;font-weight:700;">{html.escape(banner_subline)}</p>
         <div class="decision-metrics">
           <div><div class="eyebrow">Exposure Anchor</div><div class="recommendation">{html.escape(anchor_summary.replace('Exposure Anchor: ', ''))}</div></div>
           <div><div class="eyebrow">Strategy</div><div class="recommendation">{html.escape(str(payload['recommended_strategy']['strategy_label']))}</div></div>
-          <div><div class="eyebrow">Outliers</div><div class="recommendation">{int(exposure_summary['outlier_count'])}</div></div>
-          <div><div class="eyebrow">Trusted Cameras</div><div class="recommendation">{int(run_assessment.get('trusted_camera_count', 0) or 0)}</div></div>
-          <div><div class="eyebrow">Recommendation Strength</div><div class="recommendation">{html.escape(str(run_assessment.get('recommendation_strength') or 'MEDIUM_CONFIDENCE').replace('_', ' '))}</div></div>
+          <div><div class="eyebrow">Retained Cameras</div><div class="recommendation">{len(retained_rows)}</div></div>
+          <div><div class="eyebrow">Excluded Cameras</div><div class="recommendation">{len(per_camera_rows) - len(retained_rows)}</div></div>
+          <div><div class="eyebrow">Reference Candidate</div><div class="recommendation">{html.escape(str((best_reference or {}).get('camera_label') or 'n/a'))}</div></div>
         </div>
       </div>
       <dl class="meta-grid">
@@ -5036,7 +5503,7 @@ def _render_lightweight_analysis_html(payload: Dict[str, object]) -> str:
         <div class="meta-card"><dt>Subset</dt><dd>{html.escape(str(payload['subset_label']))}</dd></div>
         <div class="meta-card"><dt>Exposure Anchor</dt><dd>{html.escape(anchor_summary.replace('Exposure Anchor: ', ''))}</dd></div>
         <div class="meta-card"><dt>Recommendation</dt><dd>{html.escape(str(payload['recommended_strategy']['strategy_label']))}</dd></div>
-        <div class="meta-card"><dt>Run Status</dt><dd>{html.escape(str(run_assessment.get('status') or 'READY_WITH_WARNINGS').replace('_', ' '))}</dd></div>
+        <div class="meta-card"><dt>Calibration State</dt><dd>{html.escape(readiness_label.title())}</dd></div>
         <div class="meta-card"><dt>WB Model</dt><dd>{html.escape(str((payload.get('white_balance_model') or {}).get('model_label') or 'n/a'))}</dd></div>
         <div class="meta-card"><dt>Shared Kelvin</dt><dd>{html.escape(str((payload.get('white_balance_model') or {}).get('shared_kelvin') or 'per-camera'))}</dd></div>
       </dl>
@@ -5055,9 +5522,10 @@ def _render_lightweight_analysis_html(payload: Dict[str, object]) -> str:
         <div style="margin-top:16px;">{chart_frame('Exposure Spread', payload['visuals']['exposure_plot_svg'])}</div>
       </section>
       <section class="section">
-        <h2>Recommendation</h2>
+        <h2>Calibration Recommendation</h2>
         <p class="eyebrow">At A Glance</p>
         <p class="recommendation"><strong>{html.escape(summary_sentence)}</strong></p>
+        <p class="subtle"><strong>Closest current reference candidate:</strong> {html.escape(str((best_reference or {}).get('camera_label') or 'n/a'))} {html.escape(best_reference_profile_text)}</p>
         <p class="eyebrow">Why This Was Chosen</p>
         <ul class="bullet-list">
           {''.join(f"<li>{html.escape(point)}</li>" for point in summary_points)}
@@ -5069,19 +5537,19 @@ def _render_lightweight_analysis_html(payload: Dict[str, object]) -> str:
 
     <div class="grid two-up">
       <section class="section">
-        <h2>Should I Trust This Run?</h2>
-        <p class="lead">{html.escape(str(run_assessment.get('operator_note') or 'Review the trusted camera group before any later push.'))}</p>
+        <h2>Calibration Review Notes</h2>
+        <p class="lead">{html.escape(str(run_assessment.get('operator_note') or 'Review the retained camera group before normalizing the array.'))}</p>
         <ul class="bullet-list">
           <li>{html.escape(str(run_assessment.get('anchor_summary') or 'No anchor summary available.'))}</li>
-          <li>{html.escape(f"Trusted cameras: {int(run_assessment.get('trusted_camera_count', 0) or 0)} / {int(run_assessment.get('camera_count', 0) or 0)}")}</li>
-          <li>{html.escape(f"Excluded cameras: {int(run_assessment.get('excluded_camera_count', 0) or 0)}")}</li>
-          <li>{html.escape('Safe to push later: yes' if bool(run_assessment.get('safe_to_push_later')) else 'Safe to push later: no')}</li>
+          <li>{html.escape(f"Retained cameras: {len(retained_rows)} / {int(run_assessment.get('camera_count', 0) or 0)}")}</li>
+          <li>{html.escape(f"Excluded cameras: {len(per_camera_rows) - len(retained_rows)}")}</li>
+          <li>{html.escape('Calibration payload is ready for review.' if bool(run_assessment.get('safe_to_push_later')) else 'Review retained cameras before normalizing the array.')}</li>
           {''.join(f"<li>{html.escape(str(reason))}</li>" for reason in list(run_assessment.get('gating_reasons') or []))}
         </ul>
       </section>
       <section class="section">
-        <h2>Trust & Eligibility</h2>
-        <p class="lead">Trust classes summarize confidence, stability, cluster membership, and correction size using the current measured signals.</p>
+        <h2>Measurement Stability</h2>
+        <p class="lead">Trust classes summarize sample stability, cluster membership, and correction size using the current sphere measurements.</p>
         <div>{chart_frame('Camera Trust', payload['visuals']['trust_chart_svg'])}</div>
       </section>
     </div>
@@ -5092,18 +5560,7 @@ def _render_lightweight_analysis_html(payload: Dict[str, object]) -> str:
         <p class="lead">Each line shows where a camera measured before correction and where the chosen strategy aims to land it.</p>
         <div>{chart_frame('Before / After Exposure', payload['visuals']['before_after_exposure_svg'])}</div>
       </section>
-      <section class="section">
-        <h2>Confidence / Reliability</h2>
-        <p class="lead">Higher bars indicate cameras with steadier neutral samples and more trustworthy measurements.</p>
-        <div>{chart_frame('Confidence / Reliability', payload['visuals']['confidence_chart_svg'])}</div>
-      </section>
     </div>
-
-    <section class="section" style="margin-top:18px;">
-      <h2>Sample Stability Ranking</h2>
-      <p class="lead">Lower spread means a steadier gray reading. Cameras to the right of the threshold need more caution.</p>
-      <div>{chart_frame('Sample Stability Ranking', payload['visuals']['stability_chart_svg'])}</div>
-    </section>
 
     <section class="section" style="margin-top:18px;">
       <h2>Strategy Comparison</h2>
@@ -5201,15 +5658,36 @@ def build_lightweight_analysis_report(
     manual_target_stops: Optional[float] = None,
     manual_target_ire: Optional[float] = None,
     clear_cache: bool = True,
+    progress_path: Optional[str] = None,
 ) -> Dict[str, object]:
+    report_started_at = time.perf_counter()
     raise_if_cancelled("Run cancelled before lightweight report generation.")
     root = Path(input_path).expanduser().resolve()
     out_root = Path(out_dir).expanduser().resolve()
+    analysis_records = _load_analysis_records(input_path)
+    requested_matching_domain = _normalize_matching_domain(matching_domain)
+    resolved_matching_domain = "perceptual"
+    reusable_analysis_measurements = all(
+        str((record.get("diagnostics", {}) or {}).get("exposure_measurement_domain") or "") == "rendered_preview_ipp2"
+        and str((record.get("diagnostics", {}) or {}).get("rendered_measurement_preview_path") or "").strip()
+        for record in analysis_records
+    )
     out_root.mkdir(parents=True, exist_ok=True)
     if clear_cache:
-        clear_preview_cache(str(root), report_dir=str(out_root))
-    analysis_records = _load_analysis_records(input_path)
-    resolved_matching_domain = _normalize_matching_domain(matching_domain)
+        clear_preview_cache(
+            str(root),
+            report_dir=str(out_root),
+            preserve_measurement_previews=reusable_analysis_measurements,
+        )
+    emit_review_progress(
+        progress_path,
+        phase="lightweight_report_loaded",
+        detail=f"Loaded {len(analysis_records)} analysis record(s) for lightweight report.",
+        stage_label="Building report",
+        clip_count=len(analysis_records),
+        elapsed_seconds=time.perf_counter() - report_started_at,
+        review_mode="lightweight_analysis",
+    )
     resolved_source_mode = source_mode
     resolved_source_mode_label = source_mode_label_value or source_mode_label(resolved_source_mode)
     resolved_strategies = _ensure_anchor_strategy_list(
@@ -5220,12 +5698,37 @@ def build_lightweight_analysis_report(
     resolved_run_label = run_label or root.name or "review"
     monitoring_measurements_by_clip: Dict[str, Dict[str, object]] = {}
     measurement_preview_rendered = 0
+    reused_measurement_renders = 0
     array_calibration_payload = _load_array_calibration_payload(str(root))
-    quality_by_clip = _quality_by_clip(array_calibration_payload)
-    if resolved_matching_domain == "perceptual":
-        measurement_preview_settings = _measurement_preview_settings_for_domain(resolved_matching_domain)
+    measurement_preview_settings = _measurement_preview_settings_for_domain(resolved_matching_domain)
+    if reusable_analysis_measurements:
+        emit_review_progress(
+            progress_path,
+            phase="lightweight_report_measurement_previews_reused",
+            detail="Reusing representative IPP2 monitoring previews from analysis.",
+            stage_label="Reusing measurement previews",
+            clip_count=len(analysis_records),
+            elapsed_seconds=time.perf_counter() - report_started_at,
+            review_mode="lightweight_analysis",
+        )
+        for record in analysis_records:
+            clip_id = str(record["clip_id"])
+            reusable_measurement = _rendered_measurement_from_diagnostics(record)
+            monitoring_measurements_by_clip[clip_id] = reusable_measurement
+            reused_measurement_renders += 1
+        measurement_preview_rendered = reused_measurement_renders
+    else:
         redline_executable = _resolve_redline_executable()
         redline_capabilities = _detect_redline_capabilities(redline_executable)
+        emit_review_progress(
+            progress_path,
+            phase="lightweight_report_measurement_previews_start",
+            detail="Rendering representative IPP2 monitoring previews for lightweight measurement.",
+            stage_label="Rendering measurement previews",
+            clip_count=len(analysis_records),
+            elapsed_seconds=time.perf_counter() - report_started_at,
+            review_mode="lightweight_analysis",
+        )
         measurement_preview_paths = generate_preview_stills(
             input_path,
             analysis_records=analysis_records,
@@ -5236,14 +5739,30 @@ def build_lightweight_analysis_report(
             run_id=resolved_run_label,
         )
         measurement_preview_rendered = len(measurement_preview_paths)
+        emit_review_progress(
+            progress_path,
+            phase="lightweight_report_measurement_previews_complete",
+            detail=f"Rendered {measurement_preview_rendered} representative monitoring preview(s).",
+            stage_label="Rendering measurement previews",
+            clip_count=len(analysis_records),
+            elapsed_seconds=time.perf_counter() - report_started_at,
+            review_mode="lightweight_analysis",
+        )
         for record in analysis_records:
             clip_id = str(record["clip_id"])
             original_frame = measurement_preview_paths.get(clip_id, {}).get("original")
             if original_frame:
-                monitoring_measurements_by_clip[clip_id] = _measure_rendered_preview_roi(
+                monitoring_measurements_by_clip[clip_id] = _measure_rendered_preview_roi_ipp2(
                     str(original_frame),
                     record.get("diagnostics", {}).get("calibration_roi") or calibration_roi,
                 )
+    quality_by_clip = {
+        **_quality_by_clip(array_calibration_payload),
+        **{
+            clip_id: _monitoring_quality_for_measurement(measurement)
+            for clip_id, measurement in monitoring_measurements_by_clip.items()
+        },
+    }
     strategy_payloads = _build_strategy_payloads(
         analysis_records,
         target_strategies=resolved_strategies,
@@ -5257,6 +5776,15 @@ def build_lightweight_analysis_report(
         exposure_anchor_mode=exposure_anchor_mode,
         manual_target_stops=manual_target_stops,
         manual_target_ire=manual_target_ire,
+    )
+    emit_review_progress(
+        progress_path,
+        phase="lightweight_report_strategies",
+        detail=f"Built {len(strategy_payloads)} lightweight strategy payload(s).",
+        stage_label="Building report",
+        clip_count=len(analysis_records),
+        elapsed_seconds=time.perf_counter() - report_started_at,
+        review_mode="lightweight_analysis",
     )
     if quality_by_clip:
         for payload in strategy_payloads:
@@ -5307,7 +5835,7 @@ def build_lightweight_analysis_report(
     for index, record in enumerate(analysis_records):
         clip_id = str(record["clip_id"])
         strategy_clip = next(item for item in recommended_payload["clips"] if item["clip_id"] == clip_id)
-        measured_log2 = float(strategy_clip["measured_log2_luminance"])
+        measured_log2 = float(strategy_clip.get("display_scalar_log2", strategy_clip["measured_log2_luminance"]) or 0.0)
         is_outlier = abs(measured_log2 - float(exposure_summary["median"])) > outlier_threshold
         trust_details = _camera_trust_details(
             clip_id=clip_id,
@@ -5333,6 +5861,8 @@ def build_lightweight_analysis_report(
             {
                 "camera_label": _camera_label_for_reporting(clip_id),
                 "clip_id": clip_id,
+                "display_scalar_log2": measured_log2,
+                "display_scalar_domain": str(strategy_clip.get("display_scalar_domain") or "display_ipp2"),
                 "measured_log2_luminance": measured_log2,
                 "anchor_mode": str(strategy_clip.get("anchor_mode") or recommended_payload.get("anchor_mode") or ""),
                 "anchor_source": str(strategy_clip.get("anchor_source") or recommended_payload.get("anchor_source") or ""),
@@ -5340,10 +5870,15 @@ def build_lightweight_analysis_report(
                 "anchor_ire_summary": str(strategy_clip.get("anchor_ire_summary") or recommended_payload.get("anchor_ire_summary") or "n/a"),
                 "measured_scalar_value": measured_log2,
                 "measured_gray_exposure_summary": str(strategy_clip.get("gray_exposure_summary") or strategy_clip.get("aggregate_sphere_profile") or "n/a"),
+                "sample_1_ire": float(strategy_clip.get("sample_1_ire", strategy_clip.get("bright_ire", 0.0)) or 0.0),
+                "sample_2_ire": float(strategy_clip.get("sample_2_ire", strategy_clip.get("center_ire", 0.0)) or 0.0),
+                "sample_3_ire": float(strategy_clip.get("sample_3_ire", strategy_clip.get("dark_ire", 0.0)) or 0.0),
+                "monitoring_measurement_source": str(strategy_clip.get("monitoring_measurement_source") or ""),
                 "raw_offset_stops": float(record.get("raw_offset_stops", 0.0) or 0.0),
                 "final_offset_stops": float(strategy_clip["exposure_offset_stops"]),
                 "camera_offset_from_anchor": float(strategy_clip.get("camera_offset_from_anchor", strategy_clip["exposure_offset_stops"]) or 0.0),
-                "derived_exposure_value": float(strategy_clip.get("measured_log2_luminance_monitoring", strategy_clip.get("measured_log2_luminance", 0.0)) or 0.0),
+                "derived_display_scalar_log2": float(strategy_clip.get("display_scalar_log2", strategy_clip.get("measured_log2_luminance_monitoring", strategy_clip.get("measured_log2_luminance", 0.0))) or 0.0),
+                "derived_exposure_value": float(strategy_clip.get("display_scalar_log2", strategy_clip.get("measured_log2_luminance_monitoring", strategy_clip.get("measured_log2_luminance", 0.0))) or 0.0),
                 "derived_exposure_offset_stops": float(strategy_clip.get("camera_offset_from_anchor", strategy_clip["exposure_offset_stops"]) or 0.0),
                 "commit_values": strategy_clip["commit_values"],
                 "pre_color_residual": float(strategy_clip.get("pre_color_residual", 0.0) or 0.0),
@@ -5428,6 +5963,10 @@ def build_lightweight_analysis_report(
         "processing_mode": processing_mode or "both",
         "matching_domain": resolved_matching_domain,
         "matching_domain_label": _matching_domain_label(resolved_matching_domain),
+        "requested_matching_domain": requested_matching_domain,
+        "requested_matching_domain_label": _matching_domain_label(requested_matching_domain),
+        "requested_matching_domain": requested_matching_domain,
+        "requested_matching_domain_label": _matching_domain_label(requested_matching_domain),
         "selected_clip_ids": [str(item) for item in (selected_clip_ids or []) if str(item).strip()],
         "selected_clip_groups": [str(item) for item in (selected_clip_groups or []) if str(item).strip()],
         "selected_strategy_labels": ", ".join(str(item["strategy_label"]) for item in strategy_summaries),
@@ -5456,6 +5995,13 @@ def build_lightweight_analysis_report(
         "operator_recommendation": operator_recommendation,
         "per_camera_analysis": per_camera_rows,
         "measurement_render_count": measurement_preview_rendered,
+        "measurement_domain_trace": {
+            "requested_matching_domain": requested_matching_domain,
+            "effective_matching_domain": resolved_matching_domain,
+            "measurement_source": "rendered_preview_ipp2",
+            "measurement_preview_transform": _preview_transform_label(measurement_preview_settings),
+            "measurement_preview_reused_from_analysis": bool(reusable_analysis_measurements),
+        },
         "shared_originals": [],
         "strategies": [],
         "visuals": {
@@ -5469,10 +6015,8 @@ def build_lightweight_analysis_report(
                 recommended_payload["clips"],
                 target_log2=float(recommended_payload["target_log2_luminance"]),
             ),
-            "confidence_chart_svg": _build_confidence_chart_svg(recommended_payload["clips"]),
             "strategy_chart_svg": _build_strategy_chart_svg(strategy_summaries),
             "trust_chart_svg": _build_trust_chart_svg(per_camera_rows),
-            "stability_chart_svg": _build_stability_chart_svg(per_camera_rows),
         },
     }
     payload["debug_exposure_trace"] = _build_exposure_trace_artifacts(
@@ -6007,6 +6551,7 @@ def generate_preview_stills(
     run_id: Optional[str] = None,
     strategy_rmd_root: Optional[str] = None,
     render_originals: bool = True,
+    original_preview_by_clip: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Dict[str, object]]:
     raise_if_cancelled("Run cancelled before preview generation.")
     preview_root = Path(previews_dir).expanduser().resolve()
@@ -6104,6 +6649,10 @@ def generate_preview_stills(
                 }
             )
             print(f"[r3dmatch] preview render clip={clip_id} mode=baseline output={original_path}")
+        else:
+            reused_original = str((original_preview_by_clip or {}).get(clip_id) or "")
+            if reused_original:
+                original_path = Path(reused_original)
         preview_paths[clip_id]["original"] = str(original_path) if original_path.exists() else None
 
         for strategy_payload in resolved_strategy_payloads:
@@ -6395,15 +6944,36 @@ def build_contact_sheet_report(
     manual_target_stops: Optional[float] = None,
     manual_target_ire: Optional[float] = None,
     require_real_redline: bool = False,
+    progress_path: Optional[str] = None,
 ) -> Dict[str, object]:
+    report_started_at = time.perf_counter()
     raise_if_cancelled("Run cancelled before report generation.")
     root = Path(input_path).expanduser().resolve()
     out_root = Path(out_dir).expanduser().resolve()
+    analysis_records = _load_analysis_records(input_path)
+    reusable_analysis_measurements = all(
+        str((record.get("diagnostics", {}) or {}).get("exposure_measurement_domain") or "") == "rendered_preview_ipp2"
+        and str((record.get("diagnostics", {}) or {}).get("rendered_measurement_preview_path") or "").strip()
+        for record in analysis_records
+    )
     out_root.mkdir(parents=True, exist_ok=True)
     if clear_cache:
-        clear_preview_cache(str(root), report_dir=str(out_root))
-    analysis_records = _load_analysis_records(input_path)
-    resolved_matching_domain = _normalize_matching_domain(matching_domain)
+        clear_preview_cache(
+            str(root),
+            report_dir=str(out_root),
+            preserve_measurement_previews=reusable_analysis_measurements,
+        )
+    emit_review_progress(
+        progress_path,
+        phase="contact_report_loaded",
+        detail=f"Loaded {len(analysis_records)} analysis record(s) for full contact sheet.",
+        stage_label="Building report",
+        clip_count=len(analysis_records),
+        elapsed_seconds=time.perf_counter() - report_started_at,
+        review_mode="full_contact_sheet",
+    )
+    requested_matching_domain = _normalize_matching_domain(matching_domain)
+    resolved_matching_domain = "perceptual"
     resolved_source_mode = source_mode
     resolved_source_mode_label = source_mode_label_value or source_mode_label(resolved_source_mode)
     resolved_strategies = _ensure_anchor_strategy_list(
@@ -6417,11 +6987,21 @@ def build_contact_sheet_report(
     redline_capabilities = _detect_redline_capabilities(redline_executable)
     real_redline_validation = None
     if require_real_redline:
+        emit_review_progress(
+            progress_path,
+            phase="contact_report_real_redline",
+            detail="Checking real REDLine availability and source media.",
+            stage_label="Validating REDLine",
+            clip_count=len(analysis_records),
+            elapsed_seconds=time.perf_counter() - report_started_at,
+            review_mode="full_contact_sheet",
+        )
         real_redline_validation = _require_real_redline_validation(
             input_path=input_path,
             analysis_records=analysis_records,
             redline_executable=redline_executable,
             out_root=out_root,
+            progress_path=progress_path,
         )
     color_preview_policy = _color_preview_policy()
     measurement_preview_settings = _measurement_preview_settings_for_domain(resolved_matching_domain)
@@ -6439,26 +7019,38 @@ def build_contact_sheet_report(
     color_by_group = {entry.group_key: entry for entry in color.cameras} if color else {}
     array_calibration_payload = _load_array_calibration_payload(str(root))
     quality_by_clip = _quality_by_clip(array_calibration_payload)
-    monitoring_measurements_by_clip = {}
+    monitoring_measurements_by_clip: Dict[str, Dict[str, object]] = {}
+    analysis_original_preview_by_clip: Dict[str, str] = {}
     if resolved_matching_domain == "perceptual":
-        measurement_preview_paths = generate_preview_stills(
-            input_path,
-            analysis_records=analysis_records,
-            previews_dir=str(root / "previews" / "_measurement"),
-            preview_settings=measurement_preview_settings,
-            redline_capabilities=redline_capabilities,
-            strategy_payloads=[],
-            run_id=run_id,
-        )
-        for record in analysis_records:
-            raise_if_cancelled("Run cancelled while measuring rendered originals.")
-            clip_id = str(record["clip_id"])
-            original_frame = measurement_preview_paths.get(clip_id, {}).get("original")
-            if original_frame:
-                monitoring_measurements_by_clip[clip_id] = _measure_rendered_preview_roi(
-                    str(original_frame),
-                    record.get("diagnostics", {}).get("calibration_roi") or calibration_roi,
-                )
+        if reusable_analysis_measurements:
+            for record in analysis_records:
+                clip_id = str(record["clip_id"])
+                reusable_measurement = _rendered_measurement_from_diagnostics(record)
+                monitoring_measurements_by_clip[clip_id] = reusable_measurement
+                rendered_path = str(reusable_measurement.get("rendered_preview_path") or "")
+                if rendered_path:
+                    analysis_original_preview_by_clip[clip_id] = rendered_path
+        else:
+            measurement_preview_paths = generate_preview_stills(
+                input_path,
+                analysis_records=analysis_records,
+                previews_dir=str(root / "previews" / "_measurement"),
+                preview_settings=measurement_preview_settings,
+                redline_capabilities=redline_capabilities,
+                strategy_payloads=[],
+                run_id=run_id,
+            )
+            for record in analysis_records:
+                raise_if_cancelled("Run cancelled while measuring rendered originals.")
+                clip_id = str(record["clip_id"])
+                original_frame = measurement_preview_paths.get(clip_id, {}).get("original")
+                if original_frame:
+                    measured = _measure_rendered_preview_roi_ipp2(
+                        str(original_frame),
+                        record.get("diagnostics", {}).get("calibration_roi") or calibration_roi,
+                    )
+                    monitoring_measurements_by_clip[clip_id] = measured
+                    analysis_original_preview_by_clip[clip_id] = str(original_frame)
     strategy_payloads = _build_strategy_payloads(
         analysis_records,
         target_strategies=resolved_strategies,
@@ -6473,6 +7065,15 @@ def build_contact_sheet_report(
         manual_target_stops=manual_target_stops,
         manual_target_ire=manual_target_ire,
     )
+    emit_review_progress(
+        progress_path,
+        phase="contact_report_strategies",
+        detail=f"Built {len(strategy_payloads)} strategy payload(s).",
+        stage_label="Building report",
+        clip_count=len(analysis_records),
+        elapsed_seconds=time.perf_counter() - report_started_at,
+        review_mode="full_contact_sheet",
+    )
     ipp2_closed_loop = _run_ipp2_closed_loop_solver(
         input_path=input_path,
         out_root=out_root,
@@ -6481,8 +7082,20 @@ def build_contact_sheet_report(
         redline_capabilities=redline_capabilities,
         run_id=run_id,
         explicit_anchor_strategy_key=explicit_anchor_strategy_key,
+        progress_path=progress_path,
+        original_preview_by_clip=analysis_original_preview_by_clip,
+        original_measurements_by_clip=monitoring_measurements_by_clip,
     )
     strategy_payloads = list(ipp2_closed_loop.get("strategy_payloads") or strategy_payloads)
+    emit_review_progress(
+        progress_path,
+        phase="contact_report_closed_loop",
+        detail="Closed-loop IPP2 refinement complete.",
+        stage_label="Building report",
+        clip_count=len(analysis_records),
+        elapsed_seconds=time.perf_counter() - report_started_at,
+        review_mode="full_contact_sheet",
+    )
     sampling_comparison = _build_sampling_comparison(analysis_records, out_root=out_root)
     solve_comparison = _build_solve_comparison(
         analysis_records,
@@ -6536,7 +7149,20 @@ def build_contact_sheet_report(
         strategy_payloads=strategy_payloads,
         run_id=run_id,
         strategy_rmd_root=str(root / "review_rmd" / "strategies"),
-        render_originals=True,
+        render_originals=False,
+        original_preview_by_clip=analysis_original_preview_by_clip,
+    )
+    for clip_id, original_path in analysis_original_preview_by_clip.items():
+        preview_paths.setdefault(str(clip_id), {}).setdefault("strategies", {})
+        preview_paths[str(clip_id)]["original"] = str(original_path)
+    emit_review_progress(
+        progress_path,
+        phase="contact_report_previews",
+        detail="Preview generation complete.",
+        stage_label="Rendering previews",
+        clip_count=len(analysis_records),
+        elapsed_seconds=time.perf_counter() - report_started_at,
+        review_mode="full_contact_sheet",
     )
     preview_manifest_payload = json.loads((root / "previews" / "preview_commands.json").read_text(encoding="utf-8"))
     preview_command_lookup = {
@@ -6553,23 +7179,30 @@ def build_contact_sheet_report(
     for record in analysis_records:
         raise_if_cancelled("Run cancelled while collecting review metadata.")
         clip_id = str(record["clip_id"])
+        measurement = _measurement_values_for_record(
+            record,
+            matching_domain=resolved_matching_domain,
+            monitoring_measurements_by_clip=monitoring_measurements_by_clip,
+        )
         shared_originals.append(
             {
                 "clip_id": clip_id,
                 "group_key": str(record["group_key"]),
                 "source_path": record.get("source_path"),
+                "clip_metadata": record.get("clip_metadata"),
                 "original_frame": preview_paths.get(clip_id, {}).get("original"),
-                "measured_log2_luminance": _measurement_values_for_record(
-                    record,
-                    matching_domain=resolved_matching_domain,
-                    monitoring_measurements_by_clip=monitoring_measurements_by_clip,
-                )["log2_luminance"],
+                "display_scalar_log2": float(measurement.get("display_scalar_log2", measurement["log2_luminance"]) or 0.0),
+                "display_scalar_domain": "display_ipp2" if resolved_matching_domain == "perceptual" else "scene_analysis",
+                "measured_log2_luminance": measurement["log2_luminance"],
                 "measured_log2_luminance_monitoring": monitoring_measurements_by_clip.get(clip_id, {}).get(
                     "measured_log2_luminance_monitoring",
                     record.get("diagnostics", {}).get("measured_log2_luminance_monitoring"),
                 ),
                 "measured_log2_luminance_raw": record.get("diagnostics", {}).get("measured_log2_luminance_raw"),
                 "gray_exposure_summary": str(record.get("diagnostics", {}).get("gray_exposure_summary") or record.get("diagnostics", {}).get("aggregate_sphere_profile") or "n/a"),
+                "sample_1_ire": float(record.get("diagnostics", {}).get("sample_1_ire", record.get("diagnostics", {}).get("bright_ire", 0.0)) or 0.0),
+                "sample_2_ire": float(record.get("diagnostics", {}).get("sample_2_ire", record.get("diagnostics", {}).get("center_ire", 0.0)) or 0.0),
+                "sample_3_ire": float(record.get("diagnostics", {}).get("sample_3_ire", record.get("diagnostics", {}).get("dark_ire", 0.0)) or 0.0),
                 "top_ire": float(record.get("diagnostics", {}).get("top_ire", 0.0) or 0.0),
                 "mid_ire": float(record.get("diagnostics", {}).get("mid_ire", 0.0) or 0.0),
                 "bottom_ire": float(record.get("diagnostics", {}).get("bottom_ire", 0.0) or 0.0),
@@ -6651,6 +7284,9 @@ def build_contact_sheet_report(
                             "measured_log2_luminance_monitoring": strategy_clip["measured_log2_luminance_monitoring"],
                             "measured_log2_luminance_raw": strategy_clip["measured_log2_luminance_raw"],
                             "gray_exposure_summary": str(strategy_clip.get("gray_exposure_summary") or strategy_clip.get("aggregate_sphere_profile") or "n/a"),
+                            "sample_1_ire": float(strategy_clip.get("sample_1_ire", strategy_clip.get("bright_ire", 0.0)) or 0.0),
+                            "sample_2_ire": float(strategy_clip.get("sample_2_ire", strategy_clip.get("center_ire", 0.0)) or 0.0),
+                            "sample_3_ire": float(strategy_clip.get("sample_3_ire", strategy_clip.get("dark_ire", 0.0)) or 0.0),
                             "top_ire": float(strategy_clip.get("top_ire", 0.0) or 0.0),
                             "mid_ire": float(strategy_clip.get("mid_ire", 0.0) or 0.0),
                             "bottom_ire": float(strategy_clip.get("bottom_ire", 0.0) or 0.0),
@@ -7064,6 +7700,7 @@ def build_review_package(
     manual_target_stops: Optional[float] = None,
     manual_target_ire: Optional[float] = None,
     require_real_redline: bool = False,
+    progress_path: Optional[str] = None,
 ) -> Dict[str, object]:
     raise_if_cancelled("Run cancelled before review package assembly.")
     root = Path(out_dir).expanduser().resolve()
@@ -7092,7 +7729,8 @@ def build_review_package(
             exposure_anchor_mode=exposure_anchor_mode,
             manual_target_stops=manual_target_stops,
             manual_target_ire=manual_target_ire,
-            clear_cache=True,
+            clear_cache=False,
+            progress_path=progress_path,
         )
     else:
         report_payload = build_contact_sheet_report(
@@ -7125,6 +7763,7 @@ def build_review_package(
             manual_target_ire=manual_target_ire,
             clear_cache=True,
             require_real_redline=require_real_redline,
+            progress_path=progress_path,
         )
     if resolved_review_mode == "lightweight_analysis":
         rmd_manifest = {
@@ -7180,6 +7819,517 @@ def build_review_package(
     return package_manifest
 
 
+def _contact_sheet_image_src(path: object) -> str:
+    path_text = str(path or "").strip()
+    if not path_text:
+        return ""
+    path_obj = Path(path_text)
+    if "review_detection_overlays" in path_obj.parts:
+        return f"./review_detection_overlays/{path_obj.name}"
+    if "_measurement" in path_obj.parts:
+        return f"../previews/_measurement/{path_obj.name}"
+    if "_ipp2_closed_loop" in path_obj.parts:
+        return f"../previews/_ipp2_closed_loop/{path_obj.name}"
+    return f"../previews/{path_obj.name}"
+
+
+def _contact_sheet_display_scalar_ire(log2_value: object, fallback_ire: object = None) -> float:
+    if fallback_ire is not None:
+        try:
+            return float(fallback_ire)
+        except (TypeError, ValueError):
+            pass
+    try:
+        return float(_ire_from_log2_luminance(float(log2_value or 0.0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _contact_sheet_status_tone(status: str) -> str:
+    return {"PASS": "good", "REVIEW": "warning", "FAIL": "danger"}.get(str(status or "REVIEW"), "warning")
+
+
+def _contact_sheet_reference_candidate(entries: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
+    retained = [item for item in entries if str(item.get("reference_use") or "Included") != "Excluded"]
+    if not retained:
+        retained = list(entries)
+    if not retained:
+        return None
+    return min(
+        retained,
+        key=lambda item: (
+            abs(float(item.get("offset_to_anchor", 0.0) or 0.0)),
+            -float(item.get("trust_score", 0.0) or 0.0),
+            str(item.get("camera_label") or ""),
+        ),
+    )
+
+
+def _contact_sheet_goal_achieved(entries: List[Dict[str, object]], goal_stops: float = 0.02) -> bool:
+    if not entries:
+        return False
+    return all(float(item.get("residual_abs_stops", 0.0) or 0.0) <= goal_stops for item in entries)
+
+
+def _contact_sheet_chunks(entries: List[Dict[str, object]], *, columns: int = 3, max_rows: int = 4) -> List[List[Dict[str, object]]]:
+    page_size = max(1, int(columns) * int(max_rows))
+    if not entries:
+        return [[]]
+    return [entries[index:index + page_size] for index in range(0, len(entries), page_size)]
+
+
+def _contact_sheet_format_tint(value: object) -> str:
+    try:
+        tint = float(value)
+    except (TypeError, ValueError):
+        return ""
+    rounded = round(tint, 1)
+    if abs(rounded) < 1e-6:
+        rounded = 0.0
+    text = f"Tint {rounded:+.1f}"
+    return text.replace("+0.0", "0.0").replace("-0.0", "0.0")
+
+
+def _contact_sheet_format_kelvin(value: object) -> str:
+    try:
+        kelvin = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if kelvin <= 0:
+        return ""
+    return f"{int(round(kelvin))}K"
+
+
+def _contact_sheet_format_iso(value: object) -> str:
+    try:
+        iso = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if iso <= 0:
+        return ""
+    return f"ISO {int(round(iso))}"
+
+
+def _contact_sheet_format_shutter(value: object) -> str:
+    try:
+        shutter_seconds = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if shutter_seconds <= 0:
+        return ""
+    denominator = round(1.0 / shutter_seconds)
+    if denominator > 0 and abs((1.0 / denominator) - shutter_seconds) <= 0.001:
+        return f"1/{int(denominator)}"
+    return f"{shutter_seconds:.4f}s"
+
+
+def _contact_sheet_join_bits(parts: List[str]) -> str:
+    return " | ".join(part for part in parts if str(part).strip())
+
+
+def _contact_sheet_metric_range(values: List[float], *, fallback_span: float = 1.0) -> Tuple[float, float]:
+    if not values:
+        return (0.0, fallback_span)
+    low = min(values)
+    high = max(values)
+    if math.isclose(low, high, abs_tol=1e-9):
+        pad = max(abs(low) * 0.05, fallback_span * 0.5, 0.5)
+        return low - pad, high + pad
+    span = high - low
+    pad = max(span * 0.08, span * 0.02)
+    return low - pad, high + pad
+
+
+def _contact_sheet_svg_single_series(
+    title: str,
+    labels: List[str],
+    values: List[float],
+    *,
+    stroke: str,
+    units: str,
+    goal: Optional[float] = None,
+) -> str:
+    if not labels or not values:
+        return ""
+    width = 880
+    height = 180
+    margin_left = 58
+    margin_right = 18
+    margin_top = 18
+    margin_bottom = 36
+    plot_width = width - margin_left - margin_right
+    plot_height = height - margin_top - margin_bottom
+    y_min, y_max = _contact_sheet_metric_range(values, fallback_span=0.5)
+
+    def x_for(index: int) -> float:
+        if len(values) == 1:
+            return margin_left + plot_width / 2
+        return margin_left + (index / max(len(values) - 1, 1)) * plot_width
+
+    def y_for(value: float) -> float:
+        if math.isclose(y_min, y_max, abs_tol=1e-9):
+            return margin_top + plot_height / 2
+        return margin_top + (1.0 - ((value - y_min) / (y_max - y_min))) * plot_height
+
+    points = " ".join(f"{x_for(index):.1f},{y_for(value):.1f}" for index, value in enumerate(values))
+    y_ticks = [y_min, (y_min + y_max) / 2.0, y_max]
+    goal_markup = ""
+    if goal is not None and y_min <= goal <= y_max:
+        goal_y = y_for(goal)
+        goal_markup = (
+            f"<line x1='{margin_left:.1f}' y1='{goal_y:.1f}' x2='{width - margin_right:.1f}' y2='{goal_y:.1f}' "
+            "stroke='#9ca3af' stroke-width='1.5' stroke-dasharray='6 5' />"
+            f"<text x='{width - margin_right:.1f}' y='{goal_y - 6:.1f}' text-anchor='end' fill='#6b7280' font-size='12'>goal {goal:+.2f}</text>"
+        )
+
+    x_labels = []
+    for index, label in enumerate(labels):
+        x = x_for(index)
+        x_labels.append(
+            f"<text x='{x:.1f}' y='{height - 10:.1f}' text-anchor='middle' fill='#64748b' font-size='11'>{html.escape(label)}</text>"
+        )
+    y_labels = []
+    for tick in y_ticks:
+        y = y_for(tick)
+        y_labels.append(
+            f"<line x1='{margin_left:.1f}' y1='{y:.1f}' x2='{width - margin_right:.1f}' y2='{y:.1f}' stroke='#e2e8f0' stroke-width='1' />"
+            f"<text x='{margin_left - 8:.1f}' y='{y + 4:.1f}' text-anchor='end' fill='#64748b' font-size='11'>{tick:.2f}{html.escape(units)}</text>"
+        )
+    point_markup = "".join(
+        f"<circle cx='{x_for(index):.1f}' cy='{y_for(value):.1f}' r='4.5' fill='{stroke}' />"
+        for index, value in enumerate(values)
+    )
+    return (
+        f"<svg viewBox='0 0 {width} {height}' role='img' aria-label='{html.escape(title)}'>"
+        f"<rect x='0' y='0' width='{width}' height='{height}' fill='white' />"
+        f"<text x='0' y='14' fill='#0f172a' font-size='14' font-weight='700'>{html.escape(title)}</text>"
+        + "".join(y_labels)
+        + goal_markup
+        + f"<polyline fill='none' stroke='{stroke}' stroke-width='3' points='{points}' />"
+        + point_markup
+        + "".join(x_labels)
+        + "</svg>"
+    )
+
+
+def _contact_sheet_svg_color_chart(title: str, labels: List[str], kelvin_values: List[float], tint_values: List[float]) -> str:
+    if not labels:
+        return ""
+    width = 880
+    height = 220
+    margin_left = 58
+    margin_right = 18
+    margin_top = 18
+    margin_bottom = 36
+    track_gap = 20
+    track_height = (height - margin_top - margin_bottom - track_gap) / 2.0
+    plot_width = width - margin_left - margin_right
+    kelvin_min, kelvin_max = _contact_sheet_metric_range(kelvin_values, fallback_span=100.0)
+    tint_min, tint_max = _contact_sheet_metric_range(tint_values, fallback_span=1.0)
+
+    def x_for(index: int) -> float:
+        if len(labels) == 1:
+            return margin_left + plot_width / 2
+        return margin_left + (index / max(len(labels) - 1, 1)) * plot_width
+
+    def track_y_for(value: float, low: float, high: float, top: float) -> float:
+        if math.isclose(low, high, abs_tol=1e-9):
+            return top + track_height / 2
+        return top + (1.0 - ((value - low) / (high - low))) * track_height
+
+    def series_markup(values: List[float], low: float, high: float, top: float, stroke: str, unit_label: str) -> str:
+        if not values:
+            return ""
+        points = " ".join(
+            f"{x_for(index):.1f},{track_y_for(value, low, high, top):.1f}"
+            for index, value in enumerate(values)
+        )
+        ticks = [low, (low + high) / 2.0, high]
+        markup = "".join(
+            f"<line x1='{margin_left:.1f}' y1='{track_y_for(tick, low, high, top):.1f}' x2='{width - margin_right:.1f}' y2='{track_y_for(tick, low, high, top):.1f}' stroke='#e2e8f0' stroke-width='1' />"
+            f"<text x='{margin_left - 8:.1f}' y='{track_y_for(tick, low, high, top) + 4:.1f}' text-anchor='end' fill='#64748b' font-size='11'>{tick:.1f}{html.escape(unit_label)}</text>"
+            for tick in ticks
+        )
+        markup += f"<polyline fill='none' stroke='{stroke}' stroke-width='3' points='{points}' />"
+        markup += "".join(
+            f"<circle cx='{x_for(index):.1f}' cy='{track_y_for(value, low, high, top):.1f}' r='4.5' fill='{stroke}' />"
+            for index, value in enumerate(values)
+        )
+        return markup
+
+    x_labels = "".join(
+        f"<text x='{x_for(index):.1f}' y='{height - 10:.1f}' text-anchor='middle' fill='#64748b' font-size='11'>{html.escape(label)}</text>"
+        for index, label in enumerate(labels)
+    )
+    return (
+        f"<svg viewBox='0 0 {width} {height}' role='img' aria-label='{html.escape(title)}'>"
+        f"<rect x='0' y='0' width='{width}' height='{height}' fill='white' />"
+        f"<text x='0' y='14' fill='#0f172a' font-size='14' font-weight='700'>{html.escape(title)}</text>"
+        f"<text x='{margin_left:.1f}' y='{margin_top - 4:.1f}' fill='#64748b' font-size='11' font-weight='700'>Kelvin</text>"
+        + series_markup(kelvin_values, kelvin_min, kelvin_max, margin_top, "#0f766e", "K")
+        + f"<text x='{margin_left:.1f}' y='{margin_top + track_height + track_gap - 4:.1f}' fill='#64748b' font-size='11' font-weight='700'>Tint</text>"
+        + series_markup(tint_values, tint_min, tint_max, margin_top + track_height + track_gap, "#7c3aed", "")
+        + x_labels
+        + "</svg>"
+    )
+
+
+def _contact_sheet_view_model(payload: Dict[str, object]) -> Dict[str, object]:
+    recommended_strategy = dict(payload.get("recommended_strategy") or {})
+    recommended_key = str(recommended_strategy.get("strategy_key") or "")
+    strategies = list(payload.get("strategies") or [])
+    strategy_payload = next((item for item in strategies if str(item.get("strategy_key") or "") == recommended_key), None)
+    if strategy_payload is None and strategies:
+        strategy_payload = strategies[0]
+        recommended_key = str(strategy_payload.get("strategy_key") or "")
+        recommended_strategy = dict(strategy_payload)
+
+    ipp2_validation = dict(payload.get("ipp2_validation") or {})
+    status_counts = dict(ipp2_validation.get("status_counts") or {})
+    shared_originals = {
+        str(item.get("clip_id") or ""): dict(item)
+        for item in list(payload.get("shared_originals") or [])
+        if str(item.get("clip_id") or "").strip()
+    }
+    overlay_by_clip = {
+        str(item.get("clip_id") or ""): dict(item)
+        for item in list(((payload.get("sphere_detection_summary") or {}).get("rows") or []))
+        if str(item.get("clip_id") or "").strip()
+    }
+    validation_by_clip = {
+        str(item.get("clip_id") or ""): dict(item)
+        for item in list(ipp2_validation.get("rows") or [])
+        if str(item.get("clip_id") or "").strip() and (
+            not recommended_key or str(item.get("strategy_key") or "") == recommended_key
+        )
+    }
+
+    entries: List[Dict[str, object]] = []
+    for clip in list((strategy_payload or {}).get("clips") or []):
+        clip_id = str(clip.get("clip_id") or "")
+        if not clip_id:
+            continue
+        shared = shared_originals.get(clip_id, {})
+        clip_metadata = dict(shared.get("clip_metadata") or clip.get("clip_metadata") or {})
+        ipp2_row = dict(clip.get("ipp2_validation") or validation_by_clip.get(clip_id) or {})
+        exposure_metrics = dict(((clip.get("metrics") or {}).get("exposure") or {}))
+        commit_values = dict(((clip.get("metrics") or {}).get("commit_values") or {}))
+        overlay = overlay_by_clip.get(clip_id, {})
+        original_image = str(
+            shared.get("original_frame")
+            or clip.get("original_frame")
+            or ipp2_row.get("original_image_path")
+            or ""
+        )
+        corrected_image = str(
+            ipp2_row.get("corrected_image_path")
+            or clip.get("both_corrected")
+            or ""
+        )
+        overlay_image = str(
+            overlay.get("original_overlay_path")
+            or overlay.get("corrected_overlay_path")
+            or original_image
+        )
+        corrected_overlay_image = str(overlay.get("corrected_overlay_path") or "")
+        sample_1_ire = float(
+            ipp2_row.get("sample_1_ire", exposure_metrics.get("sample_1_ire", shared.get("sample_1_ire", 0.0))) or 0.0
+        )
+        sample_2_ire = float(
+            ipp2_row.get("sample_2_ire", exposure_metrics.get("sample_2_ire", shared.get("sample_2_ire", 0.0))) or 0.0
+        )
+        sample_3_ire = float(
+            ipp2_row.get("sample_3_ire", exposure_metrics.get("sample_3_ire", shared.get("sample_3_ire", 0.0))) or 0.0
+        )
+        display_scalar_log2 = float(
+            shared.get(
+                "display_scalar_log2",
+                exposure_metrics.get(
+                    "display_scalar_log2",
+                    exposure_metrics.get("measured_log2_luminance_monitoring", 0.0),
+                ),
+            )
+            or 0.0
+        )
+        display_scalar_ire = _contact_sheet_display_scalar_ire(
+            display_scalar_log2,
+            shared.get("display_scalar_ire", exposure_metrics.get("display_scalar_ire")),
+        )
+        adjusted_display_scalar_log2 = float(ipp2_row.get("ipp2_value_log2", display_scalar_log2) or display_scalar_log2)
+        adjusted_display_scalar_ire = _contact_sheet_display_scalar_ire(
+            adjusted_display_scalar_log2,
+            ipp2_row.get("ipp2_value_ire"),
+        )
+        status = str(ipp2_row.get("status") or "REVIEW")
+        tone = _contact_sheet_status_tone(status)
+        residual_stops = float(ipp2_row.get("ipp2_residual_stops", 0.0) or 0.0)
+        residual_abs_stops = float(ipp2_row.get("ipp2_residual_abs_stops", abs(residual_stops)) or abs(residual_stops))
+        exposure_adjust_stops = float(
+            commit_values.get("exposureAdjust", ipp2_row.get("correction_stops", exposure_metrics.get("final_offset_stops", 0.0)))
+            or 0.0
+        )
+        operator_guidance = dict(ipp2_row.get("operator_guidance") or {})
+        result_statement = {
+            "PASS": "Validation landed within the IPP2 tolerance band.",
+            "REVIEW": "Correction is close, but should be reviewed before commit.",
+            "FAIL": "Correction remains outside the accepted IPP2 tolerance.",
+        }.get(status, "Review the corrected result before commit.")
+        operator_result_label = {
+            "PASS": "In range",
+            "REVIEW": "Needs adjustment",
+            "FAIL": "Outside tolerance",
+        }.get(status, "Needs adjustment")
+        iso_value = clip_metadata.get("iso")
+        shutter_seconds = clip_metadata.get("shutter_seconds")
+        original_kelvin = clip_metadata.get("kelvin")
+        original_tint = clip_metadata.get("tint")
+        original_metadata_line = _contact_sheet_join_bits(
+            [
+                _contact_sheet_format_iso(iso_value),
+                _contact_sheet_format_shutter(shutter_seconds),
+                _contact_sheet_format_kelvin(original_kelvin),
+                _contact_sheet_format_tint(original_tint),
+            ]
+        )
+        adjusted_metadata_line = _contact_sheet_join_bits(
+            [
+                f"Exp {exposure_adjust_stops:+.2f}",
+                _contact_sheet_format_kelvin(commit_values.get("kelvin")),
+                _contact_sheet_format_tint(commit_values.get("tint")),
+            ]
+        )
+        entries.append(
+            {
+                "clip_id": clip_id,
+                "camera_label": str(ipp2_row.get("camera_label") or _camera_label_for_reporting(clip_id)),
+                "grid_label": str(ipp2_row.get("camera_label") or _camera_label_for_reporting(clip_id)),
+                "is_hero_camera": bool(clip.get("is_hero_camera") or clip_id == str(payload.get("hero_clip_id") or "")),
+                "status": status,
+                "tone": tone,
+                "result_label": "PASS" if status == "PASS" else "REVIEW" if status == "REVIEW" else "FAIL",
+                "operator_result_label": operator_result_label,
+                "result_statement": result_statement,
+                "recommended_action": str(ipp2_row.get("suggested_action") or operator_guidance.get("suggested_action") or "No adjustment needed"),
+                "action_note": str(ipp2_row.get("operator_notes") or operator_guidance.get("notes") or "Stored IPP2 validation result."),
+                "original_image": original_image,
+                "corrected_image": corrected_image,
+                "overlay_image": overlay_image,
+                "corrected_overlay_image": corrected_overlay_image,
+                "original_profile": str(ipp2_row.get("ipp2_original_gray_exposure_summary") or shared.get("gray_exposure_summary") or "n/a"),
+                "corrected_profile": str(ipp2_row.get("ipp2_gray_exposure_summary") or exposure_metrics.get("gray_exposure_summary") or "n/a"),
+                "sample_1_ire": sample_1_ire,
+                "sample_2_ire": sample_2_ire,
+                "sample_3_ire": sample_3_ire,
+                "display_scalar_log2": display_scalar_log2,
+                "display_scalar_ire": display_scalar_ire,
+                "adjusted_display_scalar_log2": adjusted_display_scalar_log2,
+                "adjusted_display_scalar_ire": adjusted_display_scalar_ire,
+                "exposure_adjust_stops": exposure_adjust_stops,
+                "kelvin": float(commit_values.get("kelvin", 0.0) or 0.0),
+                "tint": float(commit_values.get("tint", 0.0) or 0.0),
+                "original_kelvin": float(original_kelvin or 0.0) if original_kelvin is not None else 0.0,
+                "original_tint": float(original_tint or 0.0) if original_tint is not None else 0.0,
+                "iso": float(iso_value or 0.0) if iso_value is not None else 0.0,
+                "shutter_seconds": float(shutter_seconds or 0.0) if shutter_seconds is not None else 0.0,
+                "original_metadata_line": original_metadata_line,
+                "adjusted_metadata_line": adjusted_metadata_line,
+                "residual_stops": residual_stops,
+                "residual_abs_stops": residual_abs_stops,
+                "offset_to_anchor": float(ipp2_row.get("camera_offset_from_anchor", ipp2_row.get("derived_exposure_offset_stops", 0.0)) or 0.0),
+                "reference_use": str(ipp2_row.get("reference_use") or clip.get("reference_use") or "Included"),
+                "trust_score": float(clip.get("trust_score", ipp2_row.get("trust_score", 0.0)) or 0.0),
+                "trust_class": str(clip.get("trust_class") or ipp2_row.get("trust_class") or "TRUSTED"),
+                "sphere_detection_note": str(ipp2_row.get("sphere_detection_note") or "Sphere detection: verified"),
+                "profile_note": str(ipp2_row.get("profile_note") or "Profile consistent with stored solve."),
+                "measurement_domain": str(payload.get("measurement_preview_transform") or REVIEW_PREVIEW_TRANSFORM),
+            }
+        )
+
+    before_values = [float(item.get("display_scalar_log2", 0.0) or 0.0) for item in entries]
+    after_values = [
+        float(
+            item.get("adjusted_display_scalar_log2", item.get("display_scalar_log2", 0.0))
+            or 0.0
+        )
+        for item in entries
+    ]
+    center_values = [float(item.get("sample_2_ire", 0.0) or 0.0) for item in entries if float(item.get("sample_2_ire", 0.0) or 0.0) > 0.0]
+    reference_candidate = _contact_sheet_reference_candidate(entries)
+    contact_pages = []
+    for page_index, page_entries in enumerate(_contact_sheet_chunks(entries), start=1):
+        labels = [str(item.get("camera_label") or item.get("clip_id") or "") for item in page_entries]
+        original_exposure_values = [float(item.get("display_scalar_ire", 0.0) or 0.0) for item in page_entries]
+        adjusted_exposure_values = [float(item.get("adjusted_display_scalar_ire", item.get("display_scalar_ire", 0.0)) or 0.0) for item in page_entries]
+        original_kelvin_values = [float(item.get("original_kelvin", 0.0) or 0.0) for item in page_entries]
+        original_tint_values = [float(item.get("original_tint", 0.0) or 0.0) for item in page_entries]
+        adjusted_kelvin_values = [float(item.get("kelvin", 0.0) or 0.0) for item in page_entries]
+        adjusted_tint_values = [float(item.get("tint", 0.0) or 0.0) for item in page_entries]
+        contact_pages.append(
+            {
+                "page_index": page_index,
+                "entries": page_entries,
+                "original_exposure_chart_svg": _contact_sheet_svg_single_series(
+                    "Original exposure scalar (IRE)",
+                    labels,
+                    original_exposure_values,
+                    stroke="#0f172a",
+                    units="",
+                ),
+                "adjusted_exposure_chart_svg": _contact_sheet_svg_single_series(
+                    "Adjusted exposure scalar (IRE)",
+                    labels,
+                    adjusted_exposure_values,
+                    stroke="#15803d",
+                    units="",
+                    goal=None,
+                ),
+                "original_color_chart_svg": _contact_sheet_svg_color_chart(
+                    "Original white balance trace",
+                    labels,
+                    original_kelvin_values,
+                    original_tint_values,
+                ),
+                "adjusted_color_chart_svg": _contact_sheet_svg_color_chart(
+                    "Adjusted white balance trace",
+                    labels,
+                    adjusted_kelvin_values,
+                    adjusted_tint_values,
+                ),
+            }
+        )
+    return {
+        "title": "R3DMatch Calibration Assessment",
+        "batch_label": ", ".join(str(item) for item in list(payload.get("selected_clip_groups") or []) if str(item).strip()) or str(payload.get("run_label") or "Calibration run"),
+        "camera_count": len(entries),
+        "strategy_label": str((strategy_payload or {}).get("strategy_label") or recommended_strategy.get("strategy_label") or "Median"),
+        "anchor_summary": str(
+            payload.get("exposure_anchor_summary")
+            or recommended_strategy.get("anchor_summary")
+            or "Exposure Anchor: Derived from retained cluster"
+        ),
+        "domain_label": str(payload.get("measurement_preview_transform") or REVIEW_PREVIEW_TRANSFORM),
+        "all_within_tolerance": bool(ipp2_validation.get("all_within_tolerance")),
+        "status_counts": {
+            "PASS": int(status_counts.get("PASS", 0) or 0),
+            "REVIEW": int(status_counts.get("REVIEW", 0) or 0),
+            "FAIL": int(status_counts.get("FAIL", 0) or 0),
+        },
+        "before_spread_stops": (max(before_values) - min(before_values)) if before_values else 0.0,
+        "after_spread_stops": (max(after_values) - min(after_values)) if after_values else 0.0,
+        "center_ire_min": min(center_values) if center_values else 0.0,
+        "center_ire_max": max(center_values) if center_values else 0.0,
+        "best_residual": float(ipp2_validation.get("best_residual", 0.0) or 0.0),
+        "median_residual": float(ipp2_validation.get("median_residual", 0.0) or 0.0),
+        "worst_residual": float(ipp2_validation.get("max_residual", 0.0) or 0.0),
+        "goal_threshold_stops": 0.02,
+        "goal_achieved": _contact_sheet_goal_achieved(entries, 0.02),
+        "reference_candidate": reference_candidate,
+        "visuals": dict(payload.get("visuals") or {}),
+        "contact_pages": contact_pages,
+        "entries": entries,
+    }
+
+
 def render_contact_sheet_pdf(
     payload: Dict[str, object],
     *,
@@ -7190,6 +8340,8 @@ def render_contact_sheet_pdf(
     raise_if_cancelled("Run cancelled before PDF rendering.")
     from PIL import Image, ImageDraw, ImageFont
 
+    view_model = _contact_sheet_view_model(payload)
+
     def load_font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
         preferred = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
         try:
@@ -7197,248 +8349,262 @@ def render_contact_sheet_pdf(
         except OSError:
             return ImageFont.load_default()
 
-    residual_validation = dict(payload.get("corrected_residual_validation") or {})
-    ipp2_validation = dict(payload.get("ipp2_validation") or {})
-    title_font = load_font(44, bold=True)
-    section_font = load_font(28, bold=True)
-    clip_font = load_font(22, bold=True)
-    body_font = load_font(17, bold=False)
-    caption_font = load_font(15, bold=False)
-    pages = []
-    page_width = 1700
-    page_height = 2200
-    margin_x = 60
-    margin_y = 60
-    logo_max_width = 150
-    logo_max_height = 84
-    tile_gap_x = 20
-    tile_gap_y = 48
-    metadata_line_height = 30
-    section_gap = 44
+    def wrapped(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, width: int) -> List[str]:
+        words = str(text or "").split()
+        if not words:
+            return [""]
+        lines: List[str] = []
+        current = words[0]
+        for word in words[1:]:
+            trial = f"{current} {word}"
+            if draw.textlength(trial, font=font) <= width:
+                current = trial
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+        return lines
 
+    def fit_image(path: str, width: int, height: int) -> Image.Image:
+        canvas = Image.new("RGB", (width, height), "#f4f7fb")
+        if path and Path(path).exists():
+            preview = Image.open(path).convert("RGB")
+            preview.thumbnail((width, height))
+            canvas.paste(preview, ((width - preview.width) // 2, (height - preview.height) // 2))
+        return canvas
+
+    page_width = 1700
+    page_height = 2520
+    margin = 56
+    title_font = load_font(42, bold=True)
+    subtitle_font = load_font(20, bold=False)
+    h2_font = load_font(24, bold=True)
+    h3_font = load_font(20, bold=True)
+    body_font = load_font(16)
+    small_font = load_font(13)
+    small_bold = load_font(13, bold=True)
+    metric_font = load_font(24, bold=True)
     logo_image = None
     if LOGO_PATH.exists():
         try:
-            loaded_logo = Image.open(LOGO_PATH).convert("RGBA")
-            loaded_logo.thumbnail((logo_max_width, logo_max_height))
-            logo_image = loaded_logo
+            logo_image = Image.open(LOGO_PATH).convert("RGBA")
+            logo_image.thumbnail((170, 80))
         except OSError:
             logo_image = None
 
-    def new_page() -> tuple[Image.Image, ImageDraw.ImageDraw, int]:
+    def draw_header(page: Image.Image, *, first_page: bool, page_label: str) -> int:
+        draw = ImageDraw.Draw(page)
+        header_x = margin
+        if first_page and logo_image is not None:
+            page.paste(logo_image, (margin, margin), logo_image)
+            header_x += logo_image.width + 18
+        draw.text((header_x, margin), title, fill="#0f172a", font=title_font)
+        draw.text((header_x, margin + 48), page_label, fill="#475569", font=subtitle_font)
+        if timestamp_label:
+            draw.text((page_width - margin - 300, margin + 6), timestamp_label, fill="#64748b", font=small_font)
+        draw.line((margin, margin + 104, page_width - margin, margin + 104), fill="#0f172a", width=3)
+        return margin + 116
+
+    def draw_meta_line(draw: ImageDraw.ImageDraw, y: int, items: List[str]) -> int:
+        x = margin
+        line_y = y
+        for item in items:
+            text = str(item)
+            width = int(draw.textlength(text, font=small_font))
+            if x + width > page_width - margin:
+                x = margin
+                line_y += 22
+            draw.text((x, line_y), text, fill="#475569", font=small_font)
+            x += width + 20
+        return line_y + 20
+
+    def draw_chart(draw: ImageDraw.ImageDraw, rect: Tuple[int, int, int, int], labels: List[str], values: List[float], *, stroke: str) -> None:
+        x0, y0, x1, y1 = rect
+        draw.rectangle(rect, outline="#d7dee8", width=1)
+        chart_left = x0 + 48
+        chart_right = x1 - 14
+        chart_top = y0 + 18
+        chart_bottom = y1 - 26
+        y_min, y_max = _contact_sheet_metric_range(values, fallback_span=0.5)
+        if not values:
+            return
+        draw.line((chart_left, chart_bottom, chart_right, chart_bottom), fill="#94a3b8", width=1)
+        draw.line((chart_left, chart_top, chart_left, chart_bottom), fill="#94a3b8", width=1)
+        ticks = [y_min, (y_min + y_max) / 2.0, y_max]
+        for tick in ticks:
+            y = chart_bottom if math.isclose(y_min, y_max, abs_tol=1e-9) else chart_top + (1.0 - ((tick - y_min) / (y_max - y_min))) * (chart_bottom - chart_top)
+            draw.line((chart_left, int(y), chart_right, int(y)), fill="#e7edf4", width=1)
+            draw.text((x0 + 4, int(y) - 7), f"{tick:.2f}", fill="#64748b", font=small_font)
+        points = []
+        for index, value in enumerate(values):
+            x = chart_left + ((chart_right - chart_left) / max(len(values) - 1, 1)) * index if len(values) > 1 else (chart_left + chart_right) / 2
+            y = chart_bottom if math.isclose(y_min, y_max, abs_tol=1e-9) else chart_top + (1.0 - ((value - y_min) / (y_max - y_min))) * (chart_bottom - chart_top)
+            points.append((int(x), int(y)))
+            draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=stroke)
+            draw.text((x - 18, chart_bottom + 6), labels[index], fill="#64748b", font=small_font)
+        if len(points) > 1:
+            draw.line(points, fill=stroke, width=3)
+
+    def draw_color_chart(draw: ImageDraw.ImageDraw, rect: Tuple[int, int, int, int], labels: List[str], kelvin_values: List[float], tint_values: List[float]) -> None:
+        x0, y0, x1, y1 = rect
+        draw.rectangle(rect, outline="#d7dee8", width=1)
+        mid = y0 + (y1 - y0) // 2
+        draw.text((x0 + 12, y0 + 8), "Kelvin", fill="#475569", font=small_bold)
+        draw_chart(draw, (x0, y0 + 18, x1, mid - 4), labels, kelvin_values, stroke="#0f766e")
+        draw.text((x0 + 12, mid + 8), "Tint", fill="#475569", font=small_bold)
+        draw_chart(draw, (x0, mid + 18, x1, y1), labels, tint_values, stroke="#7c3aed")
+
+    def draw_contact_cell(page: Image.Image, draw: ImageDraw.ImageDraw, entry: Dict[str, object], *, x: int, y: int, width: int, adjusted: bool, image_height: int) -> None:
+        image_path = str(entry["corrected_image"] if adjusted else entry["original_image"])
+        preview = fit_image(image_path, width, image_height)
+        page.paste(preview, (x, y))
+        line_y = y + image_height + 8
+        draw.text((x, line_y), f"{entry['camera_label']} / {entry['clip_id']}", fill="#0f172a", font=small_bold)
+        line_y += 20
+        meta_line = str(entry["adjusted_metadata_line"] if adjusted else entry["original_metadata_line"])
+        if meta_line:
+            draw.text((x, line_y), meta_line, fill="#475569", font=small_font)
+            line_y += 18
+        if not adjusted:
+            draw.text((x, line_y), "Gray Sphere Totals", fill="#64748b", font=small_bold)
+            line_y += 16
+            totals_line = (
+                f"S1 {float(entry['sample_1_ire']):.1f}   "
+                f"S2 {float(entry['sample_2_ire']):.1f}   "
+                f"S3 {float(entry['sample_3_ire']):.1f}   "
+                f"Scalar {float(entry['display_scalar_ire']):.1f}"
+            )
+            draw.text((x, line_y), totals_line, fill="#0f172a", font=small_font)
+
+    pages: List[Image.Image] = []
+    snapshot_items = [
+        f"Batch {view_model['batch_label']}",
+        f"Cameras {int(view_model['camera_count'])}",
+        f"Strategy {view_model['strategy_label']}",
+        f"Domain {view_model['domain_label']}",
+        f"Exposure Anchor {view_model['anchor_summary']}",
+        f"Hero clip {payload.get('hero_clip_id') or 'None selected'}",
+        f"PASS / REVIEW / FAIL {view_model['status_counts']['PASS']} / {view_model['status_counts']['REVIEW']} / {view_model['status_counts']['FAIL']}",
+        f"Spread {float(view_model['before_spread_stops']):.2f} → {float(view_model['after_spread_stops']):.2f} stops",
+        f"Residual median {float(view_model['median_residual']):.3f} | worst {float(view_model['worst_residual']):.3f}",
+        f"±0.02 goal {'met' if view_model['goal_achieved'] else 'open'}",
+    ]
+
+    contact_pages = list(view_model.get("contact_pages") or [])
+    for contact_page in contact_pages:
+        raise_if_cancelled("Run cancelled during contact sheet PDF rendering.")
         page = Image.new("RGB", (page_width, page_height), "white")
         draw = ImageDraw.Draw(page)
-        y = margin_y
-        text_x = margin_x
-        if logo_image is not None:
-            page.paste(logo_image, (margin_x, y), logo_image)
-            text_x += logo_image.width + 28
-        draw.text((text_x, y), title, fill="black", font=title_font)
-        draw.text((text_x, y + 42), "Internal Review", fill="black", font=section_font)
-        recommended_strategy = dict(payload.get("recommended_strategy") or {})
-        anchor_summary = str(
-            payload.get("exposure_anchor_summary")
-            or recommended_strategy.get("anchor_summary")
-            or "Exposure Anchor: Automatic recommendation"
-        )
-        recommended_rows = [
-            item
-            for item in list((ipp2_validation.get("rows") or []))
-            if str(item.get("strategy_key") or "") == str(recommended_strategy.get("strategy_key") or "")
-        ]
-        outlier_count = sum(
-            1
-            for item in recommended_rows
-            if abs(float(item.get("correction_stops", item.get("applied_correction_stops", 0.0)) or 0.0)) >= WARNING_CORRECTION_STOPS
-        )
-        summary_lines = [
-            f"Run label: {payload.get('run_label')}",
-            f"Subset / target: {payload.get('target_type')} | {payload.get('processing_mode')}",
-            anchor_summary,
-            f"Strategy used: {recommended_strategy.get('strategy_label')}",
-            f"Target basis: {recommended_strategy.get('reason')}",
-            f"Pass / Review / Fail: {int((ipp2_validation.get('status_counts') or {}).get('PASS', 0) or 0)} / {int((ipp2_validation.get('status_counts') or {}).get('REVIEW', 0) or 0)} / {int((ipp2_validation.get('status_counts') or {}).get('FAIL', 0) or 0)}",
-            f"Outlier cameras: {outlier_count} | Commit readiness: {'Acceptable for commit' if bool(ipp2_validation.get('all_within_tolerance')) else 'Review before commit'}",
-            f"Look first at the suggested lens action, then confirm residual and landing state.",
-        ]
-        summary_y = y + 74
-        for line in summary_lines:
-            draw.text((text_x, summary_y), line, fill="black", font=body_font)
-            summary_y += 24
-        if timestamp_label:
-            draw.text((page_width - margin_x - 420, y + 8), timestamp_label, fill="black", font=body_font)
-        header_bottom = max(summary_y, y + (logo_image.height if logo_image is not None else 96))
-        draw.line((margin_x, header_bottom + 16, page_width - margin_x, header_bottom + 16), fill="#d7d7d7", width=2)
-        return page, draw, header_bottom + 34
-
-    def ensure_room(current_y: int, needed_height: int) -> tuple[Image.Image, ImageDraw.ImageDraw, int]:
-        nonlocal page, draw
-        if current_y + needed_height <= page_height - margin_y:
-            return page, draw, current_y
+        page_index = int(contact_page.get("page_index", 1) or 1)
+        y = draw_header(page, first_page=page_index == 1, page_label=f"Calibration Contact Sheet · Page {page_index}")
+        y = draw_meta_line(draw, y, snapshot_items)
+        y += 10
+        entries = list(contact_page.get("entries") or [])
+        draw.text((margin, y), "Original Camera Grid", fill="#0f172a", font=h2_font)
+        y += 26
+        gutter = 16
+        cell_width = int((page_width - (2 * margin) - (2 * gutter)) / 3)
+        rows = max(1, math.ceil(len(entries) / 3))
+        original_image_height = 138 if rows >= 4 else 156
+        original_cell_height = original_image_height + 78
+        for index, entry in enumerate(entries):
+            row = index // 3
+            col = index % 3
+            x = margin + col * (cell_width + gutter)
+            cell_y = y + row * original_cell_height
+            draw_contact_cell(page, draw, entry, x=x, y=cell_y, width=cell_width, adjusted=False, image_height=original_image_height)
+        y += rows * original_cell_height + 18
+        draw.line((margin, y, page_width - margin, y), fill="#d7dee8", width=1)
+        y += 10
+        draw.text((margin, y), "Original Array Synopsis", fill="#0f172a", font=h2_font)
+        y += 28
+        chart_height = 208
+        chart_width = int((page_width - (2 * margin) - gutter) / 2)
+        labels = [str(item.get("camera_label") or item.get("clip_id") or "") for item in entries]
+        draw_chart(draw, (margin, y, margin + chart_width, y + chart_height), labels, [float(item.get("display_scalar_ire", 0.0) or 0.0) for item in entries], stroke="#0f172a")
+        draw_color_chart(draw, (margin + chart_width + gutter, y, page_width - margin, y + chart_height), labels, [float(item.get("original_kelvin", 0.0) or 0.0) for item in entries], [float(item.get("original_tint", 0.0) or 0.0) for item in entries])
+        y += chart_height + 18
+        draw.text((margin, y), "Adjusted Camera Grid", fill="#0f172a", font=h2_font)
+        y += 26
+        adjusted_image_height = 138 if rows >= 4 else 156
+        adjusted_cell_height = adjusted_image_height + 52
+        for index, entry in enumerate(entries):
+            row = index // 3
+            col = index % 3
+            x = margin + col * (cell_width + gutter)
+            cell_y = y + row * adjusted_cell_height
+            draw_contact_cell(page, draw, entry, x=x, y=cell_y, width=cell_width, adjusted=True, image_height=adjusted_image_height)
+        y += rows * adjusted_cell_height + 18
+        draw.line((margin, y, page_width - margin, y), fill="#d7dee8", width=1)
+        y += 10
+        draw.text((margin, y), "Adjusted Array Synopsis", fill="#0f172a", font=h2_font)
+        y += 28
+        draw_chart(draw, (margin, y, margin + chart_width, y + chart_height), labels, [float(item.get("adjusted_display_scalar_ire", item.get("display_scalar_ire", 0.0)) or 0.0) for item in entries], stroke="#15803d")
+        draw_color_chart(draw, (margin + chart_width + gutter, y, page_width - margin, y + chart_height), labels, [float(item.get("kelvin", 0.0) or 0.0) for item in entries], [float(item.get("tint", 0.0) or 0.0) for item in entries])
         pages.append(page)
-        page, draw, new_y = new_page()
-        return page, draw, new_y
 
-    def fit_image(path: str, tile_width: int, tile_height: int) -> Image.Image:
-        preview = Image.open(path).convert("RGB")
-        preview.thumbnail((tile_width, tile_height))
-        canvas = Image.new("RGB", (tile_width, tile_height), "#f0ece3")
-        paste_x = (tile_width - preview.width) // 2
-        paste_y = (tile_height - preview.height) // 2
-        canvas.paste(preview, (paste_x, paste_y))
-        return canvas
-
-    def draw_tiles(
-        *,
-        section_title: str,
-        tiles: List[Dict[str, object]],
-        section_meta: Optional[List[str]] = None,
-    ) -> int:
-        nonlocal page, draw, y
-        columns = 2 if len(tiles) <= 12 else 3
-        tile_width = int((page_width - (2 * margin_x) - (tile_gap_x * (columns - 1))) / max(columns, 1))
-        tile_width = max(180, tile_width)
-        image_height = max(180, int(tile_width * 0.68))
-        metadata_block_height = 278
-        tile_block_height = image_height + metadata_block_height
-        tiles_per_page = _report_tiles_per_page(columns)
-        paged_tiles = _chunk_tiles(tiles, tiles_per_page)
-
-        for page_index, page_tiles in enumerate(paged_tiles):
-            raise_if_cancelled("Run cancelled during PDF pagination.")
-            _, _, y = ensure_room(y, 140)
-            heading = section_title if len(paged_tiles) == 1 else f"{section_title} ({page_index + 1}/{len(paged_tiles)})"
-            draw.text((margin_x, y), heading, fill="black", font=section_font)
-            y += 34
-            local_meta = list(section_meta or [])
-            if len(paged_tiles) > 1:
-                local_meta.append(f"Page {page_index + 1} of {len(paged_tiles)}")
-            for meta_line in local_meta:
-                draw.text((margin_x, y), meta_line, fill="black", font=body_font)
-                y += 20
-            if local_meta:
-                y += 8
-
-            rows = (len(page_tiles) + columns - 1) // columns
-            needed_height = max(1, rows) * (tile_block_height + tile_gap_y)
-            _, _, y = ensure_room(y, needed_height + 20)
-
-            for index, tile in enumerate(page_tiles):
-                raise_if_cancelled("Run cancelled during PDF tile rendering.")
-                row = index // columns
-                col = index % columns
-                tile_x = margin_x + col * (tile_width + tile_gap_x)
-                tile_y = y + row * (tile_block_height + tile_gap_y)
-                image_y = tile_y
-                action_fill = {
-                    "good": "#166534",
-                    "warning": "#92400e",
-                    "danger": "#991b1b",
-                    "outlier-good": "#065f46",
-                    "outlier-warning": "#9a3412",
-                    "outlier-danger": "#991b1b",
-                }.get(str(tile.get("guidance_tone") or ""), "#1e293b")
-                image_path = tile.get("image_path")
-                if image_path and Path(str(image_path)).exists():
-                    page.paste(fit_image(str(image_path), tile_width, image_height), (tile_x, image_y))
-                else:
-                    draw.rounded_rectangle((tile_x, image_y, tile_x + tile_width, image_y + image_height), radius=14, fill="#f0ece3", outline="#d7d7d7")
-                    draw.text((tile_x + 12, image_y + 12), "No preview", fill="#666666", font=body_font)
-                meta_y = image_y + image_height + 14
-                draw.text((tile_x, meta_y), str(tile.get("clip_id", "")), fill="black", font=clip_font)
-                draw.text((tile_x, meta_y + metadata_line_height), str(tile.get("gray_exposure_text", "Gray Exposure: n/a")), fill="#1e293b", font=body_font)
-                draw.text((tile_x, meta_y + metadata_line_height * 2), str(tile.get("offset_text", "Offset: n/a")), fill="#1e293b", font=body_font)
-                draw.text((tile_x, meta_y + metadata_line_height * 3), str(tile.get("result_text", "Result: n/a")), fill=action_fill, font=body_font)
-                draw.text((tile_x, meta_y + metadata_line_height * 4), str(tile.get("guidance_action", "No aperture adjustment required")), fill=action_fill, font=body_font)
-                draw.text((tile_x, meta_y + metadata_line_height * 5), str(tile.get("validation_text", "Residual: n/a")), fill="#334155", font=caption_font)
-                draw.text((tile_x, meta_y + metadata_line_height * 6), str(tile.get("digital_text", "Digital correction applied: n/a")), fill="#334155", font=caption_font)
-                profile_note = str(tile.get("profile_text", ""))
-                if profile_note:
-                    draw.text((tile_x, meta_y + metadata_line_height * 7), profile_note, fill="#475569", font=caption_font)
-                detection_note = str(tile.get("detection_text", ""))
-                if detection_note:
-                    draw.text((tile_x, meta_y + metadata_line_height * 8), detection_note, fill="#475569", font=caption_font)
-            y += needed_height + section_gap
-            if page_index < len(paged_tiles) - 1:
-                pages.append(page)
-                page, draw, y = new_page()
-        return y
-
-    page, draw, y = new_page()
-
-    original_profile_by_clip = {
-        str(item.get("clip_id") or ""): str(item.get("ipp2_original_gray_exposure_summary") or "")
-        for item in list((ipp2_validation.get("rows") or []))
-        if str(item.get("clip_id") or "").strip()
-    }
-    if not original_profile_by_clip:
-        for strategy in payload.get("strategies", []):
-            for clip in strategy.get("clips", []):
-                clip_id = str(clip.get("clip_id") or "")
-                if not clip_id:
-                    continue
-                ipp2_row = dict(clip.get("ipp2_validation") or {})
-                value = str(ipp2_row.get("ipp2_original_gray_exposure_summary") or "")
-                if value:
-                    original_profile_by_clip[clip_id] = value
-    original_tiles = [
-        {
-            "clip_id": f"{clip['clip_id']} [HERO]" if str(clip["clip_id"]) == str(payload.get("hero_clip_id") or "") else clip["clip_id"],
-            "image_path": clip.get("original_frame"),
-            "guidance_action": "No correction applied",
-            "guidance_tone": "good",
-            "presentation_state": "Original reference still",
-            "validation_text": "Residual: baseline reference",
-            "gray_exposure_text": f"Gray Exposure: {clip.get('gray_exposure_summary') or original_profile_by_clip.get(str(clip.get('clip_id') or ''), '') or 'Measured in corrected review rows below'}",
-            "offset_text": "Offset: original baseline",
-            "result_text": "Result: Original reference",
-            "digital_text": "Digital correction applied: original",
-            "profile_text": "Use this frame only to compare the corrected result below.",
-        }
-        for clip in payload.get("shared_originals", [])
-    ]
-    draw_tiles(section_title="Original", tiles=original_tiles)
-
-    strategies_by_key = {str(item["strategy_key"]): item for item in payload.get("strategies", [])}
-    for strategy_key in STRATEGY_ORDER:
-        raise_if_cancelled("Run cancelled during PDF strategy rendering.")
-        strategy = strategies_by_key.get(strategy_key)
-        if not strategy:
-            continue
-        tiles = []
-        for clip in strategy.get("clips", []):
-            residual_validation_row = dict(clip.get("corrected_residual_validation") or {})
-            ipp2_validation_row = dict(clip.get("ipp2_validation") or {})
-            residual_present = _ipp2_validation_presentation(ipp2_validation_row or residual_validation_row)
-            tiles.append(
-                {
-                    "clip_id": f"{clip['clip_id']} [HERO]" if clip.get("is_hero_camera") else clip["clip_id"],
-                    "image_path": clip.get("both_corrected"),
-                    "guidance_action": residual_present["action"],
-                    "guidance_tone": residual_present["tone"],
-                    "presentation_state": residual_present["presentation_state"],
-                    "validation_text": residual_present["residual_text"],
-                    "gray_exposure_text": residual_present["gray_exposure_text"],
-                    "offset_text": f"Offset to Anchor: {float(ipp2_validation_row.get('camera_offset_from_anchor', ipp2_validation_row.get('derived_exposure_offset_stops', 0.0)) or 0.0):+.3f} stops",
-                    "result_text": f"Result: {residual_present['result_label']}",
-                    "digital_text": residual_present["exact_correction_text"],
-                    "profile_text": f"Profile Note: {str(ipp2_validation_row.get('profile_note') or residual_present.get('profile_note') or 'Profile needs review')}",
-                    "detection_text": f"Sphere Detection: {str(ipp2_validation_row.get('sphere_detection_note') or residual_present.get('sphere_detection_note') or 'Sphere detection: review needed')}",
-                }
-            )
-        section_meta = [
-            f"Summary: {strategy.get('strategy_summary')}",
-            f"Exposure anchor: {strategy.get('anchor_summary') or strategy.get('anchor_source') or 'Derived'}",
-            f"Reference clip: {strategy.get('reference_clip_id')}",
-            f"Hero clip: {strategy.get('hero_clip_id')}",
-            f"Reference profile: {strategy.get('target_gray_exposure_summary') or 'n/a'}",
-            f"Acceptance domain: REDLine IPP2 / BT.709 / BT.1886 / Medium / Medium",
-            f"Worst residual: {max((float((item.get('ipp2_validation') or {}).get('ipp2_residual_abs_stops', 0.0) or 0.0) for item in strategy.get('clips', [])), default=0.0):.2f}",
+    for entry in view_model["entries"]:
+        raise_if_cancelled("Run cancelled during contact sheet PDF rendering.")
+        page = Image.new("RGB", (page_width, page_height), "white")
+        draw = ImageDraw.Draw(page)
+        y = draw_header(page, first_page=False, page_label=f"{entry['camera_label']} · {entry['clip_id']}")
+        tone = str(entry["tone"])
+        status_color = {"good": "#166534", "warning": "#92400e", "danger": "#991b1b"}[tone]
+        draw.text((page_width - margin - 170, margin + 8), str(entry["result_label"]), fill=status_color, font=h2_font)
+        draw.text((margin, y), "Recommended Action", fill="#64748b", font=small_bold)
+        draw.text((margin, y + 18), str(entry["recommended_action"]), fill="#0f172a", font=h2_font)
+        y += 64
+        draw.line((margin, y, page_width - margin, y), fill="#d7dee8", width=1)
+        y += 14
+        gutter = 16
+        comparison_width = 420
+        overlay_width = page_width - (2 * margin) - (2 * comparison_width) - (2 * gutter)
+        image_height = 300
+        original = fit_image(str(entry["original_image"]), comparison_width, image_height)
+        corrected = fit_image(str(entry["corrected_image"]), comparison_width, image_height)
+        overlay = fit_image(str(entry["overlay_image"]), overlay_width, image_height)
+        page.paste(original, (margin, y))
+        page.paste(corrected, (margin + comparison_width + gutter, y))
+        page.paste(overlay, (margin + (2 * (comparison_width + gutter)), y))
+        draw.text((margin, y - 20), "Original", fill="#64748b", font=small_bold)
+        draw.text((margin + comparison_width + gutter, y - 20), "Corrected", fill="#64748b", font=small_bold)
+        draw.text((margin + (2 * (comparison_width + gutter)), y - 20), "Solve Overlay", fill="#64748b", font=small_bold)
+        y += image_height + 18
+        sample_lines = [
+            f"Sample 1 {float(entry['sample_1_ire']):.1f} IRE",
+            f"Sample 2 {float(entry['sample_2_ire']):.1f} IRE",
+            f"Sample 3 {float(entry['sample_3_ire']):.1f} IRE",
         ]
-        if payload.get("color_preview_note"):
-            section_meta.append(f"Color preview note: {payload['color_preview_note']}")
-        draw_tiles(section_title=strategy["strategy_label"], tiles=tiles, section_meta=section_meta)
-    pages.append(page)
+        for index, line in enumerate(sample_lines):
+            draw.text((margin + (2 * (comparison_width + gutter)), y + (index * 18)), line, fill="#0f172a", font=body_font)
+        metric_y = y + 70
+        draw.line((margin, metric_y - 10, page_width - margin, metric_y - 10), fill="#d7dee8", width=1)
+        metrics = [
+            ("Samples", f"S1 {float(entry['sample_1_ire']):.1f} | S2 {float(entry['sample_2_ire']):.1f} | S3 {float(entry['sample_3_ire']):.1f}"),
+            ("Scalar", f"{float(entry['display_scalar_ire']):.1f} IRE"),
+            ("Correction", f"{float(entry['exposure_adjust_stops']):+.2f} exp | {int(round(float(entry['kelvin']) or 0.0))}K | {float(entry['tint']):+.1f} tint"),
+            ("Residual", f"{float(entry['residual_abs_stops']):.3f} stops"),
+        ]
+        col_width = int((page_width - (2 * margin) - (3 * gutter)) / 4)
+        metric_block_height = 0
+        for index, (label, value) in enumerate(metrics):
+            x = margin + index * (col_width + gutter)
+            draw.text((x, metric_y), label, fill="#64748b", font=small_bold)
+            wrapped_lines = wrapped(draw, value, body_font, col_width)
+            for line_index, line in enumerate(wrapped_lines):
+                draw.text((x, metric_y + 18 + (line_index * 18)), line, fill="#0f172a", font=body_font)
+            metric_block_height = max(metric_block_height, 18 + (len(wrapped_lines) * 18))
+        flags_y = metric_y + metric_block_height + 24
+        draw.line((margin, flags_y - 12, page_width - margin, flags_y - 12), fill="#d7dee8", width=1)
+        flag_texts = [
+            f"Reference use: {entry['reference_use']}",
+            str(entry["sphere_detection_note"]),
+            str(entry["profile_note"]),
+            f"Offset to anchor {float(entry['offset_to_anchor']):+.3f} stops",
+        ]
+        for index, text in enumerate(flag_texts):
+            draw.text((margin, flags_y + (index * 20)), text, fill="#334155", font=body_font)
+        pages.append(page)
 
     output = Path(output_path).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -7608,375 +8774,263 @@ def _ipp2_validation_presentation(validation: Dict[str, object]) -> Dict[str, st
 
 
 def render_contact_sheet_html(payload: Dict[str, object]) -> str:
-    recommended_strategy = payload.get("recommended_strategy") or {}
-    recommended_key = str(recommended_strategy.get("strategy_key") or "")
-    recommended_payload = next((item for item in payload.get("strategies", []) if str(item.get("strategy_key")) == recommended_key), None)
-    exposure_summary = payload.get("exposure_summary") or {}
-    hero_summary = payload.get("hero_recommendation") or {}
-    strategy_comparison = payload.get("strategy_comparison") or []
-    residual_validation = dict(payload.get("corrected_residual_validation") or {})
-    ipp2_validation = dict(payload.get("ipp2_validation") or {})
-    tolerance_model = dict((ipp2_validation.get("tolerance_model") or {}) or (residual_validation.get("tolerance_model") or {}))
-    recommended_residual_rows = [
-        item
-        for item in list((ipp2_validation.get("rows") or residual_validation.get("rows") or []))
-        if str(item.get("strategy_key") or "") == recommended_key
-    ]
-    recommended_outside_rows = [
-        item
-        for item in recommended_residual_rows
-        if str(item.get("status") or item.get("residual_status") or "") in {"FAIL", "outside_tolerance"}
-    ]
-    recommended_outlier_rows = [
-        item
-        for item in recommended_residual_rows
-        if abs(float(item.get("correction_stops", item.get("applied_correction_stops", 0.0)) or 0.0)) >= WARNING_CORRECTION_STOPS
-    ]
-    recommended_status_counts = {
-        key: sum(1 for item in recommended_residual_rows if str(item.get("status") or "") == key)
-        for key in ("PASS", "REVIEW", "FAIL")
-    }
-    anchor_summary = str(
-        payload.get("exposure_anchor_summary")
-        or recommended_strategy.get("anchor_summary")
-        or "Exposure Anchor: Automatic recommendation"
-    )
-    original_profile_by_clip = {
-        str(item.get("clip_id") or ""): str(item.get("ipp2_original_gray_exposure_summary") or "")
-        for item in recommended_residual_rows
-        if str(item.get("clip_id") or "").strip()
-    }
-    if not original_profile_by_clip:
-        for strategy in payload.get("strategies", []):
-            for clip in strategy.get("clips", []):
-                clip_id = str(clip.get("clip_id") or "")
-                if not clip_id:
-                    continue
-                ipp2_row = dict(clip.get("ipp2_validation") or {})
-                value = str(ipp2_row.get("ipp2_original_gray_exposure_summary") or "")
-                if value:
-                    original_profile_by_clip[clip_id] = value
-    run_commit_state = (
-        "Acceptable for commit"
-        if bool(ipp2_validation.get("all_within_tolerance"))
-        else "Review before commit"
-    )
-    operator_focus_note = (
-        "Check the suggested lens action first, then confirm whether each camera landed within tolerance."
-        if recommended_residual_rows
-        else "Review the corrected stills and operator guidance before commit."
-    )
+    view_model = _contact_sheet_view_model(payload)
     logo_markup = (
         f"<img class='brand-logo' src='{LOGO_PATH.as_posix()}' alt='R3DMatch logo' />"
         if LOGO_PATH.exists()
         else "<div class='brand-logo-text'>R3DMatch</div>"
     )
-    strategy_cards = []
-    for strategy in strategy_comparison:
-        recommended_badge = "<span class='recommended-badge'>Recommended</span>" if strategy.get("strategy_key") == recommended_key else ""
-        reference_label = strategy.get("anchor_summary") or strategy.get("hero_clip_id") or strategy.get("reference_clip_id") or "Derived"
-        strategy_profile_summary = str(strategy.get('target_gray_exposure_summary') or 'n/a')
-        strategy_cards.append(
-            "<article class='strategy-card'>"
-            f"<div class='strategy-card-top'><h3>{html.escape(str(strategy['strategy_label']))}</h3>{recommended_badge}</div>"
-            f"<p>{html.escape(str(strategy.get('summary') or ''))}</p>"
-            f"<div class='strategy-metrics'>Reference profile: {html.escape(strategy_profile_summary)}</div>"
-            f"<div class='strategy-metrics'>Mean correction {float(strategy['correction_metrics']['mean_abs_offset']):.2f} / Max {float(strategy['correction_metrics']['max_abs_offset']):.2f} stops</div>"
-            f"<div class='strategy-metrics subtle'>{html.escape(str(reference_label))}</div>"
-            "</article>"
+    reference_candidate = dict(view_model.get("reference_candidate") or {})
+    snapshot_bits = [
+        f"Batch {html.escape(str(view_model['batch_label']))}",
+        f"Cameras {int(view_model['camera_count'])}",
+        f"Strategy {html.escape(str(view_model['strategy_label']))}",
+        f"Domain {html.escape(str(view_model['domain_label']))}",
+        f"Color preview: {html.escape(str(payload.get('color_preview_status') or 'unknown'))}",
+        f"Exposure Anchor {html.escape(str(view_model['anchor_summary']))}",
+        f"Hero clip: {html.escape(str(payload.get('hero_clip_id') or 'None selected'))}",
+        f"PASS / REVIEW / FAIL {view_model['status_counts']['PASS']} / {view_model['status_counts']['REVIEW']} / {view_model['status_counts']['FAIL']}",
+        f"Spread {float(view_model['before_spread_stops']):.2f} → {float(view_model['after_spread_stops']):.2f} stops",
+        f"Residual median {float(view_model['median_residual']):.3f} | worst {float(view_model['worst_residual']):.3f}",
+        f"Reference {html.escape(str(reference_candidate.get('camera_label') or 'n/a'))}",
+        f"±0.02 goal {'met' if view_model['goal_achieved'] else 'open'}",
+    ]
+
+    def render_grid_cell(entry: Dict[str, object], *, adjusted: bool) -> str:
+        image_path = _contact_sheet_image_src(entry.get("corrected_image" if adjusted else "original_image"))
+        meta_line = str(entry.get("adjusted_metadata_line" if adjusted else "original_metadata_line") or "")
+        header_line = f"{html.escape(str(entry.get('camera_label') or ''))} / {html.escape(str(entry.get('clip_id') or ''))}"
+        totals_line = (
+            f"S1 {float(entry.get('sample_1_ire', 0.0) or 0.0):.1f}   "
+            f"S2 {float(entry.get('sample_2_ire', 0.0) or 0.0):.1f}   "
+            f"S3 {float(entry.get('sample_3_ire', 0.0) or 0.0):.1f}   "
+            f"Scalar {float(entry.get('display_scalar_ire', 0.0) or 0.0):.1f}"
         )
-    calibration_rows = []
-    for clip in (recommended_payload or {}).get("clips", []):
-        metrics = clip["metrics"]
-        commit_values = metrics.get("commit_values") or {}
-        residual_row = dict(clip.get("corrected_residual_validation") or {})
-        ipp2_row = dict(clip.get("ipp2_validation") or {})
-        residual_present = _ipp2_validation_presentation(ipp2_row or residual_row)
-        calibration_rows.append(
-            "<tr>"
-            f"<td><div class='camera-cell'><strong>{html.escape(_camera_label_for_reporting(str(clip['clip_id'])))}</strong><span>{html.escape(str(clip['clip_id']))}</span></div></td>"
-            f"<td><strong>{html.escape(str((ipp2_row.get('ipp2_gray_exposure_summary') or metrics['exposure'].get('gray_exposure_summary') or 'n/a')))}</strong></td>"
-            f"<td><strong>{float(ipp2_row.get('camera_offset_from_anchor', ipp2_row.get('derived_exposure_offset_stops', commit_values.get('exposureAdjust', 0.0))) or 0.0):+.3f} stops</strong></td>"
-            f"<td><div class='guidance-cell'><span class='status-chip {html.escape(residual_present['tone'])}'>{html.escape(residual_present['result_label'])}</span><div class='subtle'>{html.escape(residual_present['residual_text'])}</div></div></td>"
-            f"<td><div class='guidance-cell'><strong>{html.escape(residual_present['action'])}</strong><div class='subtle'>{html.escape(residual_present['exact_correction_text'])}</div><div class='subtle'>{html.escape(str(ipp2_row.get('profile_note') or residual_present.get('profile_note') or 'Profile needs review'))}</div><div class='subtle'>{html.escape(str(ipp2_row.get('sphere_detection_note') or residual_present.get('sphere_detection_note') or 'Sphere detection: review needed'))}</div></div></td>"
-            "</tr>"
+        footer = (
+            f"<div class='cell-totals-label'>Gray Sphere Totals</div><div class='cell-totals'>{html.escape(totals_line)}</div>"
+            if not adjusted
+            else ""
         )
-    render_truth_summary = dict(payload.get("render_truth_summary") or {})
-    total_originals = len(payload.get("shared_originals", []))
-    original_columns = min(_report_grid_columns(total_originals), 3)
-    original_cards = []
-    for clip in payload.get("shared_originals", []):
-        path = clip.get("original_frame")
-        is_hero_camera = str(clip["clip_id"]) == str(payload.get("hero_clip_id") or "")
-        hero_badge = "<div class='hero-badge'>Hero</div>" if is_hero_camera else ""
-        image_html = (
-            f"<figure><img src='../previews/{Path(path).name}' alt='{clip['clip_id']} Original' /><figcaption>Original baseline</figcaption></figure>"
-            if path else "<p class='subtle'>No original preview.</p>"
+        return (
+            "<article class='camera-cell'>"
+            + (f"<img class='cell-image' src='{image_path}' alt='{html.escape(str(entry.get('clip_id') or ''))} {'adjusted' if adjusted else 'original'}' />" if image_path else "<div class='cell-image missing-image'>Image unavailable</div>")
+            + f"<div class='cell-line cell-clip'>{header_line}</div>"
+            + (f"<div class='cell-line cell-meta'>{html.escape(meta_line)}</div>" if meta_line else "")
+            + footer
+            + "</article>"
         )
-        original_gray_exposure = str(clip.get('gray_exposure_summary') or original_profile_by_clip.get(str(clip.get('clip_id') or ''), '') or 'Measured in corrected review rows below')
-        original_cards.append(
-            f"<article class='clip-card{' hero' if is_hero_camera else ''}'>"
-            f"{hero_badge}"
-            f"{image_html}"
-            f"<div class='clip-label'>{clip['clip_id']}</div>"
-            f"<div class='state-line'>Original reference still</div>"
-            f"<div class='clip-meta'><strong>Gray Exposure:</strong> {html.escape(original_gray_exposure)}</div>"
-            f"<div class='clip-meta subtle'>Group {html.escape(str(clip['group_key']))}</div>"
-            "</article>"
-        )
-    strategy_sections = []
-    for strategy in payload.get("strategies", []):
-        columns = 2 if len(strategy.get("clips", [])) <= 12 else 3
-        strategy_rows = [
-            item
-            for item in list(ipp2_validation.get("rows") or residual_validation.get("rows") or [])
-            if str(item.get("strategy_key") or "") == str(strategy.get("strategy_key") or "")
-        ]
-        strategy_outside = [
-            item
-            for item in strategy_rows
-            if str(item.get("status") or item.get("residual_status") or "") in {"FAIL", "outside_tolerance"}
-        ]
-        strategy_best = min((float(item.get("ipp2_residual_abs_stops", item.get("residual_abs_error_stops", 0.0)) or 0.0) for item in strategy_rows), default=0.0)
-        strategy_worst = max((float(item.get("ipp2_residual_abs_stops", item.get("residual_abs_error_stops", 0.0)) or 0.0) for item in strategy_rows), default=0.0)
-        cards = []
-        for clip in strategy["clips"]:
-            metrics = clip["metrics"]
-            image_path = clip.get("both_corrected")
-            residual_row = dict(clip.get("corrected_residual_validation") or {})
-            ipp2_row = dict(clip.get("ipp2_validation") or {})
-            residual_present = _ipp2_validation_presentation(ipp2_row or residual_row)
-            hero_badge_html = "<div class='hero-badge'>Hero Camera</div>" if clip.get("is_hero_camera") else ""
-            thumbs_html = (
-                f"<figure><img src='../previews/{Path(image_path).name}' alt='{clip['clip_id']} Corrected' /><figcaption>Corrected review still</figcaption></figure>"
-                if image_path else "<p class='subtle'>No preview still available.</p>"
+
+    contact_pages_markup = []
+    for page in list(view_model.get("contact_pages") or []):
+        page_entries = list(page.get("entries") or [])
+        first_page = int(page.get("page_index", 1) or 1) == 1
+        contact_pages_markup.append(
+            "<section class='contact-page'>"
+            "<header class='sheet-header'>"
+            + (f"<div class='sheet-brand'>{logo_markup}</div>" if first_page else "<div class='sheet-brand sheet-brand-placeholder'></div>")
+            + "<div class='sheet-head-block'>"
+            + (f"<div class='sheet-kicker'>Calibration Contact Sheet</div><h1>{html.escape(str(view_model.get('title') or 'R3DMatch Calibration Assessment'))}</h1>" if first_page else f"<div class='sheet-kicker'>Contact Sheet Page {int(page.get('page_index', 1) or 1)}</div><h1>{html.escape(str(view_model.get('batch_label') or 'Calibration run'))}</h1>")
+            + f"<div class='sheet-meta'>{''.join(f'<span>{item}</span>' for item in snapshot_bits)}</div>"
+            + (
+                "<div class='sheet-guide'>What To Look For: Original / Corrected / Solve Overlay / Sample 1 / Sample 2 / Sample 3 / Validation Residual</div>"
+                "<div class='sheet-guide'>Exposure Summary: original grid, adjusted grid, exposure trace, white-balance trace.</div>"
+                if first_page
+                else ""
             )
-            cards.append(
-                f"<article class='clip-card{' hero' if clip.get('is_hero_camera') else ''}'>"
-                f"{hero_badge_html}"
-                f"<div class='thumb-single after-copy'>{thumbs_html}</div>"
-                f"<div class='clip-label'>{clip['clip_id']}</div>"
-                f"<div class='measurement-stack'>"
-                f"<div class='measurement-row'><span>Gray Exposure</span><strong>{html.escape(str((ipp2_row.get('ipp2_gray_exposure_summary') or metrics['exposure'].get('gray_exposure_summary') or 'n/a')))}</strong></div>"
-                f"<div class='measurement-row'><span>Offset to Anchor</span><strong>{float(ipp2_row.get('camera_offset_from_anchor', ipp2_row.get('derived_exposure_offset_stops', 0.0)) or 0.0):+.3f} stops</strong></div>"
-                f"<div class='measurement-row'><span>Result</span><strong>{html.escape(residual_present['result_label'])}</strong></div>"
-                f"<div class='measurement-row'><span>Recommended Action</span><strong>{html.escape(residual_present['action'])}</strong></div>"
-                f"<div class='measurement-row secondary'><span>Residual</span><strong>{html.escape(residual_present['residual_text'])}</strong></div>"
-                f"<div class='measurement-row secondary'><span>Digital correction</span><strong>{html.escape(residual_present['exact_correction_text'])}</strong></div>"
-                f"<div class='measurement-row secondary'><span>Profile Note</span><strong>{html.escape(str(ipp2_row.get('profile_note') or residual_present.get('profile_note') or 'Profile needs review'))}</strong></div>"
-                f"<div class='measurement-row secondary'><span>Sphere Detection</span><strong>{html.escape(str(ipp2_row.get('sphere_detection_note') or residual_present.get('sphere_detection_note') or 'Sphere detection: review needed'))}</strong></div>"
-                "</div>"
-                f"<div class='tile-summary'>"
-                f"<span class='status-chip {html.escape(residual_present['tone'])}'>{html.escape(residual_present['presentation_state'])}</span>"
-                "</div>"
-                "</article>"
+            + "</div>"
+            "</header>"
+            "<section class='grid-section'>"
+            "<div class='section-strip'><h2>Original Camera Grid</h2><div class='section-note'>Stored measurement stills</div></div>"
+            f"<div class='camera-grid'>{''.join(render_grid_cell(entry, adjusted=False) for entry in page_entries)}</div>"
+            "</section>"
+            "<section class='synopsis-section'>"
+            "<div class='section-strip'><h2>Original Array Synopsis</h2><div class='section-note'>Camera order left to right</div></div>"
+            "<div class='synopsis-grid'>"
+            + (
+                f"<article class='chart-panel'><div class='chart-frame'>{page.get('original_exposure_chart_svg') or ''}</div></article>"
+                if str(page.get("original_exposure_chart_svg") or "").strip() else ""
             )
-        strategy_sections.append(
-            f"<section class='report-section'>"
-            f"<div class='section-top'><div><h2>{strategy['strategy_label']}</h2><p class='section-meta'>{html.escape(str(strategy.get('strategy_summary') or ''))}</p></div>"
-            f"<div class='section-kpis'>"
-            f"<div><span>Best residual</span><strong>{strategy_best:.2f}</strong></div>"
-            f"<div><span>Worst residual</span><strong>{strategy_worst:.2f}</strong></div>"
-            f"<div><span>Outside tolerance</span><strong>{len(strategy_outside)}</strong></div>"
-            f"</div></div>"
-            f"<div class='grid cols-{columns}'>{''.join(cards)}</div></section>"
+            + (
+                f"<article class='chart-panel'><div class='chart-frame'>{page.get('original_color_chart_svg') or ''}</div></article>"
+                if str(page.get("original_color_chart_svg") or "").strip() else ""
+            )
+            + "</div>"
+            "</section>"
+            "<section class='grid-section'>"
+            "<div class='section-strip'><h2>Adjusted Camera Grid</h2><div class='section-note'>Stored corrected stills</div></div>"
+            f"<div class='camera-grid'>{''.join(render_grid_cell(entry, adjusted=True) for entry in page_entries)}</div>"
+            "</section>"
+            "<section class='synopsis-section'>"
+            "<div class='section-strip'><h2>Adjusted Array Synopsis</h2><div class='section-note'>Convergence check</div></div>"
+            "<div class='synopsis-grid'>"
+            + (
+                f"<article class='chart-panel'><div class='chart-frame'>{page.get('adjusted_exposure_chart_svg') or ''}</div></article>"
+                if str(page.get("adjusted_exposure_chart_svg") or "").strip() else ""
+            )
+            + (
+                f"<article class='chart-panel'><div class='chart-frame'>{page.get('adjusted_color_chart_svg') or ''}</div></article>"
+                if str(page.get("adjusted_color_chart_svg") or "").strip() else ""
+            )
+            + "</div>"
+            "</section>"
+            "</section>"
         )
-    color_preview_line = (
-        f"Color preview: {html.escape(str(payload.get('color_preview_status')))} | {html.escape(str(payload.get('color_preview_note')))}"
-        if payload.get("color_preview_note")
-        else f"Color preview: {html.escape(str(payload.get('color_preview_status') or 'unknown'))}"
-    )
+
+    camera_sections = []
+    for entry in list(view_model.get("entries") or []):
+        original_image = _contact_sheet_image_src(entry.get("original_image"))
+        corrected_image = _contact_sheet_image_src(entry.get("corrected_image"))
+        overlay_image = _contact_sheet_image_src(entry.get("overlay_image"))
+        corrected_overlay_image = _contact_sheet_image_src(entry.get("corrected_overlay_image"))
+        flags = []
+        if str(entry.get("reference_use") or "Included") != "Included":
+            flags.append(str(entry.get("reference_use")))
+        if "fallback" in str(entry.get("sphere_detection_note") or "").lower():
+            flags.append("Fallback used")
+        if float(entry.get("residual_abs_stops", 0.0) or 0.0) > 0.02:
+            flags.append("Residual > ±0.02 goal")
+        if str(entry.get("status") or "PASS") != "PASS":
+            flags.append(str(entry.get("operator_result_label") or entry.get("status") or "Review"))
+        sample_range = max(
+            float(entry.get("sample_1_ire", 0.0) or 0.0),
+            float(entry.get("sample_2_ire", 0.0) or 0.0),
+            float(entry.get("sample_3_ire", 0.0) or 0.0),
+        ) - min(
+            float(entry.get("sample_1_ire", 0.0) or 0.0),
+            float(entry.get("sample_2_ire", 0.0) or 0.0),
+            float(entry.get("sample_3_ire", 0.0) or 0.0),
+        )
+        if sample_range > 3.0:
+            flags.append("Uneven sample profile")
+        if not flags:
+            flags.append("No anomaly flags")
+        hero_badge_html = "<div class='hero-badge hero-tag'>Hero Camera</div>" if entry.get("is_hero_camera") else ""
+        comparison_figures = []
+        for label, src in [
+            ("Original", original_image),
+            ("Corrected", corrected_image),
+        ]:
+            comparison_figures.append(
+                "<figure class='comparison-figure'>"
+                f"<div class='figure-label'>{html.escape(label)}</div>"
+                + (f"<img src='{src}' alt='{html.escape(str(entry.get('clip_id') or 'camera'))} {html.escape(label)}' />" if src else "<div class='missing-image'>Image unavailable</div>")
+                + 
+                "</figure>"
+            )
+        overlay_markup = (
+            "<figure class='overlay-figure'>"
+            "<div class='figure-label'>Solve Overlay</div>"
+            + (f"<img src='{overlay_image}' alt='{html.escape(str(entry.get('clip_id') or 'camera'))} Solve Overlay' />" if overlay_image else "<div class='missing-image'>Image unavailable</div>")
+            + "</figure>"
+        )
+        camera_sections.append(
+            f"<section class='camera-page' data-corrected-overlay='{html.escape(corrected_overlay_image)}'>"
+            "<div class='camera-topline'>"
+            f"<div class='camera-title'><div class='camera-kicker'>{html.escape(str(entry.get('clip_id') or ''))}</div><h2>{html.escape(str(entry.get('camera_label') or 'Camera'))}</h2>{hero_badge_html}</div>"
+            f"<div class='camera-status-line'><span class='status-inline {html.escape(str(entry.get('tone') or 'warning'))}'>{html.escape(str(entry.get('status') or 'REVIEW'))}</span><div class='status-text'>{html.escape(str(entry.get('operator_result_label') or entry.get('status') or 'Review'))}</div></div>"
+            f"<div class='camera-action-line'><span>Recommended Action</span><strong>{html.escape(str(entry.get('recommended_action') or 'Review'))}</strong></div>"
+            "</div>"
+            "<div class='camera-main'>"
+            f"<div class='camera-images'>{''.join(comparison_figures)}</div>"
+            "<div class='verify-column'>"
+            f"{overlay_markup}"
+            "<div class='sample-coupling'>"
+            "<div class='sample-coupling-title'>Gray Exposure Sample Map</div>"
+            f"<div class='sample-coupling-row'><span>Sample 1</span><strong>{float(entry.get('sample_1_ire', 0.0) or 0.0):.1f} IRE</strong></div>"
+            f"<div class='sample-coupling-row'><span>Sample 2</span><strong>{float(entry.get('sample_2_ire', 0.0) or 0.0):.1f} IRE</strong></div>"
+            f"<div class='sample-coupling-row'><span>Sample 3</span><strong>{float(entry.get('sample_3_ire', 0.0) or 0.0):.1f} IRE</strong></div>"
+            "</div>"
+            "</div>"
+            "</div>"
+            "<div class='metric-block'>"
+            f"<div><span>Samples</span><strong>S1 {float(entry.get('sample_1_ire', 0.0) or 0.0):.1f} | S2 {float(entry.get('sample_2_ire', 0.0) or 0.0):.1f} | S3 {float(entry.get('sample_3_ire', 0.0) or 0.0):.1f}</strong></div>"
+            f"<div><span>Scalar</span><strong>{float(entry.get('display_scalar_ire', 0.0) or 0.0):.1f} IRE</strong></div>"
+            f"<div><span>Digital correction applied</span><strong>{float(entry.get('exposure_adjust_stops', 0.0) or 0.0):+.2f} exp | {int(round(float(entry.get('kelvin', 0.0) or 0.0)))}K | {float(entry.get('tint', 0.0) or 0.0):+.1f} tint</strong></div>"
+            f"<div><span>Validation Residual</span><strong>{float(entry.get('residual_abs_stops', 0.0) or 0.0):.3f} stops</strong></div>"
+            "</div>"
+            "<div class='flag-block'>"
+            f"<div><span>Reference</span><strong>{html.escape(str(entry.get('reference_use') or 'Included'))}</strong></div>"
+            f"<div><span>Sphere Detection</span><strong>{html.escape(str(entry.get('sphere_detection_note') or 'Verified'))}</strong></div>"
+            f"<div><span>Profile</span><strong>{html.escape(str(entry.get('profile_note') or 'Profile consistent with stored solve.'))}</strong></div>"
+            f"<div><span>Flags</span><strong>{html.escape(' | '.join(flags))}</strong></div>"
+            "</div>"
+            "</section>"
+        )
+
     return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>R3DMatch Review Contact Sheet</title>
+  <title>R3DMatch Calibration Assessment</title>
   <style>
-    body {{ margin: 0; background: #eef2f7; color: #111827; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
-    .page {{ max-width: 1680px; margin: 0 auto; padding: 38px; }}
-    .shell {{ display: grid; gap: 24px; }}
-    .hero, .panel, .report-section {{ background: rgba(255,255,255,0.98); border: 1px solid #d8dee8; border-radius: 24px; box-shadow: 0 18px 44px rgba(15,23,42,0.06); }}
-    .hero {{ padding: 40px; }}
-    .hero-top {{ display: flex; align-items: flex-start; gap: 20px; }}
-    .brand-logo {{ width: 150px; height: auto; object-fit: contain; }}
-    .brand-logo-text {{ font-size:30px; font-weight: 800; }}
-    .eyebrow {{ font-size: 12px; font-weight: 800; letter-spacing: 0.12em; text-transform: uppercase; color: #64748b; }}
-    h1 {{ margin: 6px 0 10px 0; font-size: 46px; line-height: 1.02; }}
-    .hero-subtitle {{ margin: 0; font-size: 22px; color: #334155; }}
-    .synopsis {{ margin-top: 24px; font-size: 24px; line-height: 1.65; color: #1e293b; max-width: 76ch; font-weight: 700; }}
-    .meta-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 22px; }}
-    .meta-card {{ background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 18px; padding: 16px; }}
-    .meta-card dt {{ font-size: 11px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b; }}
-    .meta-card dd {{ margin: 8px 0 0 0; font-size: 18px; font-weight: 800; }}
-    .two-up {{ display: grid; grid-template-columns: 1.25fr 1fr; gap: 20px; }}
-    .panel {{ padding: 28px; }}
-    .panel h2, .report-section h2 {{ margin: 0 0 10px 0; font-size: 36px; line-height: 1.06; }}
-    .panel p.lead, .section-meta {{ margin: 0 0 16px 0; color: #475569; font-size: 21px; line-height: 1.78; }}
-    .stats {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px; }}
-    .stat {{ border-radius: 18px; background: #f8fafc; border: 1px solid #e2e8f0; padding: 16px; }}
-    .stat .label {{ font-size: 11px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b; }}
-    .stat .value {{ margin-top: 8px; font-size: 30px; font-weight: 800; }}
-    .strategy-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; }}
-    .strategy-card {{ border-radius: 18px; background: #f8fafc; border: 1px solid #dbe3ee; padding: 16px; }}
-    .strategy-card-top {{ display: flex; justify-content: space-between; gap: 12px; align-items: center; }}
-    .strategy-card h3 {{ margin: 0; font-size:22px; }}
-    .strategy-metrics {{ font-size: 16px; margin-top: 8px; color: #1e293b; }}
-    .recommended-badge {{ display: inline-flex; align-items: center; padding: 4px 8px; border-radius: 999px; background: #dbeafe; color: #1d4ed8; font-size: 11px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; }}
-    .chart-frame {{ border-radius: 18px; background: #f8fafc; border: 1px solid #dbe3ee; padding: 18px; margin-top: 16px; overflow: auto; }}
-    .chart-frame svg {{ display: block; width: 100%; height: auto; min-height: 520px; }}
-    table {{ width: 100%; border-collapse: collapse; margin-top: 14px; }}
-    th, td {{ padding: 20px 16px; border-bottom: 1px solid #e5e7eb; text-align: left; vertical-align: top; font-size: 19px; }}
-    th {{ font-size: 12px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b; }}
-    .camera-cell {{ display: flex; flex-direction: column; gap: 4px; }}
-    .camera-cell span {{ font-size: 12px; color: #64748b; }}
-    .report-section {{ padding: 28px; }}
-    .section-top {{ display: flex; justify-content: space-between; gap: 18px; align-items: baseline; margin-bottom: 14px; flex-wrap: wrap; }}
-    .section-kpis {{ display: flex; gap: 12px; flex-wrap: wrap; }}
-    .section-kpis div {{ min-width: 150px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 14px; padding: 10px 12px; }}
-    .section-kpis span {{ display: block; font-size: 11px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b; }}
-    .section-kpis strong {{ display: block; margin-top: 6px; font-size: 24px; }}
-    .grid {{ display: grid; gap: 18px; align-items: start; }}
-    .grid.cols-2 {{ grid-template-columns: repeat(2, minmax(0,1fr)); }}
-    .grid.cols-3 {{ grid-template-columns: repeat(3, minmax(0,1fr)); }}
-    .grid.cols-4 {{ grid-template-columns: repeat(4, minmax(0,1fr)); }}
-    .grid.cols-6 {{ grid-template-columns: repeat(6, minmax(0,1fr)); }}
-    .grid.cols-8 {{ grid-template-columns: repeat(8, minmax(0,1fr)); }}
-    .clip-card {{ background: white; border-radius: 20px; padding: 28px; border: 1px solid #e2e8f0; display: grid; gap: 16px; }}
-    .clip-card.hero {{ border: 2px solid #b91c1c; }}
-    .hero-badge {{ display: inline-flex; align-items: center; padding: 5px 9px; border-radius: 999px; background: #b91c1c; color: white; font-size: 11px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 10px; }}
-    .thumb-single figure, figure {{ margin: 0; }}
-    .thumb-single img, figure img {{ width: 100%; display: block; border-radius: 14px; background: #d7dce4; aspect-ratio: 16 / 10; object-fit: cover; }}
-    .thumb-single.after-copy {{ margin-top: 20px; }}
-    figcaption {{ margin-top: 10px; font-size: 16px; color: #64748b; }}
-    .clip-label {{ font-size: 32px; font-weight: 800; margin-top: 4px; line-height: 1.14; }}
-    .state-line {{ margin-top: 10px; font-size: 14px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; color: #475569; }}
-    .clip-meta {{ font-size: 16px; line-height: 1.7; margin-top: 12px; }}
-    .tile-summary {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 2px; }}
-    .status-chip {{ display: inline-flex; align-items: center; padding: 8px 12px; border-radius: 999px; font-size: 12px; font-weight: 800; letter-spacing: 0.05em; text-transform: uppercase; }}
-    .status-chip.good {{ background: #dcfce7; color: #166534; }}
-    .status-chip.warning {{ background: #fef3c7; color: #92400e; }}
-    .status-chip.danger {{ background: #fee2e2; color: #991b1b; }}
-    .status-chip.outlier-good {{ background: #d1fae5; color: #065f46; }}
-    .status-chip.outlier-warning {{ background: #ffedd5; color: #9a3412; }}
-    .status-chip.outlier-danger {{ background: #fee2e2; color: #991b1b; }}
-    .status-chip.trust {{ background: #e2e8f0; color: #334155; }}
-    .guidance-cell {{ display: grid; gap: 6px; }}
-    .guidance-cell strong {{ font-size: 20px; line-height: 1.42; color: #0f172a; }}
-    .action-callout {{ margin-top: 14px; border-radius: 18px; padding: 16px 18px; border: 1px solid #dbe3ee; }}
-    .action-callout.good {{ background: #f0fdf4; border-color: #86efac; }}
-    .action-callout.warning {{ background: #fffbeb; border-color: #fcd34d; }}
-    .action-callout.danger {{ background: #fef2f2; border-color: #fca5a5; }}
-    .action-callout.outlier-good {{ background: #ecfdf5; border-color: #6ee7b7; }}
-    .action-callout.outlier-warning {{ background: #fff7ed; border-color: #fdba74; }}
-    .action-callout.outlier-danger {{ background: #fef2f2; border-color: #f87171; }}
-    .action-eyebrow {{ font-size: 11px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b; }}
-    .action-text {{ margin-top: 6px; font-size: 28px; line-height: 1.2; font-weight: 800; color: #0f172a; }}
-    .action-note {{ margin-top: 8px; font-size: 17px; line-height: 1.6; color: #334155; }}
-    .measurement-stack {{ display: grid; gap: 8px; margin-top: 14px; }}
-    .measurement-row {{ display: flex; justify-content: space-between; gap: 14px; align-items: baseline; padding: 12px 14px; border-radius: 14px; background: #f8fafc; border: 1px solid #e2e8f0; }}
-    .measurement-row span {{ font-size: 13px; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; color: #64748b; }}
-    .measurement-row strong {{ font-size: 20px; line-height: 1.35; text-align: right; color: #0f172a; }}
-    .measurement-row.secondary {{ background: #ffffff; }}
-    .measurement-row.secondary strong {{ font-size: 17px; color: #334155; }}
-    .render-proof {{ margin-top: 10px; padding-top: 10px; border-top: 1px solid #e2e8f0; font-size: 13px; line-height: 1.6; color: #334155; }}
-    .truth-panel {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 18px; }}
-    .truth-card {{ background: #f8fafc; border: 1px solid #dbe3ee; border-radius: 16px; padding: 14px 16px; }}
-    .truth-card strong {{ display: block; font-size: 24px; margin-top: 6px; }}
-    .operator-summary {{ display: grid; grid-template-columns: 1.3fr 1fr; gap: 16px; margin-top: 18px; }}
-    .operator-summary-card {{ background: #f8fafc; border: 1px solid #dbe3ee; border-radius: 18px; padding: 18px 20px; }}
-    .operator-summary-card h2 {{ margin: 6px 0 10px 0; font-size: 28px; line-height: 1.2; }}
-    .operator-summary-card p {{ margin: 0 0 8px 0; font-size: 17px; line-height: 1.6; color: #334155; }}
-    .subtle {{ color: #64748b; }}
-    @media (max-width: 980px) {{ .two-up {{ grid-template-columns: 1fr; }} .stats {{ grid-template-columns: repeat(2, minmax(0,1fr)); }} .operator-summary {{ grid-template-columns: 1fr; }} .grid.cols-2, .grid.cols-3 {{ grid-template-columns: 1fr; }} }}
-    @media print {{ body {{ background: white; }} .page {{ padding: 12px; }} .hero, .panel, .report-section {{ box-shadow: none; }} }}
+    :root {{ --ink:#0f172a; --muted:#475569; --soft:#64748b; --paper:#ffffff; --ground:#edf2f7; --line:#d7dee8; --softline:#e7edf4; --pass:#166534; --review:#92400e; --fail:#991b1b; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; background:var(--ground); color:var(--ink); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+    .page {{ max-width:1660px; margin:0 auto; padding:18px; }}
+    .shell {{ display:grid; gap:16px; }}
+    .contact-page, .camera-page {{ background:var(--paper); border:1px solid var(--line); }}
+    .contact-page {{ padding:16px 18px 18px; display:grid; gap:14px; page-break-after:always; }}
+    .camera-page {{ padding:16px 18px 18px; display:grid; gap:12px; page-break-before:always; }}
+    .sheet-header {{ display:grid; grid-template-columns:auto 1fr; gap:18px; align-items:start; padding-bottom:10px; border-bottom:2px solid var(--ink); }}
+    .sheet-brand {{ min-width:120px; }}
+    .sheet-brand-placeholder {{ min-width:0; }}
+    .brand-logo {{ width:132px; height:auto; object-fit:contain; display:block; }}
+    .brand-logo-text {{ font-size:34px; font-weight:800; }}
+    .sheet-kicker, .section-note, .camera-kicker, .metric-block span, .flag-block span, .camera-action-line span, .sample-coupling-title, .figure-label {{ font-size:11px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; color:var(--soft); }}
+    h1 {{ margin:0; font-size:34px; line-height:1; letter-spacing:-.03em; }}
+    h2 {{ margin:0; font-size:22px; line-height:1.1; }}
+    .sheet-meta {{ margin-top:8px; display:flex; flex-wrap:wrap; gap:10px 14px; font-size:14px; line-height:1.45; color:var(--muted); }}
+    .sheet-meta span {{ white-space:nowrap; }}
+    .sheet-guide {{ margin-top:8px; font-size:13px; line-height:1.4; color:var(--muted); }}
+    .grid-section, .synopsis-section {{ display:grid; gap:8px; }}
+    .section-strip {{ display:flex; justify-content:space-between; align-items:flex-end; gap:16px; padding-bottom:6px; border-bottom:1px solid var(--line); }}
+    .camera-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }}
+    .camera-cell {{ display:grid; gap:5px; align-content:start; }}
+    .cell-image, .comparison-figure img, .overlay-figure img, .missing-image {{ width:100%; display:block; aspect-ratio:16/10; object-fit:cover; background:#dce3ec; border:1px solid var(--line); }}
+    .missing-image {{ display:grid; place-items:center; color:var(--soft); font-size:16px; }}
+    .cell-line {{ font-size:13px; line-height:1.35; }}
+    .cell-clip {{ font-weight:700; }}
+    .cell-meta {{ color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+    .cell-totals-label {{ font-size:11px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; color:var(--soft); }}
+    .cell-totals {{ font-size:14px; font-weight:700; letter-spacing:.01em; }}
+    .synopsis-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }}
+    .chart-panel {{ border:1px solid var(--line); padding:8px; }}
+    .chart-frame svg {{ display:block; width:100%; height:auto; }}
+    .camera-topline {{ display:grid; grid-template-columns:1.2fr auto 1fr; gap:16px; align-items:end; padding-bottom:10px; border-bottom:2px solid var(--ink); }}
+    .camera-title h2 {{ margin-top:4px; font-size:30px; }}
+    .hero-tag, .hero-badge {{ margin-top:6px; font-size:11px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; color:#991b1b; }}
+    .status-inline {{ display:inline-block; padding:6px 12px; border:1px solid currentColor; font-size:13px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; }}
+    .status-inline.good {{ color:var(--pass); }}
+    .status-inline.warning {{ color:var(--review); }}
+    .status-inline.danger {{ color:var(--fail); }}
+    .camera-status-line {{ justify-self:center; text-align:center; }}
+    .status-text {{ margin-top:6px; font-size:14px; color:var(--muted); }}
+    .camera-action-line {{ justify-self:end; text-align:right; }}
+    .camera-action-line strong {{ display:block; margin-top:4px; font-size:20px; line-height:1.2; }}
+    .camera-main {{ display:grid; grid-template-columns:1.55fr .85fr; gap:14px; align-items:start; }}
+    .camera-images {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }}
+    .comparison-figure, .overlay-figure {{ margin:0; display:grid; gap:8px; }}
+    .verify-column {{ display:grid; gap:8px; }}
+    .sample-coupling {{ border-top:1px solid var(--ink); border-bottom:1px solid var(--line); }}
+    .sample-coupling-row {{ display:flex; justify-content:space-between; gap:12px; padding:8px 0; border-top:1px solid var(--softline); font-size:15px; }}
+    .sample-coupling-row:first-of-type {{ border-top:0; }}
+    .sample-coupling-row strong {{ font-size:18px; }}
+    .metric-block, .flag-block {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:0; border-top:1px solid var(--ink); border-bottom:1px solid var(--line); }}
+    .metric-block > div, .flag-block > div {{ padding:10px 10px 10px 0; border-right:1px solid var(--softline); }}
+    .metric-block > div:last-child, .flag-block > div:last-child {{ border-right:0; padding-right:0; }}
+    .metric-block strong, .flag-block strong {{ display:block; margin-top:5px; font-size:18px; line-height:1.35; }}
+    .flag-block strong {{ font-size:15px; }}
+    @media (max-width:1280px) {{ .synopsis-grid,.camera-main,.metric-block,.flag-block {{ grid-template-columns:1fr; }} .camera-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .camera-topline {{ grid-template-columns:1fr; align-items:start; }} .camera-action-line {{ justify-self:start; text-align:left; }} }}
+    @media (max-width:860px) {{ .page {{ padding:10px; }} .camera-grid,.camera-images,.synopsis-grid,.camera-main,.metric-block,.flag-block,.sheet-header {{ grid-template-columns:1fr; }} .sheet-meta span,.cell-meta {{ white-space:normal; }} h1 {{ font-size:28px; }} .camera-title h2 {{ font-size:24px; }} }}
+    @media print {{ body {{ background:white; }} .page {{ padding:6px; }} .contact-page,.camera-page {{ break-inside:avoid; }} }}
   </style>
 </head>
 <body>
   <div class="page">
     <div class="shell">
-      <section class="hero">
-        <div class="hero-top">
-          {logo_markup}
-          <div>
-            <div class="eyebrow">Multi-Camera RED Calibration Review</div>
-            <h1>R3DMatch Decision Report</h1>
-            <p class="hero-subtitle">A client-facing calibration proof showing whether corrected stills converge to the chosen scene exposure anchor and which cameras remain outside tolerance.</p>
-            <p class="section-meta">Hero clip: {html.escape(str(payload.get('hero_clip_id') or 'None selected'))} | {color_preview_line}</p>
-          </div>
-        </div>
-        <p class="synopsis">{html.escape(str(payload.get('executive_synopsis') or ''))}</p>
-        <div class="truth-panel">
-          <div class="truth-card"><div class="eyebrow">Run / Subset</div><strong>{html.escape(str(payload.get('run_label') or 'Review run'))}</strong></div>
-          <div class="truth-card"><div class="eyebrow">Exposure Anchor</div><strong>{html.escape(anchor_summary.replace('Exposure Anchor: ', ''))}</strong></div>
-          <div class="truth-card"><div class="eyebrow">Strategy Used</div><strong>{html.escape(str((recommended_strategy or {}).get('strategy_label') or 'Pending'))}</strong></div>
-          <div class="truth-card"><div class="eyebrow">Target Basis</div><strong>{html.escape(str((recommended_strategy or {}).get('reason') or 'Derived from chosen anchor'))}</strong></div>
-          <div class="truth-card"><div class="eyebrow">Commit Readiness</div><strong>{html.escape(run_commit_state)}</strong></div>
-          <div class="truth-card"><div class="eyebrow">Corrected Renders</div><strong>{int(render_truth_summary.get('corrected_render_count', 0) or 0)}</strong></div>
-          <div class="truth-card"><div class="eyebrow">Pass / Review / Fail</div><strong>{recommended_status_counts['PASS']} / {recommended_status_counts['REVIEW']} / {recommended_status_counts['FAIL']}</strong></div>
-          <div class="truth-card"><div class="eyebrow">Outlier Cameras</div><strong>{len(recommended_outlier_rows)}</strong></div>
-          <div class="truth-card"><div class="eyebrow">Worst IPP2 Residual</div><strong>{float(ipp2_validation.get('max_residual', residual_validation.get('worst_residual_stops', 0.0)) or 0.0):.2f}</strong></div>
-        </div>
-        <div class="operator-summary">
-          <div class="operator-summary-card">
-            <div class="eyebrow">What To Look For</div>
-            <h2>Start with the suggested lens action, then confirm whether the camera landed.</h2>
-            <p>{html.escape(operator_focus_note)}</p>
-          </div>
-          <div class="operator-summary-card">
-            <div class="eyebrow">Validation Meaning</div>
-            <p><strong>PASS</strong>: Final result landed within tolerance.</p>
-            <p><strong>REVIEW</strong>: Final result is close, but still needs confirmation.</p>
-            <p><strong>FAIL</strong>: Final result is still outside tolerance.</p>
-          </div>
-        </div>
-        <dl class="meta-grid">
-          <div class="meta-card"><dt>Run Label</dt><dd>{html.escape(str(payload.get('run_label')))}</dd></div>
-          <div class="meta-card"><dt>Source Mode</dt><dd>{html.escape(str(payload.get('source_mode_label')))}</dd></div>
-          <div class="meta-card"><dt>Target Type</dt><dd>{html.escape(str(payload.get('target_type')))}</dd></div>
-          <div class="meta-card"><dt>Matching Domain</dt><dd>{html.escape(str(payload.get('matching_domain_label')))}</dd></div>
-          <div class="meta-card"><dt>Chosen Method</dt><dd>{html.escape(str((recommended_strategy or {}).get('strategy_label') or 'Pending'))}</dd></div>
-          <div class="meta-card"><dt>Tolerance</dt><dd>&plusmn;{float(tolerance_model.get('pass_threshold_stops', 0.0) or 0.0):.2f} stops pass</dd></div>
-        </dl>
-      </section>
-
-      <section class="panel">
-        <h2>Exposure Acceptance Summary</h2>
-        <p class="lead">IPP2 is the only acceptance domain. A camera is only considered in range when its corrected gray exposure lands within the final IPP2 tolerance.</p>
-        <div class="stats">
-          <div class="stat"><div class="label">Best Residual</div><div class="value">{float(ipp2_validation.get('best_residual', residual_validation.get('best_residual_stops', 0.0)) or 0.0):.2f}</div></div>
-          <div class="stat"><div class="label">Median Residual</div><div class="value">{float(ipp2_validation.get('median_residual', residual_validation.get('median_residual_stops', 0.0)) or 0.0):.2f}</div></div>
-          <div class="stat"><div class="label">Worst Residual</div><div class="value">{float(ipp2_validation.get('max_residual', residual_validation.get('worst_residual_stops', 0.0)) or 0.0):.2f}</div></div>
-          <div class="stat"><div class="label">Recommended Method</div><div class="value">{html.escape(str((recommended_strategy or {}).get('strategy_label') or 'Pending'))}</div></div>
-        </div>
-        <p class="section-meta"><strong>Method note:</strong> {html.escape(str((recommended_strategy or {}).get('reason') or 'No recommendation available.'))}</p>
-        <p class="section-meta"><strong>Exposure anchor:</strong> {html.escape(anchor_summary)}</p>
-        <p class="section-meta"><strong>Hero recommendation:</strong> {html.escape(str(hero_summary.get('candidate_clip_id') or 'No clear hero'))}. {html.escape(str(hero_summary.get('reason') or ''))}</p>
-      </section>
-
-      <section class="panel">
-        <h2>Exposure Summary</h2>
-        <p class="lead">Use this table first on set. It shows the measured gray exposure, the scalar offset used for correction, the final IPP2 result, and the immediate operator action.</p>
-        <table>
-          <thead>
-            <tr>
-              <th>Camera</th>
-              <th>Gray Exposure</th>
-              <th>Offset to Anchor</th>
-              <th>Result</th>
-              <th>Recommended Action</th>
-            </tr>
-          </thead>
-          <tbody>{''.join(calibration_rows)}</tbody>
-        </table>
-      </section>
-
-      <section class="report-section">
-        <div class="section-top"><div><h2>Original Reference Stills</h2><p class="section-meta">These are the original frames before any correction. The corrected sections below use the actual strategy-specific render assets written for this report.</p></div></div>
-        <div class="grid cols-{original_columns}">{''.join(original_cards)}</div>
-      </section>
-
-      {''.join(strategy_sections)}
+      {''.join(contact_pages_markup)}
+      {''.join(camera_sections)}
     </div>
   </div>
 </body>
