@@ -16,6 +16,7 @@ from .calibration import (
     load_color_calibration,
     load_exposure_calibration,
     measure_sphere_region_statistics,
+    measure_sphere_zone_profile_statistics,
     percentile_clip,
     write_array_calibration_json,
 )
@@ -613,28 +614,37 @@ def _measure_gray_sphere_statistics(raw_region: np.ndarray, monitoring_region: n
     refined_raw = measure_sphere_region_statistics(raw_region, sphere_roi, sampling_variant="refined")
     legacy_monitoring = measure_sphere_region_statistics(monitoring_region, sphere_roi, sampling_variant="legacy")
     refined_monitoring = measure_sphere_region_statistics(monitoring_region, sphere_roi, sampling_variant="refined")
-    raw_window_stats = _measure_three_sample_statistics(raw_region)
-    monitoring_window_stats = _measure_three_sample_statistics(monitoring_region)
+    raw_profile = measure_sphere_zone_profile_statistics(raw_region, sphere_roi, sampling_variant="refined")
+    monitoring_profile = measure_sphere_zone_profile_statistics(monitoring_region, sphere_roi, sampling_variant="refined")
     return {
-        "measured_log2_luminance": float(refined_monitoring["measured_log2_luminance"]),
-        "measured_log2_luminance_monitoring": float(refined_monitoring["measured_log2_luminance"]),
-        "measured_log2_luminance_raw": float(refined_raw["measured_log2_luminance"]),
-        "measured_rgb_mean": [float(value) for value in refined_raw["measured_rgb_mean"]],
-        "measured_rgb_chromaticity": [float(value) for value in refined_raw["measured_rgb_chromaticity"]],
-        "valid_pixel_count": int(refined_monitoring["valid_pixel_count"]),
+        "measured_log2_luminance": float(monitoring_profile["measured_log2_luminance"]),
+        "measured_log2_luminance_monitoring": float(monitoring_profile["measured_log2_luminance"]),
+        "measured_log2_luminance_raw": float(raw_profile["measured_log2_luminance"]),
+        "measured_rgb_mean": [float(value) for value in raw_profile["measured_rgb_mean"]],
+        "measured_rgb_chromaticity": [float(value) for value in raw_profile["measured_rgb_chromaticity"]],
+        "valid_pixel_count": int(monitoring_profile["valid_pixel_count"]),
         "saturation_fraction": float(refined_monitoring["saturation_fraction"]),
         "black_fraction": float(refined_monitoring["black_fraction"]),
-        "roi_variance": float(refined_monitoring["roi_variance"]),
-        "monitoring_roi_variance": float(refined_monitoring["roi_variance"]),
-        "raw_roi_variance": float(refined_raw["roi_variance"]),
-        "neutral_sample_count": monitoring_window_stats["neutral_sample_count"],
-        "neutral_sample_log2_spread": monitoring_window_stats["neutral_sample_log2_spread"],
-        "neutral_sample_chromaticity_spread": raw_window_stats["neutral_sample_chromaticity_spread"],
-        "neutral_samples": monitoring_window_stats["neutral_samples"],
-        "neutral_samples_raw": raw_window_stats["neutral_samples"],
+        "roi_variance": float(monitoring_profile["roi_variance"]),
+        "monitoring_roi_variance": float(monitoring_profile["roi_variance"]),
+        "raw_roi_variance": float(raw_profile["roi_variance"]),
+        "neutral_sample_count": int(monitoring_profile["neutral_sample_count"]),
+        "neutral_sample_log2_spread": float(monitoring_profile["neutral_sample_log2_spread"]),
+        "neutral_sample_chromaticity_spread": float(raw_profile["neutral_sample_chromaticity_spread"]),
+        "neutral_samples": [dict(item) for item in monitoring_profile["zone_measurements"]],
+        "neutral_samples_raw": [dict(item) for item in raw_profile["zone_measurements"]],
+        "gray_exposure_summary": str(monitoring_profile["aggregate_sphere_profile"]),
+        "gray_exposure_summary_raw": str(raw_profile["aggregate_sphere_profile"]),
+        "top_ire": float(monitoring_profile["top_ire"]),
+        "mid_ire": float(monitoring_profile["mid_ire"]),
+        "bottom_ire": float(monitoring_profile["bottom_ire"]),
+        "zone_spread_ire": float(monitoring_profile["zone_spread_ire"]),
+        "zone_spread_stops": float(monitoring_profile["zone_spread_stops"]),
+        "sphere_zone_profile_monitoring": [dict(item) for item in monitoring_profile["zone_measurements"]],
+        "sphere_zone_profile_raw": [dict(item) for item in raw_profile["zone_measurements"]],
         "raw_saturation_fraction": float(refined_raw["saturation_fraction"]),
         "sphere_sampling_comparison": {
-            "measurement_geometry": "inscribed_circle_with_refined_interior_mask",
+            "measurement_geometry": "three_band_gradient_aligned_profile_within_refined_sphere_mask",
             "sphere_roi_within_roi": {"cx": sphere_roi.cx, "cy": sphere_roi.cy, "r": sphere_roi.r},
             "legacy": {
                 "monitoring_log2": float(legacy_monitoring["measured_log2_luminance"]),
@@ -648,19 +658,24 @@ def _measure_gray_sphere_statistics(raw_region: np.ndarray, monitoring_region: n
             "refined": {
                 "monitoring_log2": float(refined_monitoring["measured_log2_luminance"]),
                 "raw_log2": float(refined_raw["measured_log2_luminance"]),
-                "confidence": float(refined_raw["confidence"]),
+                "confidence": float(raw_profile["confidence"]),
                 "mask_fraction": float(refined_raw["mask_fraction"]),
-                "sampling_method": str(refined_raw["sampling_method"]),
+                "sampling_method": str(raw_profile["sampling_method"]),
                 "rgb_mean_raw": [float(value) for value in refined_raw["measured_rgb_mean"]],
                 "rgb_chromaticity_raw": [float(value) for value in refined_raw["measured_rgb_chromaticity"]],
+                "top_ire": float(raw_profile["top_ire"]),
+                "mid_ire": float(raw_profile["mid_ire"]),
+                "bottom_ire": float(raw_profile["bottom_ire"]),
+                "profile_summary": str(raw_profile["aggregate_sphere_profile"]),
             },
             "delta_raw_log2": float(refined_raw["measured_log2_luminance"] - legacy_raw["measured_log2_luminance"]),
             "delta_monitoring_log2": float(refined_monitoring["measured_log2_luminance"] - legacy_monitoring["measured_log2_luminance"]),
-            "window_reference_raw_log2": float(raw_window_stats["measured_log2_luminance"]),
-            "window_reference_monitoring_log2": float(monitoring_window_stats["measured_log2_luminance"]),
+            "window_reference_raw_log2": float(raw_profile["measured_log2_luminance"]),
+            "window_reference_monitoring_log2": float(monitoring_profile["measured_log2_luminance"]),
+            "window_reference_profile": str(monitoring_profile["aggregate_sphere_profile"]),
         },
-        "gray_sphere_sampling_confidence": float(refined_raw["confidence"]),
-        "calibration_measurement_mode": "gray_sphere_refined_circle",
+        "gray_sphere_sampling_confidence": float(raw_profile["confidence"]),
+        "calibration_measurement_mode": "gray_sphere_three_zone_profile",
     }
 
 

@@ -17,7 +17,13 @@ from .rcp2_apply import (
     read_camera_state,
     test_rcp2_write_smoke,
 )
-from .report import build_contact_sheet_report, normalize_review_mode, normalize_target_strategy_name
+from .report import (
+    _strategy_key_for_anchor_mode,
+    build_contact_sheet_report,
+    normalize_exposure_anchor_mode,
+    normalize_review_mode,
+    normalize_target_strategy_name,
+)
 from .rmd import write_rmds_from_analysis
 from .transcode import write_transcode_plan
 from .validation import validate_pipeline
@@ -215,14 +221,29 @@ def report_contact_sheet_command(
     color_calibration: Optional[str] = typer.Option(None, "--color-calibration", help="Optional color calibration JSON"),
     target_type: Optional[str] = typer.Option(None, "--target-type", help="Optional target type: gray_card, gray_sphere, or color_chart"),
     processing_mode: Optional[str] = typer.Option(None, "--processing-mode", help="Optional processing mode: exposure, color, or both"),
-    preview_mode: str = typer.Option("calibration", "--preview-mode", help="Preview mode: calibration or monitoring"),
+    preview_mode: str = typer.Option("monitoring", "--preview-mode", help="Preview mode: monitoring (legacy calibration is accepted as an alias)"),
     preview_output_space: Optional[str] = typer.Option(None, "--preview-output-space", help="Preview output color space"),
     preview_output_gamma: Optional[str] = typer.Option(None, "--preview-output-gamma", help="Preview output gamma"),
     preview_highlight_rolloff: Optional[str] = typer.Option(None, "--preview-highlight-rolloff", help="Preview highlight rolloff"),
     preview_shadow_rolloff: Optional[str] = typer.Option(None, "--preview-shadow-rolloff", help="Preview shadow rolloff"),
     preview_lut: Optional[str] = typer.Option(None, "--preview-lut", help="Optional monitoring LUT (.cube)"),
+    exposure_anchor_mode: Optional[str] = typer.Option(None, "--exposure-anchor-mode", help="Exposure anchor: median, hero-camera, hero-clip, manual-clip, or manual-target"),
+    reference_clip_id: Optional[str] = typer.Option(None, "--reference-clip-id", help="Reference clip ID for manual-clip anchor"),
+    hero_clip_id: Optional[str] = typer.Option(None, "--hero-clip-id", help="Hero clip ID for hero anchor"),
+    manual_target_stops: Optional[float] = typer.Option(None, "--manual-target-stops", help="Explicit manual anchor target in stops"),
+    manual_target_ire: Optional[float] = typer.Option(None, "--manual-target-ire", help="Explicit manual anchor target in IRE"),
     require_real_redline: bool = typer.Option(False, "--require-real-redline", help="Require real REDLine plus real source media; fail explicitly instead of accepting mock-backed validation"),
 ) -> None:
+    try:
+        normalized_anchor_mode = normalize_exposure_anchor_mode(exposure_anchor_mode)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if normalized_anchor_mode == "manual_clip" and not reference_clip_id:
+        raise typer.BadParameter("manual-clip anchor requires --reference-clip-id")
+    if normalized_anchor_mode in {"hero_camera", "hero_clip"} and not hero_clip_id:
+        raise typer.BadParameter("hero-camera/hero-clip anchor requires --hero-clip-id")
+    if normalized_anchor_mode == "manual_target" and manual_target_stops is None and manual_target_ire is None:
+        raise typer.BadParameter("manual-target anchor requires --manual-target-stops or --manual-target-ire")
     payload = build_contact_sheet_report(
         input_path,
         out_dir=out,
@@ -236,6 +257,11 @@ def report_contact_sheet_command(
         preview_highlight_rolloff=preview_highlight_rolloff,
         preview_shadow_rolloff=preview_shadow_rolloff,
         preview_lut=preview_lut,
+        reference_clip_id=reference_clip_id,
+        hero_clip_id=hero_clip_id,
+        exposure_anchor_mode=normalized_anchor_mode,
+        manual_target_stops=manual_target_stops,
+        manual_target_ire=manual_target_ire,
         require_real_redline=require_real_redline,
     )
     typer.echo(str(payload))
@@ -272,10 +298,13 @@ def review_calibration_command(
     clip_id: list[str] = typer.Option([], "--clip-id", help="Repeat to include only specific clip IDs in this calibration subset"),
     clip_group: list[str] = typer.Option([], "--clip-group", help="Repeat to include all clips from a discovered subset group (for example take number)"),
     clip_subset_file: Optional[str] = typer.Option(None, "--clip-subset-file", help="Optional JSON file describing clip_ids / clip_groups / run_label for this subset run"),
-    target_strategy: list[str] = typer.Option(["median"], "--target-strategy", help="Target strategy: median, optimal-exposure, manual, or hero-camera; repeat to compare multiple"),
-    reference_clip_id: Optional[str] = typer.Option(None, "--reference-clip-id", help="Reference clip ID for manual target strategy"),
-    hero_clip_id: Optional[str] = typer.Option(None, "--hero-clip-id", help="Hero clip ID for hero-camera target strategy"),
-    preview_mode: str = typer.Option("calibration", "--preview-mode", help="Preview mode: calibration or monitoring"),
+    target_strategy: list[str] = typer.Option(["median"], "--target-strategy", help="Target strategy: median, optimal-exposure, manual, hero-camera, or manual-target; repeat to compare multiple"),
+    reference_clip_id: Optional[str] = typer.Option(None, "--reference-clip-id", help="Reference clip ID for manual target strategy or manual-clip anchor"),
+    hero_clip_id: Optional[str] = typer.Option(None, "--hero-clip-id", help="Hero clip ID for hero-camera target strategy or hero anchor"),
+    exposure_anchor_mode: Optional[str] = typer.Option(None, "--exposure-anchor-mode", help="Exposure anchor: median, hero-camera, hero-clip, manual-clip, or manual-target"),
+    manual_target_stops: Optional[float] = typer.Option(None, "--manual-target-stops", help="Explicit manual anchor target in stops"),
+    manual_target_ire: Optional[float] = typer.Option(None, "--manual-target-ire", help="Explicit manual anchor target in IRE"),
+    preview_mode: str = typer.Option("monitoring", "--preview-mode", help="Preview mode: monitoring (legacy calibration is accepted as an alias)"),
     preview_output_space: Optional[str] = typer.Option(None, "--preview-output-space", help="Preview output color space"),
     preview_output_gamma: Optional[str] = typer.Option(None, "--preview-output-gamma", help="Preview output gamma"),
     preview_highlight_rolloff: Optional[str] = typer.Option(None, "--preview-highlight-rolloff", help="Preview highlight rolloff"),
@@ -301,10 +330,23 @@ def review_calibration_command(
             raise typer.BadParameter("Normalized ROI must remain inside the image bounds")
         calibration_roi = {"x": float(roi_x), "y": float(roi_y), "w": float(roi_w), "h": float(roi_h)}
     normalized_strategies = [normalize_target_strategy_name(item) for item in target_strategy]
+    try:
+        normalized_anchor_mode = normalize_exposure_anchor_mode(exposure_anchor_mode)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    explicit_anchor_strategy_key = _strategy_key_for_anchor_mode(normalized_anchor_mode)
+    if explicit_anchor_strategy_key and explicit_anchor_strategy_key not in normalized_strategies:
+        normalized_strategies.append(explicit_anchor_strategy_key)
     if "manual" in normalized_strategies and not reference_clip_id:
         raise typer.BadParameter("manual target strategy requires --reference-clip-id")
     if "hero_camera" in normalized_strategies and not hero_clip_id:
         raise typer.BadParameter("hero-camera target strategy requires --hero-clip-id")
+    if normalized_anchor_mode == "manual_clip" and not reference_clip_id:
+        raise typer.BadParameter("manual-clip anchor requires --reference-clip-id")
+    if normalized_anchor_mode in {"hero_camera", "hero_clip"} and not hero_clip_id:
+        raise typer.BadParameter("hero-camera/hero-clip anchor requires --hero-clip-id")
+    if normalized_anchor_mode == "manual_target" and manual_target_stops is None and manual_target_ire is None:
+        raise typer.BadParameter("manual-target anchor requires --manual-target-stops or --manual-target-ire")
     try:
         resolved_matching_domain = normalize_matching_domain(matching_domain)
     except ValueError as exc:
@@ -340,9 +382,12 @@ def review_calibration_command(
         selected_clip_ids=clip_id,
         selected_clip_groups=clip_group,
         clip_subset_file=clip_subset_file,
-        target_strategies=target_strategy,
+        target_strategies=normalized_strategies,
         reference_clip_id=reference_clip_id,
         hero_clip_id=hero_clip_id,
+        exposure_anchor_mode=normalized_anchor_mode,
+        manual_target_stops=manual_target_stops,
+        manual_target_ire=manual_target_ire,
         preview_mode=preview_mode,
         preview_output_space=preview_output_space,
         preview_output_gamma=preview_output_gamma,

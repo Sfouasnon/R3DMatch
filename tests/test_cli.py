@@ -4,10 +4,11 @@ import subprocess
 import time
 import types
 from pathlib import Path
-from typing import Optional
+from typing import Optional, cast
 
 import numpy as np
 import pytest
+from PIL import Image
 from typer.testing import CliRunner
 
 from r3dmatch.calibration import build_array_calibration_from_analysis, calibrate_card_path, calibrate_color_path, calibrate_exposure_path, calibrate_sphere_path, center_crop_roi, derive_array_group_key, detect_gray_card_roi, load_calibration, load_card_roi_file, load_color_calibration, load_exposure_calibration, measure_card_from_roi, measure_color_region, measure_sphere_from_roi, solve_neutral_gains
@@ -22,6 +23,7 @@ from r3dmatch.models import GrayCardROI, SamplingRegion, SphereROI
 from r3dmatch.rcp2_apply import (
     MemoryRcp2Transport,
     Rcp2TimeoutError,
+    WebSocketRcp2Transport,
     apply_calibration_payload,
     build_camera_verification_report,
     summarize_apply_report,
@@ -29,22 +31,24 @@ from r3dmatch.rcp2_apply import (
 from r3dmatch.rcp2_websocket import (
     PARAMETER_SPECS,
     JsonWebSocketClient,
+    Rcp2ParameterState,
     Rcp2WebSocketSession,
     Rcp2WebSocketTimeout,
+    normalize_parameter_id,
     build_periodic_get_payload,
     build_websocket_text_frame,
     build_websocket_upgrade_request,
     expected_websocket_accept,
     extract_parameter_state,
 )
-from r3dmatch.report import _build_strategy_payloads, _compute_image_difference_metrics, _ipp2_closed_loop_next_correction, _report_grid_columns, _report_tiles_per_page, _resolve_redline_executable, build_contact_sheet_report, build_lightweight_analysis_report, build_review_package, preview_filename_for_clip_id, render_contact_sheet_html, render_contact_sheet_pdf, render_preview_frame
+from r3dmatch.report import _build_sphere_detection_artifacts, _build_strategy_payloads, _compute_image_difference_metrics, _ipp2_closed_loop_next_correction, _ipp2_closed_loop_target, _ipp2_validation_presentation, _measure_rendered_preview_roi_ipp2, _operator_guidance_for_correction, _report_grid_columns, _report_tiles_per_page, _resolve_redline_executable, _sphere_detection_label, _sphere_detection_note, build_contact_sheet_report, build_lightweight_analysis_report, build_review_package, format_stop_string, preview_filename_for_clip_id, render_contact_sheet_html, render_contact_sheet_pdf, render_preview_frame, round_to_standard_stop_fraction
 from r3dmatch.rmd import render_rmd_xml, rmd_filename_for_clip_id, write_rmd_for_clip_with_metadata, write_rmds_from_analysis
 from r3dmatch.ui import build_table_rows, load_review_bundle
 from r3dmatch.sdk import MockR3DBackend, RedSdkDecoder, resolve_backend
 from r3dmatch.sidecar import build_sidecar_payload, sidecar_filename_for_clip_id
 from r3dmatch.transcode import build_redline_command, build_redline_command_variants, write_transcode_plan
 from r3dmatch.validation import validate_pipeline
-from r3dmatch.web_app import _normalize_subset_form, _preferred_roi_preview_record, _resolve_selected_clip_ids, _resolved_output_path_for_form, _scan_preview_path, _subset_selection_ui, build_review_web_command, create_app, scan_sources
+from r3dmatch.web_app import _ensure_scan_preview, _normalize_subset_form, _preferred_roi_preview_record, _resolve_selected_clip_ids, _resolved_output_path_for_form, _scan_preview_path, _subset_selection_ui, build_review_web_command, create_app, scan_sources
 from r3dmatch.workflow import approve_master_rmd, build_post_apply_verification_from_reviews, clear_preview_cache, resolve_review_output_dir, review_calibration, validate_review_run_contract
 
 runner = CliRunner()
@@ -102,6 +106,278 @@ def test_ipp2_closed_loop_next_correction_moves_against_residual() -> None:
         previous_correction=None,
         previous_residual=None,
     ) < 0.5
+
+
+def test_measure_rendered_preview_roi_ipp2_detects_off_center_sphere_when_roi_missing(tmp_path: Path) -> None:
+    height = 400
+    width = 400
+    image = np.zeros((height, width, 3), dtype=np.float32)
+    yy, xx = np.meshgrid(np.arange(height, dtype=np.float32), np.arange(width, dtype=np.float32), indexing="ij")
+    cx = 245.0
+    cy = 180.0
+    radius = 42.0
+    distance = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    sphere_mask = distance <= radius
+    vertical = np.clip((yy - (cy - radius)) / max(2.0 * radius, 1.0), 0.0, 1.0)
+    sphere_luma = 0.42 - (vertical * 0.14)
+    for channel in range(3):
+        image[..., channel] = np.where(sphere_mask, sphere_luma, image[..., channel])
+    path = tmp_path / "off_center_sphere.jpg"
+    Image.fromarray(np.clip(image * 255.0, 0, 255).astype(np.uint8), mode="RGB").save(path, format="JPEG")
+
+    measured = _measure_rendered_preview_roi_ipp2(str(path), None)
+
+    assert measured["sphere_roi_source"] in {"primary_detected", "secondary_detected"}
+    assert measured["detected_sphere_roi"]["cx"] > 90.0
+    assert measured["top_ire"] > measured["mid_ire"] > measured["bottom_ire"]
+
+
+def test_measure_rendered_preview_roi_ipp2_fails_explicitly_when_no_sphere_candidate_exists(tmp_path: Path) -> None:
+    image = np.zeros((320, 320, 3), dtype=np.float32)
+    image[..., :] = 0.18
+    path = tmp_path / "no_sphere.jpg"
+    Image.fromarray(np.clip(image * 255.0, 0, 255).astype(np.uint8), mode="RGB").save(path, format="JPEG")
+
+    measured = _measure_rendered_preview_roi_ipp2(str(path), None)
+
+    assert measured["detection_failed"] is True
+    assert measured["sphere_roi_source"] == "failed"
+    assert measured["gray_exposure_summary"] == "Sphere detection failed"
+
+
+def test_measure_rendered_preview_roi_ipp2_reuses_original_roi_for_corrected_frames(tmp_path: Path) -> None:
+    height = 320
+    width = 320
+    image = np.zeros((height, width, 3), dtype=np.float32)
+    yy, xx = np.meshgrid(np.arange(height, dtype=np.float32), np.arange(width, dtype=np.float32), indexing="ij")
+    cx = 220.0
+    cy = 150.0
+    radius = 50.0
+    distance = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    sphere_mask = distance <= radius
+    vertical = np.clip((yy - (cy - radius)) / max(2.0 * radius, 1.0), 0.0, 1.0)
+    sphere_luma = 0.40 - (vertical * 0.15)
+    for channel in range(3):
+        image[..., channel] = np.where(sphere_mask, sphere_luma, image[..., channel])
+    path = tmp_path / "corrected_like.jpg"
+    Image.fromarray(np.clip(image * 255.0, 0, 255).astype(np.uint8), mode="RGB").save(path, format="JPEG")
+
+    measured = _measure_rendered_preview_roi_ipp2(
+        str(path),
+        {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        sphere_roi_override={"cx": cx, "cy": cy, "r": radius},
+    )
+
+    assert measured["detection_failed"] is False
+    assert measured["sphere_roi_source"] == "reused_from_original"
+    assert measured["detected_sphere_roi"]["cx"] == pytest.approx(cx)
+
+
+def test_sphere_detection_label_thresholds() -> None:
+    assert _sphere_detection_label(0.85) == "HIGH"
+    assert _sphere_detection_label(0.60) == "MEDIUM"
+    assert _sphere_detection_label(0.35) == "LOW"
+    assert _sphere_detection_label(0.10) == "FAILED"
+
+
+def test_sphere_detection_note_includes_recovery_labels() -> None:
+    assert _sphere_detection_note("primary_detected", "HIGH") == "Sphere detection: verified"
+    assert _sphere_detection_note("localized_recovery", "MEDIUM") == "Sphere detection: fallback used"
+    assert _sphere_detection_note("forced_best_effort", "LOW") == "Sphere detection: low-confidence recovery"
+
+
+def test_ipp2_closed_loop_target_uses_original_zone_profiles_for_median_anchor() -> None:
+    rows = [
+        {
+            "clip_id": "A",
+            "trust_class": "TRUSTED",
+            "original_ipp2_zone_profile": [
+                {"label": "upper_mid", "measured_log2_luminance": -2.0, "measured_ire": 25.0},
+                {"label": "center", "measured_log2_luminance": -2.2, "measured_ire": 22.0},
+                {"label": "lower_mid", "measured_log2_luminance": -2.4, "measured_ire": 19.0},
+            ],
+            "initial_ipp2_zone_profile": [
+                {"label": "upper_mid", "measured_log2_luminance": -4.0, "measured_ire": 6.0},
+                {"label": "center", "measured_log2_luminance": -4.0, "measured_ire": 6.0},
+                {"label": "lower_mid", "measured_log2_luminance": -4.0, "measured_ire": 6.0},
+            ],
+        },
+        {
+            "clip_id": "B",
+            "trust_class": "TRUSTED",
+            "original_ipp2_zone_profile": [
+                {"label": "upper_mid", "measured_log2_luminance": -1.8, "measured_ire": 29.0},
+                {"label": "center", "measured_log2_luminance": -2.0, "measured_ire": 25.0},
+                {"label": "lower_mid", "measured_log2_luminance": -2.2, "measured_ire": 22.0},
+            ],
+            "initial_ipp2_zone_profile": [
+                {"label": "upper_mid", "measured_log2_luminance": -4.0, "measured_ire": 6.0},
+                {"label": "center", "measured_log2_luminance": -4.0, "measured_ire": 6.0},
+                {"label": "lower_mid", "measured_log2_luminance": -4.0, "measured_ire": 6.0},
+            ],
+        },
+    ]
+
+    target = _ipp2_closed_loop_target(strategy_key="median", reference_clip_id=None, rows=rows, anchor_mode="median")
+
+    assert target["target_source"] == "trusted_camera_median_original_ipp2_profile"
+    assert target["target_profile_summary"] != "Top 6 / Mid 6 / Bottom 6 IRE"
+    assert target["target_zone_profile"][0]["measured_log2_luminance"] == pytest.approx(-1.9)
+    assert target["target_zone_profile"][1]["measured_log2_luminance"] == pytest.approx(-2.1)
+    assert target["target_zone_profile"][2]["measured_log2_luminance"] == pytest.approx(-2.3)
+
+
+def test_round_to_standard_stop_fraction_prefers_standard_lens_steps() -> None:
+    assert round_to_standard_stop_fraction(1.48) == pytest.approx(1.5)
+    assert round_to_standard_stop_fraction(-1.48) == pytest.approx(-1.5)
+    assert round_to_standard_stop_fraction(0.62) == pytest.approx(2.0 / 3.0)
+    assert round_to_standard_stop_fraction(0.74) == pytest.approx(0.75)
+
+
+def test_format_stop_string_formats_human_readable_stop_labels() -> None:
+    assert format_stop_string(1.0) == "1 stop"
+    assert format_stop_string(0.5) == "1/2 stop"
+    assert format_stop_string(1.0 / 3.0) == "1/3 stop"
+    assert format_stop_string(0.25) == "1/4 stop"
+    assert format_stop_string(2.5) == "2 1/2 stops"
+
+
+def test_operator_guidance_marks_large_corrections_as_outliers() -> None:
+    guidance = _operator_guidance_for_correction(
+        correction_stops=-3.2,
+        residual_stops=0.18,
+        validation_status="FAIL",
+    )
+    assert guidance["status"] == "OUTLIER"
+    assert guidance["direction"] == "close"
+    assert guidance["suggested_action"] == "Close aperture by 3 1/4 stops"
+    assert "Verify T-Stop" in guidance["notes"]
+
+
+def test_operator_guidance_handles_zero_correction_without_direction_bias() -> None:
+    guidance = _operator_guidance_for_correction(
+        correction_stops=0.0,
+        residual_stops=0.0,
+        validation_status="PASS",
+    )
+    assert guidance["status"] == "PASS"
+    assert guidance["direction"] == "hold"
+    assert guidance["suggested_action"] == "No aperture adjustment required"
+
+
+def test_operator_guidance_rounds_tiny_corrections_down_to_no_adjustment() -> None:
+    guidance = _operator_guidance_for_correction(
+        correction_stops=0.02,
+        residual_stops=0.0,
+        validation_status="PASS",
+    )
+    assert guidance["direction"] == "hold"
+    assert guidance["suggested_action"] == "No aperture adjustment required"
+
+
+def test_ipp2_validation_presentation_distinguishes_outlier_outcomes() -> None:
+    landed = _ipp2_validation_presentation(
+        {
+            "status": "PASS",
+            "ipp2_residual_stops": 0.03,
+            "ipp2_profile_max_residual_stops": 0.28,
+            "applied_correction_stops": 3.0,
+            "ipp2_gray_exposure_summary": "Bright 40 / Center 31 / Dark 26 IRE",
+            "ipp2_target_gray_exposure_summary": "Bright 41 / Center 31 / Dark 26 IRE",
+            "ipp2_zone_residuals": [
+                {"label": "bright_side", "residual_stops": 0.03},
+                {"label": "center", "residual_stops": -0.01},
+                {"label": "dark_side", "residual_stops": 0.02},
+            ],
+        }
+    )
+    assert landed["presentation_state"] == "Outlier corrected successfully"
+    assert landed["validation_label"] == "Verify T-Stop"
+    assert landed["gray_exposure_text"] == "Gray Exposure: Bright 40 / Center 31 / Dark 26 IRE"
+    assert landed["target_profile_text"] == "Reference profile: Bright 41 / Center 31 / Dark 26 IRE"
+    assert "Bright +0.03" in landed["zone_residual_text"]
+    assert landed["residual_text"] == "Exposure residual after validation: 0.03 stops"
+    assert landed["profile_residual_text"] == "Worst zone residual after validation: 0.28 stops"
+    assert landed["result_label"] == "Outlier"
+
+    review = _ipp2_validation_presentation(
+        {
+            "status": "REVIEW",
+            "ipp2_residual_stops": 0.08,
+            "ipp2_profile_max_residual_stops": 0.08,
+            "applied_correction_stops": -3.0,
+        }
+    )
+    assert review["presentation_state"] == "Outlier needs review"
+
+    failed = _ipp2_validation_presentation(
+        {
+            "status": "FAIL",
+            "ipp2_residual_stops": 0.18,
+            "ipp2_profile_max_residual_stops": 0.18,
+            "applied_correction_stops": -3.0,
+        }
+    )
+    assert failed["presentation_state"] == "Outlier still outside tolerance"
+
+
+def test_build_sphere_detection_artifacts_writes_overlay_images_and_summary(tmp_path: Path) -> None:
+    image = np.zeros((240, 320, 3), dtype=np.float32)
+    yy, xx = np.meshgrid(np.arange(240, dtype=np.float32), np.arange(320, dtype=np.float32), indexing="ij")
+    cx = 220.0
+    cy = 120.0
+    radius = 44.0
+    distance = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    mask = distance <= radius
+    image[..., :] = 0.05
+    image[mask] = 0.30
+    original_path = tmp_path / "CAM001.original.jpg"
+    corrected_path = tmp_path / "CAM001.corrected.jpg"
+    Image.fromarray(np.clip(image * 255.0, 0, 255).astype(np.uint8), mode="RGB").save(original_path, format="JPEG")
+    Image.fromarray(np.clip(image * 255.0, 0, 255).astype(np.uint8), mode="RGB").save(corrected_path, format="JPEG")
+
+    summary = {
+        "rows": [
+            {
+                "strategy_key": "median",
+                "clip_id": "CAM001",
+                "camera_id": "CAM001",
+                "calibration_roi": None,
+                "original_image_path": str(original_path),
+                "corrected_image_path": str(corrected_path),
+                "ipp2_original_detection_source": "primary_detected",
+                "ipp2_original_detection_confidence": 0.81,
+                "ipp2_original_detection_label": "HIGH",
+                "ipp2_original_detected_sphere_roi": {"cx": cx, "cy": cy, "r": radius},
+                "ipp2_detection_source": "reused_from_original",
+                "ipp2_detection_confidence": 1.0,
+                "ipp2_detection_label": "HIGH",
+                "ipp2_detected_sphere_roi": {"cx": cx, "cy": cy, "r": radius},
+                "ipp2_original_zone_profile": [
+                    {"label": "upper_mid", "display_label": "Top", "measured_ire": 39.0, "bounds": {"pixel": {"x0": 196, "y0": 96, "x1": 244, "y1": 114}}},
+                    {"label": "center", "display_label": "Mid", "measured_ire": 31.0, "bounds": {"pixel": {"x0": 196, "y0": 114, "x1": 244, "y1": 132}}},
+                    {"label": "lower_mid", "display_label": "Bottom", "measured_ire": 26.0, "bounds": {"pixel": {"x0": 196, "y0": 132, "x1": 244, "y1": 150}}},
+                ],
+                "ipp2_zone_profile": [
+                    {"label": "upper_mid", "display_label": "Top", "measured_ire": 39.0, "bounds": {"pixel": {"x0": 196, "y0": 96, "x1": 244, "y1": 114}}},
+                    {"label": "center", "display_label": "Mid", "measured_ire": 31.0, "bounds": {"pixel": {"x0": 196, "y0": 114, "x1": 244, "y1": 132}}},
+                    {"label": "lower_mid", "display_label": "Bottom", "measured_ire": 26.0, "bounds": {"pixel": {"x0": 196, "y0": 132, "x1": 244, "y1": 150}}},
+                ],
+                "detection_failed": False,
+            }
+        ]
+    }
+
+    artifacts = _build_sphere_detection_artifacts(
+        out_root=tmp_path,
+        validation_summary=summary,
+        recommended_strategy_key="median",
+    )
+
+    assert Path(artifacts["path"]).exists()
+    assert Path(artifacts["overlay_root"]).joinpath("CAM001.original_detection.png").exists()
+    assert Path(artifacts["overlay_root"]).joinpath("CAM001.corrected_detection.png").exists()
+    assert artifacts["summary"]["confidence_counts"]["HIGH"] == 1
 
 
 def test_parameter_specs_use_documented_fallback_dividers() -> None:
@@ -259,6 +535,73 @@ def _apply_fake_cdl(image: np.ndarray, cdl: Optional[dict], *, enabled: bool) ->
     return np.clip(luma[..., None] + (corrected - luma[..., None]) * saturation, 0.0, 1.0)
 
 
+def _fake_redline_base_image(command: list[str]) -> np.ndarray:
+    base = np.zeros((18, 32, 3), dtype=np.float32)
+    if "--useMeta" in command:
+        base[..., 0] = 80.0 / 255.0
+        base[..., 1] = 90.0 / 255.0
+        base[..., 2] = 100.0 / 255.0
+    else:
+        base[..., 0] = 70.0 / 255.0
+        base[..., 1] = 80.0 / 255.0
+        base[..., 2] = 90.0 / 255.0
+    return base
+
+
+def _fake_redline_command_state(command: list[str]) -> dict:
+    exposure = 0.0
+    kelvin = None
+    tint = 0.0
+    red_gain = 1.0
+    green_gain = 1.0
+    blue_gain = 1.0
+    rmd_payload = None
+    if "--loadRMD" in command:
+        rmd_path = Path(command[command.index("--loadRMD") + 1])
+        rmd_payload = json.loads(rmd_path.read_text(encoding="utf-8"))
+        exposure = float(rmd_payload.get("exposure", 0.0) or 0.0)
+        gains = rmd_payload.get("rgb_gains")
+        if gains:
+            red_gain = float(gains[0])
+            green_gain = float(gains[1])
+            blue_gain = float(gains[2])
+    else:
+        if "--exposureAdjust" in command:
+            exposure = float(command[command.index("--exposureAdjust") + 1])
+        elif "--exposure" in command:
+            exposure = float(command[command.index("--exposure") + 1])
+        if "--kelvin" in command:
+            kelvin = int(float(command[command.index("--kelvin") + 1]))
+        if "--tint" in command:
+            tint = float(command[command.index("--tint") + 1])
+        red_gain = float(command[command.index("--redGain") + 1]) if "--redGain" in command else red_gain
+        green_gain = float(command[command.index("--greenGain") + 1]) if "--greenGain" in command else green_gain
+        blue_gain = float(command[command.index("--blueGain") + 1]) if "--blueGain" in command else blue_gain
+    return {
+        "exposure": exposure,
+        "kelvin": kelvin,
+        "tint": tint,
+        "red_gain": red_gain,
+        "green_gain": green_gain,
+        "blue_gain": blue_gain,
+        "rmd_payload": rmd_payload,
+    }
+
+
+def _apply_fake_redline_direct_controls(image: np.ndarray, *, kelvin: Optional[int], tint: float) -> np.ndarray:
+    corrected = np.asarray(image, dtype=np.float32).copy()
+    if kelvin is not None:
+        warmth = float(np.clip((float(kelvin) - 5600.0) / 4000.0, -0.5, 0.5))
+        corrected[..., 0] *= 1.0 + (warmth * 0.20)
+        corrected[..., 2] *= 1.0 - (warmth * 0.20)
+    if abs(float(tint)) > 1e-9:
+        tint_shift = float(np.clip(float(tint) / 10.0, -0.25, 0.25))
+        corrected[..., 1] *= 1.0 - (tint_shift * 0.12)
+        corrected[..., 0] *= 1.0 + (tint_shift * 0.06)
+        corrected[..., 2] *= 1.0 + (tint_shift * 0.06)
+    return np.clip(corrected, 0.0, 1.0)
+
+
 def _install_fake_redline(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_write_rmd_for_clip_with_metadata(clip_id: str, payload: dict, out_dir):  # type: ignore[no-untyped-def]
         out_path = Path(out_dir) / f"{clip_id}.RMD"
@@ -292,6 +635,9 @@ def _install_fake_redline(monkeypatch: pytest.MonkeyPatch) -> None:
                     "--loadRMD <filename>",
                     "--useRMD <int>",
                     "--exposure <float>",
+                    "--exposureAdjust <float>",
+                    "--kelvin <int>",
+                    "--tint <float>",
                     "--redGain <float>",
                     "--greenGain <float>",
                     "--blueGain <float>",
@@ -321,29 +667,22 @@ def _install_fake_redline(monkeypatch: pytest.MonkeyPatch) -> None:
         output_path = Path(command[command.index("--o") + 1])
         generated_path = output_path.with_name(f"{output_path.name}.000000.jpg")
         generated_path.parent.mkdir(parents=True, exist_ok=True)
-        exposure = 0.0
-        red_gain = 1.0
-        green_gain = 1.0
-        blue_gain = 1.0
+        state = _fake_redline_command_state(command)
+        exposure = float(state["exposure"])
+        red_gain = float(state["red_gain"])
+        green_gain = float(state["green_gain"])
+        blue_gain = float(state["blue_gain"])
+        base = _fake_redline_base_image(command)
+        base = _apply_fake_redline_direct_controls(
+            base,
+            kelvin=cast(Optional[int], state["kelvin"]),
+            tint=float(state["tint"]),
+        )
+        base[..., 0] = np.clip(base[..., 0] * (2.0**exposure) * red_gain, 0, 1)
+        base[..., 1] = np.clip(base[..., 1] * (2.0**exposure) * green_gain, 0, 1)
+        base[..., 2] = np.clip(base[..., 2] * (2.0**exposure) * blue_gain, 0, 1)
         if "--loadRMD" in command:
-            rmd_path = Path(command[command.index("--loadRMD") + 1])
-            rmd_payload = json.loads(rmd_path.read_text(encoding="utf-8"))
-            exposure = float(rmd_payload.get("exposure", 0.0) or 0.0)
-            gains = rmd_payload.get("rgb_gains")
-            if gains:
-                red_gain = float(gains[0])
-                green_gain = float(gains[1])
-                blue_gain = float(gains[2])
-        elif "--exposure" in command:
-            exposure = float(command[command.index("--exposure") + 1])
-            red_gain = float(command[command.index("--redGain") + 1]) if "--redGain" in command else 1.0
-            green_gain = float(command[command.index("--greenGain") + 1]) if "--greenGain" in command else 1.0
-            blue_gain = float(command[command.index("--blueGain") + 1]) if "--blueGain" in command else 1.0
-        base = np.zeros((18, 32, 3), dtype=np.float32)
-        base[..., 0] = np.clip((80.0 / 255.0) * (2.0**exposure) * red_gain, 0, 1)
-        base[..., 1] = np.clip((90.0 / 255.0) * (2.0**exposure) * green_gain, 0, 1)
-        base[..., 2] = np.clip((100.0 / 255.0) * (2.0**exposure) * blue_gain, 0, 1)
-        if "--loadRMD" in command:
+            rmd_payload = cast(Optional[dict], state["rmd_payload"]) or {}
             base = _apply_fake_cdl(base, rmd_payload.get("cdl"), enabled=bool(rmd_payload.get("cdl_enabled")))
         Image.fromarray(np.clip(base * 255.0, 0, 255).astype(np.uint8), mode="RGB").save(generated_path, format="JPEG")
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -648,7 +987,7 @@ def test_web_app_routes_and_validation(tmp_path: Path, monkeypatch: pytest.Monke
             "processing_mode": "both",
             "target_strategies": ["median"],
             "review_mode": "lightweight_analysis",
-            "preview_mode": "calibration",
+            "preview_mode": "monitoring",
             "roi_mode": "center",
         },
     )
@@ -658,7 +997,7 @@ def test_web_app_routes_and_validation(tmp_path: Path, monkeypatch: pytest.Monke
     assert started["kwargs"]["clip_count"] == 1
     assert started["kwargs"]["strategies_text"] == "median"
     assert started["kwargs"]["review_mode"] == "lightweight_analysis"
-    assert started["kwargs"]["preview_mode"] == "calibration"
+    assert started["kwargs"]["preview_mode"] == "monitoring"
 
 
 def test_resolved_output_path_for_form_matches_workflow_group_run_label(tmp_path: Path) -> None:
@@ -710,7 +1049,7 @@ def test_web_run_review_uses_canonical_group_output_path_not_subset_count(tmp_pa
             "processing_mode": "both",
             "matching_domain": "scene",
             "review_mode": "lightweight_analysis",
-            "preview_mode": "calibration",
+            "preview_mode": "monitoring",
             "roi_x": "0.43",
             "roi_y": "0.42",
             "roi_w": "0.14",
@@ -757,9 +1096,54 @@ def test_preferred_roi_preview_record_prefers_group_063_when_available() -> None
 
 
 def test_scan_preview_path_changes_with_selected_roi_clip() -> None:
-    first = _scan_preview_path("/tmp/calibration", clip_id="G007_A063_032563_001", preview_mode="calibration")
-    second = _scan_preview_path("/tmp/calibration", clip_id="G007_A065_0325F6_001", preview_mode="calibration")
+    first = _scan_preview_path("/tmp/calibration", clip_id="G007_A063_032563_001", preview_mode="monitoring")
+    second = _scan_preview_path("/tmp/calibration", clip_id="G007_A065_0325F6_001", preview_mode="monitoring")
     assert first != second
+
+
+def test_ensure_scan_preview_propagates_kelvin_and_tint_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clip_path = tmp_path / "G007_A063_032563_001.R3D"
+    clip_path.write_bytes(b"")
+    captured: dict[str, object] = {}
+
+    def fake_build(*args, **kwargs):  # type: ignore[no-untyped-def]
+        captured["kelvin"] = kwargs.get("kelvin")
+        captured["tint"] = kwargs.get("tint")
+        output_index = args[0] if False else None
+        return ["REDLine", "--o", str(kwargs["output_path"])]
+
+    def fake_run(command, capture_output, text, check):  # type: ignore[no-untyped-def]
+        output_path = Path(command[command.index("--o") + 1])
+        output_path.write_bytes(b"preview")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("r3dmatch.web_app._resolve_redline_executable", lambda: "/usr/local/bin/REDLine")
+    monkeypatch.setattr(
+        "r3dmatch.web_app._detect_redline_capabilities",
+        lambda executable: {
+            "supports_color_space": True,
+            "supports_gamma_curve": True,
+            "supports_output_tonemap": True,
+            "supports_rolloff": True,
+            "supports_shadow_control": True,
+            "supports_lut": False,
+            "supports_load_rmd": True,
+        },
+    )
+    monkeypatch.setattr("r3dmatch.web_app._build_redline_preview_command", fake_build)
+    monkeypatch.setattr("r3dmatch.web_app.subprocess.run", fake_run)
+    scan = {
+        "first_clip_path": str(clip_path),
+        "kelvin": 6100,
+        "tint": -3,
+    }
+    preview_path = _ensure_scan_preview(str(tmp_path), scan, form={"preview_mode": "monitoring"})
+    assert preview_path is not None
+    assert captured["kelvin"] == 6100
+    assert captured["tint"] == -3.0
 
 
 def test_build_review_web_command_supports_ftps_source_mode() -> None:
@@ -784,7 +1168,7 @@ def test_build_review_web_command_supports_ftps_source_mode() -> None:
             "reference_clip_id": "",
             "hero_clip_id": "",
             "review_mode": "lightweight_analysis",
-            "preview_mode": "calibration",
+            "preview_mode": "monitoring",
             "preview_lut": "",
             "ftps_reel": "007",
             "ftps_clips": "63,64-65",
@@ -860,7 +1244,7 @@ def test_web_app_advanced_clip_mode_disables_group_submission(tmp_path: Path, mo
             "target_type": "gray_sphere",
             "processing_mode": "both",
             "target_strategies": ["median"],
-            "preview_mode": "calibration",
+            "preview_mode": "monitoring",
             "roi_mode": "center",
             "advanced_clip_selection": "1",
             "selected_clip_groups": ["063"],
@@ -900,7 +1284,7 @@ def test_web_app_status_progress_and_completion_links(tmp_path: Path, monkeypatc
     state.task.returncode = 0
     state.task.clip_count = 3
     state.task.strategies_text = "median, optimal-exposure"
-    state.task.preview_mode = "calibration"
+    state.task.preview_mode = "monitoring"
     status_response = client.get("/status")
     assert status_response.status_code == 200
     payload = status_response.get_json()
@@ -1913,7 +2297,7 @@ def test_web_review_command_includes_hero_clip() -> None:
             "reference_clip_id": "",
             "hero_clip_id": "G007_D060_0324M6_001",
             "review_mode": "full_contact_sheet",
-            "preview_mode": "calibration",
+            "preview_mode": "monitoring",
             "preview_lut": "",
         },
     )
@@ -1943,7 +2327,7 @@ def test_web_review_command_includes_subset_and_matching_domain() -> None:
             "reference_clip_id": "",
             "hero_clip_id": "",
             "review_mode": "lightweight_analysis",
-            "preview_mode": "calibration",
+            "preview_mode": "monitoring",
             "preview_lut": "",
         },
     )
@@ -1976,7 +2360,7 @@ def test_web_app_scan_page_shows_roi_guidance_and_preview_note(tmp_path: Path, m
     (clip_dir / "G007_A063_032563_001.R3D").write_bytes(b"")
 
     def fake_preview(input_path, scan, form=None):  # type: ignore[no-untyped-def]
-        scan["preview_note"] = "ROI preview uses G007_A063_032563_001 from group 063 with the active calibration preview transform."
+        scan["preview_note"] = "ROI preview uses G007_A063_032563_001 from group 063 with the active monitoring preview transform."
         scan["preview_warning"] = None
         return "/tmp/roi-preview.jpg"
 
@@ -2508,6 +2892,48 @@ def test_hero_camera_strategy_matches_to_selected_hero() -> None:
     assert other_clip["color_cdl"]["saturation"] != pytest.approx(1.0)
 
 
+def test_manual_target_strategy_records_explicit_anchor_metadata() -> None:
+    records = [
+        {
+            "clip_id": "G007_A063_032563_001",
+            "group_key": "array_batch",
+            "source_path": "/tmp/G007_A063_032563_001.R3D",
+            "confidence": 0.9,
+            "flags": [],
+            "diagnostics": {
+                "measured_log2_luminance_monitoring": -1.3,
+                "measured_log2_luminance_raw": -1.3,
+                "measured_rgb_chromaticity": [0.34, 0.33, 0.33],
+            },
+        },
+        {
+            "clip_id": "I007_D063_0325EZ_001",
+            "group_key": "array_batch",
+            "source_path": "/tmp/I007_D063_0325EZ_001.R3D",
+            "confidence": 0.9,
+            "flags": [],
+            "diagnostics": {
+                "measured_log2_luminance_monitoring": -1.7,
+                "measured_log2_luminance_raw": -1.7,
+                "measured_rgb_chromaticity": [0.33, 0.33, 0.34],
+            },
+        },
+    ]
+    strategy = _build_strategy_payloads(
+        records,
+        target_strategies=["manual-target"],
+        reference_clip_id=None,
+        manual_target_ire=39.0,
+        exposure_anchor_mode="manual_target",
+    )[0]
+    assert strategy["strategy_key"] == "manual_target"
+    assert strategy["anchor_mode"] == "manual_target"
+    assert strategy["anchor_source"] == "39 IRE"
+    assert strategy["anchor_scalar_value"] == pytest.approx(np.log2(39.0 / 100.0))
+    assert "Manual target 39 IRE" in strategy["anchor_summary"]
+    assert strategy["clips"][0]["camera_offset_from_anchor"] == pytest.approx(strategy["clips"][0]["exposure_offset_stops"])
+
+
 def test_analyze_path_writes_manifest_and_sidecar(tmp_path: Path) -> None:
     clip_a = tmp_path / "G007_D060_0324M6_001.R3D"
     clip_b = tmp_path / "G007_D061_0324M6_002.R3D"
@@ -2519,6 +2945,38 @@ def test_analyze_path_writes_manifest_and_sidecar(tmp_path: Path) -> None:
     assert clip_summary["group_key"] == derive_array_group_key(str(tmp_path))
     assert sidecar_payload["rmd_name"] == f"{clip_summary['clip_id']}.RMD"
     assert (tmp_path / "out" / "array_calibration.json").exists()
+
+
+def test_review_calibration_command_passes_explicit_anchor_options(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_review_calibration(input_path: str, **kwargs: object) -> dict[str, object]:
+        captured["input_path"] = input_path
+        captured.update(kwargs)
+        return {"status": "ok"}
+
+    monkeypatch.setattr("r3dmatch.cli.review_calibration", fake_review_calibration)
+    result = runner.invoke(
+        app,
+        [
+            "review-calibration",
+            str(tmp_path),
+            "--out",
+            str(tmp_path / "out"),
+            "--target-type",
+            "gray_sphere",
+            "--review-mode",
+            "lightweight_analysis",
+            "--exposure-anchor-mode",
+            "manual-target",
+            "--manual-target-ire",
+            "39",
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert captured["exposure_anchor_mode"] == "manual_target"
+    assert captured["manual_target_ire"] == pytest.approx(39.0)
+    assert "manual_target" in list(captured["target_strategies"])
 
 
 def test_sidecar_to_rmd_conversion_exposure_only() -> None:
@@ -2777,7 +3235,7 @@ def test_measure_frame_color_and_exposure_uses_refined_sphere_sampling_for_gray_
     assert measurement["measured_log2_luminance_raw"] == pytest.approx(np.log2(0.25), abs=0.12)
     comparison = measurement["sphere_sampling_comparison"]
     assert comparison["legacy"]["raw_log2"] > comparison["refined"]["raw_log2"]
-    assert measurement["calibration_measurement_mode"] == "gray_sphere_refined_circle"
+    assert measurement["calibration_measurement_mode"] == "gray_sphere_three_zone_profile"
 
 
 def test_sphere_calibration_grouping_uses_group_key(tmp_path: Path) -> None:
@@ -3515,7 +3973,7 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert report_json["exposure_measurement_domain"] == "scene"
     assert report_json["preview_mode"] == "monitoring"
     assert report_json["preview_settings"]["lut_path"].endswith("show.cube")
-    assert report_json["measurement_preview_settings"]["preview_mode"] == "calibration"
+    assert report_json["measurement_preview_settings"]["preview_mode"] == "monitoring"
     assert report_json["redline_capabilities"]["supports_lut"] is True
     assert report_json["calibration_roi"] == {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4}
     assert report_json["target_strategies"] == ["median", "optimal_exposure"]
@@ -3527,6 +3985,11 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert report_json["ipp2_validation"]["contact_sheet_preview_matches_validation"] is False
     assert report_json["strategies"][0]["clips"][0]["metrics"]["preview_transform"] == report_json["preview_transform"]
     assert report_json["strategies"][0]["clips"][0]["ipp2_validation"]["status"] in {"PASS", "REVIEW", "FAIL"}
+    assert "ipp2_gray_exposure_summary" in report_json["strategies"][0]["clips"][0]["ipp2_validation"]
+    assert "ipp2_target_gray_exposure_summary" in report_json["strategies"][0]["clips"][0]["ipp2_validation"]
+    assert isinstance(report_json["strategies"][0]["clips"][0]["ipp2_validation"].get("ipp2_zone_residuals"), list)
+    assert "operator_guidance" in report_json["strategies"][0]["clips"][0]["ipp2_validation"]
+    assert report_json["strategies"][0]["clips"][0]["ipp2_validation"]["operator_guidance"]["direction"] in {"open", "close", "hold"}
     assert "initial_offset_stops" in report_json["strategies"][0]["clips"][0]["metrics"]["exposure"]
     assert "ipp2_closed_loop_iterations" in report_json["strategies"][0]["clips"][0]["metrics"]["exposure"]
     assert "measured_log2_luminance_monitoring" in report_json["strategies"][0]["clips"][0]["metrics"]["exposure"]
@@ -3535,19 +3998,19 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert not list((tmp_path / "analysis-out" / "previews").glob("*.000000.jpg"))
     preview_commands = json.loads((tmp_path / "analysis-out" / "previews" / "preview_commands.json").read_text(encoding="utf-8"))
     exposure_command = next(command for command in preview_commands["commands"] if command["variant"] == "exposure" and command["strategy"] == "median")
-    assert exposure_command["application_method"] == "rmd"
+    assert exposure_command["application_method"] == "direct_redline_flags"
     assert exposure_command["look_metadata_path"].endswith("/review_rmd/strategies/median/exposure/G007_D060_0324M6_001.RMD")
     assert Path(exposure_command["look_metadata_path"]).exists()
-    assert "--loadRMD" in exposure_command["command"]
-    assert "--exposure" not in exposure_command["command"]
-    assert "--useMeta" not in exposure_command["command"]
+    assert "--useMeta" in exposure_command["command"]
+    assert "--exposureAdjust" in exposure_command["command"]
+    assert "--loadRMD" not in exposure_command["command"]
     assert "--lut" in exposure_command["command"]
     strategy_command = next(command for command in preview_commands["commands"] if command["variant"] == "both" and command["strategy"] == "median")
     assert strategy_command["application_method"] == "preview_color_disabled"
     assert strategy_command["preview_color_applied"] is False
     assert strategy_command["output_reused_from_variant"] == "exposure"
     assert strategy_command["validation_method"] == "preview_fallback_copy"
-    assert strategy_command["correction_application_method"] == "rmd"
+    assert strategy_command["correction_application_method"] == "preview_color_disabled"
     assert strategy_command["command"] is None
     assert strategy_command["rmd_path"].endswith("/review_rmd/strategies/median/both/G007_D060_0324M6_001.RMD")
     assert Path(strategy_command["rmd_path"]).exists()
@@ -3555,14 +4018,18 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert report_json["color_preview_status"] == "disabled_unverified"
     html = Path(payload["report_html"]).read_text(encoding="utf-8")
     assert "Color preview" in html
-    assert "IPP2 residual after correction" in html
+    assert "Gray Exposure" in html
+    assert "aperture" in html
+    assert "Digital correction applied" in html
+    assert "What To Look For" in html
+    assert "Exposure Summary" in html
+    assert "Recommended Action" in html
     assert "G007_D060_0324M6_001" in html
-    assert "Render proof" in html
     assert "../previews/G007_D060_0324M6_001.original.review.analysis-out.jpg" in html
     assert "both.review.median.analysis-out.jpg" in html
     assert payload["preview_mode"] == "monitoring"
     assert payload["preview_settings"]["lut_path"].endswith("show.cube")
-    assert payload["measurement_preview_settings"]["preview_mode"] == "calibration"
+    assert payload["measurement_preview_settings"]["preview_mode"] == "monitoring"
     assert payload["redline_capabilities"]["supports_lut"] is True
 
 
@@ -3600,7 +4067,7 @@ def test_report_contact_sheet_requires_real_redline_for_strict_validation(tmp_pa
         )
 
 
-def test_contact_sheet_report_honors_requested_calibration_preview_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_contact_sheet_report_treats_calibration_preview_mode_as_monitoring_alias(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_redline(monkeypatch)
     clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
     clip_path.write_bytes(b"")
@@ -3626,15 +4093,17 @@ def test_contact_sheet_report_honors_requested_calibration_preview_mode(tmp_path
     report_json = json.loads(Path(payload["report_json"]).read_text(encoding="utf-8"))
     preview_commands = json.loads((tmp_path / "analysis-out" / "previews" / "preview_commands.json").read_text(encoding="utf-8"))
     original_command = next(command for command in preview_commands["commands"] if command["variant"] == "original")
-    assert report_json["preview_mode"] == "calibration"
-    assert report_json["preview_settings"]["output_space"] == "REDWideGamutRGB"
-    assert report_json["preview_settings"]["output_gamma"] == "Log3G10"
-    assert report_json["ipp2_validation"]["contact_sheet_preview_matches_validation"] is False
+    assert report_json["preview_mode"] == "monitoring"
+    assert report_json["preview_settings"]["requested_preview_mode"] == "calibration"
+    assert report_json["preview_settings"]["preview_mode_alias"] == "calibration_compatibility_alias_to_monitoring"
+    assert report_json["preview_settings"]["output_space"] == "BT.709"
+    assert report_json["preview_settings"]["output_gamma"] == "BT.1886"
+    assert report_json["ipp2_validation"]["contact_sheet_preview_matches_validation"] is True
     assert Path(report_json["ipp2_validation_path"]).exists()
     assert "--colorSpace" in original_command["command"]
-    assert original_command["command"][original_command["command"].index("--colorSpace") + 1] == "25"
+    assert original_command["command"][original_command["command"].index("--colorSpace") + 1] == "13"
     assert "--gammaCurve" in original_command["command"]
-    assert original_command["command"][original_command["command"].index("--gammaCurve") + 1] == "34"
+    assert original_command["command"][original_command["command"].index("--gammaCurve") + 1] == "32"
 
 
 def test_lightweight_analysis_report_generates_customer_facing_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4002,6 +4471,7 @@ def test_render_contact_sheet_html_uses_logo_and_dynamic_grid(tmp_path: Path) ->
         "target_type": "gray_sphere",
         "processing_mode": "both",
         "preview_transform": "REDLine IPP2 / BT.709 / BT.1886 / Medium / Medium",
+        "exposure_anchor_summary": "Exposure Anchor: Hero clip CAM001",
         "clip_count": 3,
         "calibration_roi": {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
         "shared_originals": [
@@ -4017,6 +4487,7 @@ def test_render_contact_sheet_html_uses_logo_and_dynamic_grid(tmp_path: Path) ->
                 "strategy_key": "median",
                 "strategy_label": "Median",
                 "reference_clip_id": None,
+                "anchor_summary": "Exposure Anchor: Hero clip CAM001",
                 "target_log2_luminance": -2.8,
                 "calibration_roi": {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
                 "clips": [
@@ -4043,14 +4514,23 @@ def test_render_contact_sheet_html_uses_logo_and_dynamic_grid(tmp_path: Path) ->
     html = render_contact_sheet_html(payload)
     assert "R3DMatch Review Contact Sheet" in html
     assert "brand-logo" in html
-    assert "grid cols-3" in html
+    assert "grid cols-2" in html or "grid cols-3" in html
     assert "../previews/CAM001.original.review.run01.jpg" in html
     assert "../previews/CAM001.both.review.median.run01.jpg" in html
     assert "status-chip" in html
-    assert "IPP2 residual after correction" in html
-    assert "Render proof" in html
+    assert "Gray Exposure" in html
+    assert "Exposure Summary" in html
+    assert "Result" in html
+    assert "Recommended Action" in html
+    assert "What To Look For" in html
+    assert "IPP2 is the only acceptance domain" in html
+    assert "Exposure Anchor" in html
+    assert "Hero clip CAM001" in html
+    assert "Offset to Anchor" in html
+    assert "Confidence:" not in html
+    assert "Zone residuals" not in html
     assert "font-size:30px" in html
-    assert "font-size: 24px" in html
+    assert "font-size: 21px" in html
 
 
 def test_render_contact_sheet_pdf_paginates_large_camera_counts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4130,6 +4610,9 @@ def test_report_preview_keeps_rmd_as_canonical_path_without_printmeta_validation
                     "--loadRMD <filename>",
                     "--useRMD <int>",
                     "--exposure <float>",
+                    "--exposureAdjust <float>",
+                    "--kelvin <int>",
+                    "--tint <float>",
                     "--redGain <float>",
                     "--greenGain <float>",
                     "--blueGain <float>",
@@ -4147,29 +4630,18 @@ def test_report_preview_keeps_rmd_as_canonical_path_without_printmeta_validation
         output_path = Path(command[command.index("--o") + 1])
         generated_path = output_path.with_name(f"{output_path.name}.000000.jpg")
         generated_path.parent.mkdir(parents=True, exist_ok=True)
-        exposure = 0.0
-        red_gain = 1.0
-        green_gain = 1.0
-        blue_gain = 1.0
-        if "--loadRMD" in command:
-            rmd_path = Path(command[command.index("--loadRMD") + 1])
-            rmd_payload = json.loads(rmd_path.read_text(encoding="utf-8"))
-            exposure = float(rmd_payload.get("exposure", 0.0) or 0.0)
-            gains = rmd_payload.get("rgb_gains")
-            if gains:
-                red_gain = float(gains[0])
-                green_gain = float(gains[1])
-                blue_gain = float(gains[2])
-        elif "--exposure" in command:
-            exposure = float(command[command.index("--exposure") + 1])
-            red_gain = float(command[command.index("--redGain") + 1]) if "--redGain" in command else 1.0
-            green_gain = float(command[command.index("--greenGain") + 1]) if "--greenGain" in command else 1.0
-            blue_gain = float(command[command.index("--blueGain") + 1]) if "--blueGain" in command else 1.0
-        image = np.zeros((18, 32, 3), dtype=np.uint8)
-        image[..., 0] = np.clip(70.0 * (2.0**exposure) * red_gain, 0, 255)
-        image[..., 1] = np.clip(80.0 * (2.0**exposure) * green_gain, 0, 255)
-        image[..., 2] = np.clip(90.0 * (2.0**exposure) * blue_gain, 0, 255)
-        Image.fromarray(image, mode="RGB").save(generated_path, format="JPEG")
+        state = _fake_redline_command_state(command)
+        image = _fake_redline_base_image(command)
+        image = _apply_fake_redline_direct_controls(
+            image,
+            kelvin=cast(Optional[int], state["kelvin"]),
+            tint=float(state["tint"]),
+        )
+        image[..., 0] = np.clip(image[..., 0] * (2.0 ** float(state["exposure"])) * float(state["red_gain"]), 0.0, 1.0)
+        image[..., 1] = np.clip(image[..., 1] * (2.0 ** float(state["exposure"])) * float(state["green_gain"]), 0.0, 1.0)
+        image[..., 2] = np.clip(image[..., 2] * (2.0 ** float(state["exposure"])) * float(state["blue_gain"]), 0.0, 1.0)
+        image_u8 = np.clip(image * 255.0, 0.0, 255.0).astype(np.uint8)
+        Image.fromarray(image_u8, mode="RGB").save(generated_path, format="JPEG")
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("r3dmatch.report.run_cancellable_subprocess", fake_run)
@@ -4210,8 +4682,9 @@ def test_report_preview_keeps_rmd_as_canonical_path_without_printmeta_validation
     )
     preview_commands = json.loads((tmp_path / "analysis-out" / "previews" / "preview_commands.json").read_text(encoding="utf-8"))
     exposure_command = next(command for command in preview_commands["commands"] if command["variant"] == "exposure" and command["strategy"] == "median")
-    assert "--loadRMD" in exposure_command["command"]
-    assert "--useRMD" in exposure_command["command"]
+    assert "--useMeta" in exposure_command["command"]
+    assert "--exposureAdjust" in exposure_command["command"]
+    assert "--loadRMD" not in exposure_command["command"]
     strategy_command = next(command for command in preview_commands["commands"] if command["variant"] == "both" and command["strategy"] == "median")
     assert strategy_command["mode"] == "corrected"
     assert strategy_command["command"] is None
@@ -4226,9 +4699,9 @@ def test_render_preview_frame_corrected_image_differs_from_baseline(tmp_path: Pa
     clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
     clip_path.write_bytes(b"")
     settings = {
-        "preview_mode": "calibration",
-        "output_space": "REDWideGamutRGB",
-        "output_gamma": "Log3G10",
+        "preview_mode": "monitoring",
+        "output_space": "BT.709",
+        "output_gamma": "BT.1886",
         "highlight_rolloff": "medium",
         "shadow_rolloff": "medium",
         "output_tonemap": "medium",
@@ -4352,9 +4825,14 @@ def test_contact_sheet_report_writes_corrected_residual_validation_from_correcte
     assert strategy_clip["corrected_residual_validation"]["clip_id"] == row["clip_id"]
     assert strategy_clip["ipp2_validation"]["clip_id"] == row["clip_id"]
     assert "log_vs_ipp2_residual_delta_stops" in strategy_clip["ipp2_validation"]
+    assert strategy_clip["ipp2_validation"]["operator_guidance"]["status"] in {"PASS", "REVIEW", "FAIL", "OUTLIER"}
+    assert "suggested_action" in strategy_clip["ipp2_validation"]
+    assert "operator_status" in strategy_clip["ipp2_validation"]
     html = Path(payload["report_html"]).read_text(encoding="utf-8")
-    assert "IPP2 residual after correction" in html
-    assert "PASS" in html or "REVIEW" in html or "FAIL" in html
+    assert "Gray Exposure" in html
+    assert "aperture" in html
+    assert "Recommended Action" in html
+    assert "In range" in html or "Needs adjustment" in html or "Outside tolerance" in html
 
 
 def test_contact_sheet_report_writes_sampling_and_solve_comparison_for_gray_sphere(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4802,6 +5280,79 @@ def test_apply_calibration_payload_dry_run_uses_inventory_targets(tmp_path: Path
     assert result["results"][0]["status"] == "dry_run"
     assert result["results"][0]["readback"]["kelvin"] == 5663
     assert Path(result["report_path"]).exists()
+    assert Path(result["post_apply_verification_path"]).exists()
+
+
+def test_apply_calibration_payload_enforces_kelvin_tint_exposure_order(tmp_path: Path) -> None:
+    payload = {
+        "schema_version": "r3dmatch_rcp2_ready_v1",
+        "camera_id": "G007_A065",
+        "clip_id": "G007_A065_0325F6_001",
+        "inventory_camera_label": "GA",
+        "inventory_camera_ip": "172.20.114.165",
+        "format": "rcp2_ready",
+        "calibration": {"exposureAdjust": -0.75, "kelvin": 5663, "tint": -0.2},
+        "confidence": 0.68,
+        "is_hero_camera": False,
+        "notes": [],
+    }
+    payload_path = tmp_path / "GA-order.json"
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    class OrderedTransport:
+        mode = "live"
+
+        def __init__(self) -> None:
+            self.writes = []
+
+        def open(self, *, host: str, port: int, camera_label: str) -> dict:
+            return {"host": host, "port": port, "camera_label": camera_label, "state": {"exposureAdjust": 0.0, "kelvin": 5600, "tint": 0.0}}
+
+        def close(self, session: object) -> None:
+            return None
+
+        def read_state(self, session: object) -> dict:
+            return dict((session or {}).get("state") or {})
+
+        def write_state(self, session: object, values: dict) -> None:
+            self.writes.append(dict(values))
+            session["state"] = dict(values)
+
+    transport = OrderedTransport()
+    result = apply_calibration_payload(str(payload_path), transport=transport)
+    row = result["results"][0]
+    assert row["status"] == "applied_successfully"
+    assert [step["field_name"] for step in row["camera_verification"]["write_sequence_trace"]] == ["kelvin", "tint", "exposureAdjust"]
+    assert transport.writes[0] == {"exposureAdjust": 0.0, "kelvin": 5663, "tint": 0.0}
+    assert transport.writes[1] == {"exposureAdjust": 0.0, "kelvin": 5663, "tint": -0.2}
+    assert transport.writes[2] == {"exposureAdjust": -0.75, "kelvin": 5663, "tint": -0.2}
+
+
+def test_apply_calibration_payload_stops_on_first_field_verification_failure(tmp_path: Path) -> None:
+    payload = {
+        "schema_version": "r3dmatch_rcp2_ready_v1",
+        "camera_id": "H007_D065",
+        "clip_id": "H007_D065_0325CS_001",
+        "inventory_camera_label": "HD",
+        "inventory_camera_ip": "172.20.114.172",
+        "format": "rcp2_ready",
+        "calibration": {"exposureAdjust": 0.9, "kelvin": 5663, "tint": 0.7},
+        "confidence": 0.71,
+        "is_hero_camera": False,
+        "notes": [],
+    }
+    payload_path = tmp_path / "HD-stop.json"
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    transport = MemoryRcp2Transport(
+        initial_states={"172.20.114.172": {"exposureAdjust": 0.0, "kelvin": 5600, "tint": 0.0}},
+        readback_overrides={"172.20.114.172": {"exposureAdjust": 0.0, "kelvin": 5900, "tint": 0.0}},
+    )
+    result = apply_calibration_payload(str(payload_path), transport=transport)
+    row = result["results"][0]
+    assert row["status"] == "mismatch_after_writeback"
+    assert row["camera_verification"]["verification_summary"]["mismatched_fields"] == ["kelvin"]
+    assert [step["field_name"] for step in row["camera_verification"]["write_sequence_trace"]] == ["kelvin"]
+    assert row["verification"]["mismatched_fields"] == ["kelvin"]
 
 
 def test_apply_calibration_payload_reports_readback_mismatch(tmp_path: Path) -> None:
@@ -4824,6 +5375,7 @@ def test_apply_calibration_payload_reports_readback_mismatch(tmp_path: Path) -> 
     assert result["status"] == "failed"
     assert result["results"][0]["status"] == "mismatch_after_writeback"
     assert result["results"][0]["verification"]["mismatched_fields"] == ["kelvin"]
+    assert result["results"][0]["camera_verification"]["verification_summary"]["mismatched_fields"] == ["kelvin"]
 
 
 def test_apply_calibration_payload_retries_once_after_timeout_then_succeeds(tmp_path: Path) -> None:
@@ -4869,6 +5421,73 @@ def test_apply_calibration_payload_retries_once_after_timeout_then_succeeds(tmp_
     assert len(result["results"][0]["attempts"]) == 2
     assert result["results"][0]["attempts"][0]["failure_reason"] == "timeout"
     assert result["results"][0]["attempts"][1]["status"] == "applied_successfully"
+
+
+def test_apply_calibration_payload_records_timeout_field_verification(tmp_path: Path) -> None:
+    payload = {
+        "schema_version": "r3dmatch_rcp2_ready_v1",
+        "camera_id": "G007_A065",
+        "clip_id": "G007_A065_0325F6_001",
+        "inventory_camera_label": "GA",
+        "inventory_camera_ip": "172.20.114.165",
+        "format": "rcp2_ready",
+        "calibration": {"exposureAdjust": -0.821145, "kelvin": 5663, "tint": -0.2},
+        "confidence": 0.68,
+        "is_hero_camera": False,
+        "notes": [],
+    }
+    payload_path = tmp_path / "GA-timeout-field.json"
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    class TimeoutFieldTransport:
+        mode = "live"
+
+        def open(self, *, host: str, port: int, camera_label: str) -> dict:
+            return {"host": host, "port": port, "camera_label": camera_label}
+
+        def close(self, session: object) -> None:
+            return None
+
+        def read_state(self, session: object) -> dict:
+            return {"exposureAdjust": 0.0, "kelvin": 5600, "tint": 0.0}
+
+        def write_state(self, session: object, values: dict) -> None:
+            return None
+
+        def apply_state_transactionally(self, session: object, values: dict, **kwargs) -> dict:
+            del session, values, kwargs
+            return {
+                "before_state": {"exposureAdjust": 0.0, "kelvin": 5600, "tint": 0.0},
+                "final_readback": {"exposureAdjust": 0.0, "kelvin": 5600, "tint": 0.0},
+                "per_field": {
+                    "kelvin": {
+                        "field_name": "kelvin",
+                        "requested_value": 5663,
+                        "applied_value": None,
+                        "delta": None,
+                        "verification_status": "TIMEOUT",
+                    }
+                },
+                "write_sequence_trace": [{"field_name": "kelvin", "verification_status": "TIMEOUT"}],
+                "verification_summary": {
+                    "mismatched_fields": [],
+                    "timeout_fields": ["kelvin"],
+                    "unavailable_fields": [],
+                    "exact_match_fields": [],
+                    "within_tolerance_fields": [],
+                    "all_verified": False,
+                    "final_status": "TIMEOUT",
+                },
+                "final_status": "TIMEOUT",
+                "histogram_guard": {"enabled": False, "status": "not_run"},
+                "clip_metadata_cross_check": {"status": "not_run"},
+            }
+
+    result = apply_calibration_payload(str(payload_path), transport=TimeoutFieldTransport(), retry_count=0)
+    row = result["results"][0]
+    assert row["status"] == "timeout"
+    assert row["failure_reason"] == "timeout"
+    assert row["camera_verification"]["verification_summary"]["timeout_fields"] == ["kelvin"]
 
 
 def test_apply_calibration_payload_reports_timeout_and_generates_full_report(tmp_path: Path) -> None:
@@ -5160,6 +5779,130 @@ def test_cli_test_rcp2_write_uses_helper(monkeypatch: pytest.MonkeyPatch) -> Non
     assert calls["kwargs"]["port"] == 9998
     assert calls["kwargs"]["field_name"] == "exposureAdjust"
     assert calls["kwargs"]["transport_kind"] == "websocket"
+
+
+def test_websocket_transaction_uses_ordered_set_get_verify_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport = WebSocketRcp2Transport()
+    session = Rcp2WebSocketSession(sock=object(), host="10.0.0.1", port=9998)
+    current = {
+        "kelvin": Rcp2ParameterState("COLOR_TEMPERATURE", 5600, 1, 5600.0, "5600", {"divider": 1, "min": 2000, "max": 10000}, []),
+        "tint": Rcp2ParameterState("TINT", 0, 1000, 0.0, "0.0", {"divider": 1000, "min": -10000, "max": 10000}, []),
+        "exposureAdjust": Rcp2ParameterState("EXPOSURE_ADJUST", 0, 1000, 0.0, "0.0", {"divider": 1000, "min": -3000, "max": 3000}, []),
+    }
+    call_order = []
+
+    def fake_read_state(_session: object) -> dict:
+        return {
+            "exposureAdjust": current["exposureAdjust"].value,
+            "kelvin": int(round(current["kelvin"].value)),
+            "tint": current["tint"].value,
+        }
+
+    def fake_read_parameter_state(_session: object, field_name: str) -> Rcp2ParameterState:
+        call_order.append(("get", field_name))
+        return current[field_name]
+
+    def fake_write_parameter_state(_session: object, field_name: str, raw_value: int) -> Rcp2ParameterState:
+        call_order.append(("set", field_name, raw_value))
+        state = current[field_name]
+        current[field_name] = Rcp2ParameterState(
+            parameter_id=normalize_parameter_id(state.parameter_id),
+            raw_value=raw_value,
+            divider=state.divider,
+            value=float(raw_value) / float(state.divider),
+            display=str(float(raw_value) / float(state.divider)),
+            edit_info=state.edit_info,
+            messages=[],
+        )
+        return current[field_name]
+
+    monkeypatch.setattr(transport, "read_state", fake_read_state)
+    monkeypatch.setattr(transport, "_read_parameter_state", fake_read_parameter_state)
+    monkeypatch.setattr(transport, "_write_parameter_state", fake_write_parameter_state)
+
+    result = transport.apply_state_transactionally(
+        session,
+        {"exposureAdjust": -0.25, "kelvin": 5663, "tint": -0.2},
+    )
+    assert [step["field_name"] for step in result["write_sequence_trace"]] == ["kelvin", "tint", "exposureAdjust"]
+    assert call_order == [
+        ("get", "kelvin"),
+        ("set", "kelvin", 5663),
+        ("get", "kelvin"),
+        ("get", "tint"),
+        ("set", "tint", -200),
+        ("get", "tint"),
+        ("get", "exposureAdjust"),
+        ("set", "exposureAdjust", -250),
+        ("get", "exposureAdjust"),
+    ]
+    assert result["verification_summary"]["final_status"] == "VERIFIED"
+
+
+def test_websocket_transaction_marks_invalid_input_when_histogram_clipping_detected(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport = WebSocketRcp2Transport()
+    session = Rcp2WebSocketSession(sock=object(), host="10.0.0.1", port=9998)
+    monkeypatch.setattr(transport, "read_state", lambda _session: {"exposureAdjust": 0.0, "kelvin": 5600, "tint": 0.0})
+    monkeypatch.setattr(
+        transport,
+        "_best_effort_histogram_guard",
+        lambda _session: {"enabled": True, "status": "success", "clipping_detected": True, "note": "Clipping detected on gray reference — measurement invalid"},
+    )
+    result = transport.apply_state_transactionally(
+        session,
+        {"exposureAdjust": 0.0, "kelvin": 5600, "tint": 0.0},
+        enable_histogram_guard=True,
+    )
+    assert result["verification_summary"]["final_status"] == "INVALID_INPUT"
+    assert result["histogram_guard"]["clipping_detected"] is True
+
+
+def test_websocket_transaction_includes_clip_metadata_cross_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport = WebSocketRcp2Transport()
+    session = Rcp2WebSocketSession(sock=object(), host="10.0.0.1", port=9998)
+    current = {
+        "kelvin": Rcp2ParameterState("COLOR_TEMPERATURE", 5600, 1, 5600.0, "5600", {"divider": 1, "min": 2000, "max": 10000}, []),
+        "tint": Rcp2ParameterState("TINT", 0, 1000, 0.0, "0.0", {"divider": 1000, "min": -10000, "max": 10000}, []),
+        "exposureAdjust": Rcp2ParameterState("EXPOSURE_ADJUST", 0, 1000, 0.0, "0.0", {"divider": 1000, "min": -3000, "max": 3000}, []),
+    }
+
+    def fake_read_state(_session: object) -> dict:
+        return {
+            "exposureAdjust": current["exposureAdjust"].value,
+            "kelvin": int(round(current["kelvin"].value)),
+            "tint": current["tint"].value,
+        }
+
+    def fake_read_parameter_state(_session: object, field_name: str) -> Rcp2ParameterState:
+        return current[field_name]
+
+    def fake_write_parameter_state(_session: object, field_name: str, raw_value: int) -> Rcp2ParameterState:
+        state = current[field_name]
+        current[field_name] = Rcp2ParameterState(
+            parameter_id=normalize_parameter_id(state.parameter_id),
+            raw_value=raw_value,
+            divider=state.divider,
+            value=float(raw_value) / float(state.divider),
+            display=str(float(raw_value) / float(state.divider)),
+            edit_info=state.edit_info,
+            messages=[],
+        )
+        return current[field_name]
+
+    monkeypatch.setattr(transport, "read_state", fake_read_state)
+    monkeypatch.setattr(transport, "_read_parameter_state", fake_read_parameter_state)
+    monkeypatch.setattr(transport, "_write_parameter_state", fake_write_parameter_state)
+    monkeypatch.setattr(
+        transport,
+        "_best_effort_clip_metadata",
+        lambda _session, _state: {"status": "success", "metadata_match_status": "WITHIN_TOLERANCE", "fields": {"kelvin": {"status": "WITHIN_TOLERANCE"}}},
+    )
+    result = transport.apply_state_transactionally(
+        session,
+        {"exposureAdjust": 0.0, "kelvin": 5663, "tint": 0.0},
+        include_clip_metadata_cross_check=True,
+    )
+    assert result["clip_metadata_cross_check"]["metadata_match_status"] == "WITHIN_TOLERANCE"
 
 
 def test_summarize_apply_report_uses_operator_tolerances() -> None:

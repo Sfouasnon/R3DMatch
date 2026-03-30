@@ -158,7 +158,7 @@ class R3DMatchDesktopApp:
         self.roi_w = tk.StringVar()
         self.roi_h = tk.StringVar()
         self.reference_clip_id = tk.StringVar()
-        self.preview_mode = tk.StringVar(value="calibration")
+        self.preview_mode = tk.StringVar(value="monitoring")
         self.preview_lut = tk.StringVar()
         self.status_text = tk.StringVar(value="Select a calibration folder containing RED clips.")
         self.source_summary_text = tk.StringVar(value="Found 0 RED clips")
@@ -246,7 +246,7 @@ class R3DMatchDesktopApp:
         self.reference_entry.pack(fill="x")
 
         preview = self._section(content, "Preview")
-        self._labeled_combobox(preview, "Preview Mode", self.preview_mode, ["calibration", "monitoring"])
+        self._labeled_combobox(preview, "Preview Mode", self.preview_mode, ["monitoring"])
         ttk.Label(preview, text="LUT (.cube)").pack(anchor="w", pady=(8, 0))
         lut_row = ttk.Frame(preview)
         lut_row.pack(fill="x", pady=(4, 0))

@@ -544,7 +544,7 @@ PAGE_TEMPLATE = """
         <div class="field">
           <label for="preview_mode">Preview Mode</label>
           <select id="preview_mode" name="preview_mode">
-            {% for value in ['calibration', 'monitoring'] %}
+            {% for value in ['monitoring'] %}
               <option value="{{ value }}" {% if form.preview_mode == value %}selected{% endif %}>{{ value }}</option>
             {% endfor %}
           </select>
@@ -1357,7 +1357,7 @@ def _default_form() -> Dict[str, object]:
         "reference_clip_id": "",
         "hero_clip_id": "",
         "review_mode": "full_contact_sheet",
-        "preview_mode": "calibration",
+        "preview_mode": "monitoring",
         "preview_lut": "",
         "apply_cameras": "",
         "verification_after_path": "",
@@ -2430,16 +2430,54 @@ def _render_apply_surface(surface: Dict[str, object]) -> str:
         operator_result = dict(row.get("operator_result") or {})
         requested = dict(row.get("requested") or {})
         readback = dict(row.get("readback") or {})
+        camera_verification = dict(row.get("camera_verification") or {})
+        verification_summary = dict(camera_verification.get("verification_summary") or {})
+        per_field = dict(camera_verification.get("per_field") or {})
         deviations = dict(operator_result.get("deviations") or {})
         failure_reason = str(row.get("failure_reason") or "")
+        verified = bool((row.get("verification") or {}).get("matches")) if isinstance(row.get("verification"), dict) else False
+        exposure_requested = float(requested.get("exposureAdjust", 0.0) or 0.0) if requested else None
+        kelvin_requested = int(requested.get("kelvin", 0) or 0) if requested else None
+        tint_requested = float(requested.get("tint", 0.0) or 0.0) if requested else None
+        exposure_applied = float(readback.get("exposureAdjust", 0.0) or 0.0) if readback else None
+        kelvin_applied = int(readback.get("kelvin", 0) or 0) if readback else None
+        tint_applied = float(readback.get("tint", 0.0) or 0.0) if readback else None
+        quantization_notes = []
+        if exposure_requested is not None and exposure_applied is not None and abs(exposure_applied - exposure_requested) > 1e-6:
+            quantization_notes.append(f"Exposure quantized by {_format_signed_value(exposure_applied - exposure_requested, decimals=3)}")
+        if kelvin_requested is not None and kelvin_applied is not None and kelvin_applied != kelvin_requested:
+            quantization_notes.append(f"Kelvin quantized by {kelvin_applied - kelvin_requested:+d}")
+        if tint_requested is not None and tint_applied is not None and abs(tint_applied - tint_requested) > 1e-6:
+            quantization_notes.append(f"Tint quantized by {_format_signed_value(tint_applied - tint_requested, decimals=3)}")
+        for field_name in ("kelvin", "tint", "exposureAdjust"):
+            field_result = dict(per_field.get(field_name) or {})
+            field_status = str(field_result.get("verification_status") or "").strip()
+            if field_status and field_status != "EXACT_MATCH":
+                quantization_notes.append(f"{field_name}: {field_status.lower().replace('_', ' ')}")
+        histogram_guard = dict(camera_verification.get("histogram_guard") or {})
+        if bool(histogram_guard.get("clipping_detected")):
+            quantization_notes.append("Gray reference clipping detected")
+        clip_metadata = dict(camera_verification.get("clip_metadata_cross_check") or {})
+        metadata_status = str(clip_metadata.get("metadata_match_status") or "").strip()
+        if metadata_status and metadata_status != "NOT_AVAILABLE":
+            quantization_notes.append(f"clip metadata: {metadata_status.lower().replace('_', ' ')}")
+        verification_label = (
+            str(verification_summary.get("final_status") or "").replace("_", " ").title()
+            or ("Verified" if verified else ("Not verified" if readback else "n/a"))
+        )
         body.append(
             "<tr>"
             f"<td>{html.escape(str(row.get('inventory_camera_label') or row.get('camera_id') or ''))}</td>"
             f"<td>{html.escape(str(operator_result.get('display_status') or row.get('status') or ''))}</td>"
             f"<td>{html.escape(failure_reason) if failure_reason else 'n/a'}</td>"
-            f"<td>{html.escape(json.dumps(requested, separators=(', ', ': ')))}</td>"
-            f"<td>{html.escape(json.dumps(readback, separators=(', ', ': '))) if readback else 'n/a'}</td>"
-            f"<td>{html.escape(json.dumps(deviations, separators=(', ', ': '))) if deviations else 'n/a'}</td>"
+            f"<td>{_format_signed_value(exposure_requested, decimals=3) if exposure_requested is not None else '—'}</td>"
+            f"<td>{_format_signed_value(exposure_applied, decimals=3) if exposure_applied is not None else '—'}</td>"
+            f"<td>{kelvin_requested if kelvin_requested is not None else '—'}</td>"
+            f"<td>{kelvin_applied if kelvin_applied is not None else '—'}</td>"
+            f"<td>{_format_signed_value(tint_requested, decimals=3) if tint_requested is not None else '—'}</td>"
+            f"<td>{_format_signed_value(tint_applied, decimals=3) if tint_applied is not None else '—'}</td>"
+            f"<td>{html.escape(verification_label)}</td>"
+            f"<td>{html.escape('; '.join(quantization_notes) if quantization_notes else (json.dumps(deviations, separators=(', ', ': ')) if deviations else 'Exact readback'))}</td>"
             f"<td>{html.escape(str(row.get('error') or ''))}</td>"
             "</tr>"
         )
@@ -2448,8 +2486,9 @@ def _render_apply_surface(surface: Dict[str, object]) -> str:
         f"<p class='surface-note'>Transport mode: {html.escape(str(surface.get('transport_mode') or ''))}. "
         f"Operator status: {html.escape(str(surface.get('operator_status') or surface.get('status') or ''))}. "
         f"Tolerances: {html.escape(json.dumps(surface.get('operator_tolerances') or {}, separators=(', ', ': ')))}.</p>"
+        "<p class='surface-copy'>Requested values are the intended writeback targets. Applied values come from camera readback, so any quantization is visible immediately.</p>"
         '<div class="table-wrap"><table class="data-table"><thead><tr>'
-        "<th>Camera</th><th>Display Status</th><th>Failure Reason</th><th>Requested</th><th>Readback</th><th>Deviation</th><th>Error</th>"
+        "<th>Camera</th><th>Display Status</th><th>Failure Reason</th><th>Requested Exposure</th><th>Applied Exposure</th><th>Requested Kelvin</th><th>Applied Kelvin</th><th>Requested Tint</th><th>Applied Tint</th><th>Readback Verified</th><th>Quantization / Deviation</th><th>Error</th>"
         "</tr></thead><tbody>"
         + "".join(body)
         + "</tbody></table></div>"
@@ -2662,12 +2701,13 @@ def _preferred_roi_preview_record(form: Dict[str, object], scan: Dict[str, objec
     return sorted(candidates, key=lambda item: str(item.get("clip_id") or ""))[0]
 
 
-def _scan_preview_path(input_path: str, *, clip_id: str = "", preview_mode: str = "calibration") -> Path:
+def _scan_preview_path(input_path: str, *, clip_id: str = "", preview_mode: str = "monitoring") -> Path:
+    normalized_preview_mode = "monitoring" if (preview_mode.strip().lower() if preview_mode else "monitoring") == "calibration" else (preview_mode.strip() or "monitoring")
     token_source = "|".join(
         [
             str(Path(input_path).expanduser().resolve()),
             clip_id.strip(),
-            preview_mode.strip() or "calibration",
+            normalized_preview_mode,
         ]
     )
     token = hashlib.sha1(token_source.encode("utf-8")).hexdigest()[:12]
@@ -2683,14 +2723,15 @@ def _ensure_scan_preview(input_path: str, scan: Dict[str, object], form: Optiona
         scan["preview_warning"] = "No representative clip frame was available for ROI preview."
         scan["preview_note"] = None
         return None
-    preview_mode = str(resolved_form.get("preview_mode") or "calibration")
+    preview_mode = str(resolved_form.get("preview_mode") or "monitoring")
     output_path = _scan_preview_path(str(input_path), clip_id=clip_id, preview_mode=preview_mode)
+    actual_preview_mode = preview_mode
     if output_path.exists():
         subset_group = str((record or {}).get("subset_group") or "")
         scan["preview_note"] = (
-            f"ROI preview uses {clip_id} from group {subset_group} with the active {preview_mode} preview transform."
+            f"ROI preview uses {clip_id} from group {subset_group} with the active {actual_preview_mode} preview transform."
             if clip_id and subset_group
-            else f"ROI preview uses {clip_id} with the active {preview_mode} preview transform."
+            else f"ROI preview uses {clip_id} with the active {actual_preview_mode} preview transform."
         )
         scan["preview_warning"] = None
         return str(output_path)
@@ -2704,11 +2745,24 @@ def _ensure_scan_preview(input_path: str, scan: Dict[str, object], form: Optiona
         preview_shadow_rolloff=None,
         preview_lut=None,
     )
+    actual_preview_mode = str(settings.get("preview_mode") or "monitoring")
+    kelvin_raw = resolved_form.get("kelvin", scan.get("kelvin", 5600))
+    tint_raw = resolved_form.get("tint", scan.get("tint", 0))
+    try:
+        kelvin = int(round(float(kelvin_raw if kelvin_raw not in (None, "") else 5600)))
+    except (TypeError, ValueError):
+        kelvin = 5600
+    try:
+        tint = float(tint_raw if tint_raw not in (None, "") else 0)
+    except (TypeError, ValueError):
+        tint = 0.0
     command = _build_redline_preview_command(
         clip_path,
         output_path=str(output_path),
         frame_index=0,
         exposure_stops=None,
+        kelvin=kelvin,
+        tint=tint,
         color_cdl=None,
         color_method=None,
         redline_executable=redline_executable,
@@ -2729,9 +2783,9 @@ def _ensure_scan_preview(input_path: str, scan: Dict[str, object], form: Optiona
     if output_path.exists():
         subset_group = str((record or {}).get("subset_group") or "")
         scan["preview_note"] = (
-            f"ROI preview uses {clip_id} from group {subset_group} with the active {preview_mode} preview transform."
+            f"ROI preview uses {clip_id} from group {subset_group} with the active {actual_preview_mode} preview transform."
             if clip_id and subset_group
-            else f"ROI preview uses {clip_id} with the active {preview_mode} preview transform."
+            else f"ROI preview uses {clip_id} with the active {actual_preview_mode} preview transform."
         )
         scan["preview_warning"] = None
         return str(output_path)
@@ -3620,7 +3674,7 @@ def create_app() -> Flask:
         candidate = _scan_preview_path(
             str(state.form.get("input_path", "")),
             clip_id=str((record or {}).get("clip_id") or ""),
-            preview_mode=str(state.form.get("preview_mode") or "calibration"),
+            preview_mode=str(state.form.get("preview_mode") or "monitoring"),
         )
         if not candidate.exists():
             return redirect(url_for("index"))

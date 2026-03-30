@@ -40,10 +40,12 @@ EXPOSURE_ADJUST_MAX = 4.0
 EXPOSURE_VERIFY_TOLERANCE = 0.001
 KELVIN_VERIFY_TOLERANCE = 50
 TINT_VERIFY_TOLERANCE = 0.5
+SAFE_FIELD_ORDER = ("kelvin", "tint", "exposureAdjust")
 OPERATOR_EXPOSURE_TOLERANCE = 0.01
 OPERATOR_KELVIN_TOLERANCE = 50
 OPERATOR_TINT_TOLERANCE = 0.01
 VERIFICATION_REPORT_SCHEMA = "r3dmatch_rcp2_verification_report_v1"
+TRANSACTIONAL_VERIFICATION_SCHEMA = "r3dmatch_rcp2_post_apply_verification_v1"
 
 
 class Rcp2ApplyError(RuntimeError):
@@ -232,6 +234,181 @@ def _prepare_calibration_values(calibration: Dict[str, object]) -> Dict[str, obj
     }
 
 
+def _verification_tolerance_for_field(field_name: str) -> float:
+    if field_name == "exposureAdjust":
+        return float(EXPOSURE_VERIFY_TOLERANCE)
+    if field_name == "kelvin":
+        return float(KELVIN_VERIFY_TOLERANCE)
+    if field_name == "tint":
+        return float(TINT_VERIFY_TOLERANCE)
+    raise KeyError(field_name)
+
+
+def _coerce_field_value(field_name: str, value: object) -> object:
+    if value is None:
+        return None
+    if field_name == "kelvin":
+        return int(round(float(value)))
+    return round(float(value), 6)
+
+
+def _field_delta(field_name: str, requested_value: object, applied_value: object) -> object:
+    if requested_value is None or applied_value is None:
+        return None
+    if field_name == "kelvin":
+        return int(round(float(applied_value) - float(requested_value)))
+    return round(float(applied_value) - float(requested_value), 6)
+
+
+def _field_verification_status(field_name: str, requested_value: object, applied_value: object) -> str:
+    if applied_value is None:
+        return "NOT_AVAILABLE"
+    delta = _field_delta(field_name, requested_value, applied_value)
+    if delta in {0, 0.0}:
+        return "EXACT_MATCH"
+    if abs(float(delta)) <= _verification_tolerance_for_field(field_name):
+        return "WITHIN_TOLERANCE"
+    return "MISMATCH"
+
+
+def _build_field_verification(
+    *,
+    field_name: str,
+    requested_value: object,
+    applied_value: object,
+    requested_raw_value: Optional[int] = None,
+    applied_raw_value: Optional[int] = None,
+    parameter_id: str = "",
+    verification_status: Optional[str] = None,
+    note: str = "",
+    set_action: str = "",
+) -> Dict[str, object]:
+    status = verification_status or _field_verification_status(field_name, requested_value, applied_value)
+    return {
+        "field_name": field_name,
+        "parameter_id": parameter_id or PARAMETER_SPECS[field_name].parameter_id,
+        "requested_value": _coerce_field_value(field_name, requested_value),
+        "applied_value": _coerce_field_value(field_name, applied_value),
+        "delta": _field_delta(field_name, requested_value, applied_value),
+        "requested_raw_value": requested_raw_value,
+        "applied_raw_value": applied_raw_value,
+        "tolerance": _verification_tolerance_for_field(field_name),
+        "verification_status": status,
+        "note": str(note or ""),
+        "set_action": str(set_action or ""),
+    }
+
+
+def _summarize_field_verifications(
+    per_field: Dict[str, Dict[str, object]],
+    *,
+    invalid_input: bool = False,
+) -> Dict[str, object]:
+    exact_fields: List[str] = []
+    tolerance_fields: List[str] = []
+    mismatched_fields: List[str] = []
+    timeout_fields: List[str] = []
+    unavailable_fields: List[str] = []
+    for field_name in SAFE_FIELD_ORDER:
+        result = dict(per_field.get(field_name) or {})
+        status = str(result.get("verification_status") or "NOT_AVAILABLE")
+        if status == "EXACT_MATCH":
+            exact_fields.append(field_name)
+        elif status == "WITHIN_TOLERANCE":
+            tolerance_fields.append(field_name)
+        elif status == "MISMATCH":
+            mismatched_fields.append(field_name)
+        elif status == "TIMEOUT":
+            timeout_fields.append(field_name)
+        else:
+            unavailable_fields.append(field_name)
+    if invalid_input:
+        final_status = "INVALID_INPUT"
+    elif timeout_fields:
+        final_status = "TIMEOUT"
+    elif mismatched_fields or unavailable_fields:
+        final_status = "FAILED"
+    elif tolerance_fields:
+        final_status = "VERIFIED_WITH_TOLERANCE"
+    else:
+        final_status = "VERIFIED"
+    return {
+        "field_count": len(SAFE_FIELD_ORDER),
+        "exact_match_fields": exact_fields,
+        "within_tolerance_fields": tolerance_fields,
+        "mismatched_fields": mismatched_fields,
+        "timeout_fields": timeout_fields,
+        "unavailable_fields": unavailable_fields,
+        "all_verified": final_status in {"VERIFIED", "VERIFIED_WITH_TOLERANCE"},
+        "final_status": final_status,
+    }
+
+
+def _legacy_verification_from_transaction(
+    desired: Dict[str, object],
+    readback: Dict[str, object],
+    transaction: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    if transaction:
+        summary = dict(transaction.get("verification_summary") or {})
+        mismatches = list(summary.get("mismatched_fields") or []) + list(summary.get("timeout_fields") or [])
+        return {
+            "matches": bool(summary.get("all_verified")),
+            "mismatched_fields": mismatches,
+            "tolerances": {
+                "exposureAdjust": EXPOSURE_VERIFY_TOLERANCE,
+                "kelvin": KELVIN_VERIFY_TOLERANCE,
+                "tint": TINT_VERIFY_TOLERANCE,
+            },
+            "field_results": dict(transaction.get("per_field") or {}),
+            "final_status": str(summary.get("final_status") or ""),
+        }
+    mismatches: List[str] = []
+    if abs(float(readback.get("exposureAdjust", 0.0) or 0.0) - float(desired["exposureAdjust"])) > EXPOSURE_VERIFY_TOLERANCE:
+        mismatches.append("exposureAdjust")
+    if abs(float(readback.get("kelvin", 0.0) or 0.0) - float(desired["kelvin"])) > KELVIN_VERIFY_TOLERANCE:
+        mismatches.append("kelvin")
+    if abs(float(readback.get("tint", 0.0) or 0.0) - float(desired["tint"])) > TINT_VERIFY_TOLERANCE:
+        mismatches.append("tint")
+    return {
+        "matches": not mismatches,
+        "mismatched_fields": mismatches,
+        "tolerances": {
+            "exposureAdjust": EXPOSURE_VERIFY_TOLERANCE,
+            "kelvin": KELVIN_VERIFY_TOLERANCE,
+            "tint": TINT_VERIFY_TOLERANCE,
+        },
+    }
+
+
+def _apply_status_from_transaction(transaction: Dict[str, object], *, transport_mode: str) -> str:
+    if transport_mode == "dry_run":
+        return "dry_run"
+    final_status = str((transaction.get("verification_summary") or {}).get("final_status") or transaction.get("final_status") or "")
+    if final_status in {"VERIFIED", "VERIFIED_WITH_TOLERANCE"}:
+        return "applied_successfully"
+    if final_status == "TIMEOUT":
+        return "timeout"
+    if final_status == "INVALID_INPUT":
+        return "invalid_input"
+    return "mismatch_after_writeback"
+
+
+def _failure_reason_from_transaction(transaction: Dict[str, object], *, status: str) -> str:
+    if status in {"applied_successfully", "dry_run"}:
+        return ""
+    if status == "timeout":
+        return "timeout"
+    if status == "invalid_input":
+        return "invalid_input"
+    return "mismatch_after_writeback"
+
+
+def _default_post_apply_verification_path(out_path: str) -> Path:
+    report_path = Path(out_path).expanduser().resolve()
+    return report_path.with_name("rcp2_post_apply_verification.json")
+
+
 def _failure_reason_for_exception(exc: Exception) -> str:
     if isinstance(exc, Rcp2InvalidPayloadError):
         return "invalid_payload"
@@ -309,6 +486,17 @@ class Rcp2Transport(Protocol):
     def write_state(self, session: object, values: Dict[str, object]) -> None:
         ...
 
+    def apply_state_transactionally(
+        self,
+        session: object,
+        values: Dict[str, object],
+        *,
+        stop_on_failure: bool = True,
+        enable_histogram_guard: bool = False,
+        include_clip_metadata_cross_check: bool = False,
+    ) -> Dict[str, object]:
+        ...
+
 
 class DryRunRcp2Transport:
     mode = "dry_run"
@@ -326,6 +514,51 @@ class DryRunRcp2Transport:
         if not isinstance(session, dict):
             raise Rcp2ApplyError("Invalid dry-run session.")
         session["state"] = dict(values)
+
+    def apply_state_transactionally(
+        self,
+        session: object,
+        values: Dict[str, object],
+        *,
+        stop_on_failure: bool = True,
+        enable_histogram_guard: bool = False,
+        include_clip_metadata_cross_check: bool = False,
+    ) -> Dict[str, object]:
+        del stop_on_failure, enable_histogram_guard, include_clip_metadata_cross_check
+        if not isinstance(session, dict):
+            raise Rcp2ApplyError("Invalid dry-run session.")
+        before_state = dict((session or {}).get("state") or {})
+        original_before_state = dict(before_state)
+        requested = clamp_calibration_values(values)
+        per_field: Dict[str, Dict[str, object]] = {}
+        write_sequence_trace: List[Dict[str, object]] = []
+        for index, field_name in enumerate(SAFE_FIELD_ORDER, start=1):
+            current_value = before_state.get(field_name, requested[field_name])
+            session.setdefault("state", {})
+            session["state"][field_name] = requested[field_name]
+            result = _build_field_verification(
+                field_name=field_name,
+                requested_value=requested[field_name],
+                applied_value=requested[field_name],
+                parameter_id=PARAMETER_SPECS[field_name].parameter_id,
+                set_action="simulated_write",
+            )
+            result["step"] = index
+            result["before_value"] = _coerce_field_value(field_name, current_value)
+            per_field[field_name] = result
+            write_sequence_trace.append(dict(result))
+            before_state[field_name] = requested[field_name]
+        summary = _summarize_field_verifications(per_field)
+        return {
+            "before_state": original_before_state,
+            "final_readback": dict((session or {}).get("state") or {}),
+            "per_field": per_field,
+            "write_sequence_trace": write_sequence_trace,
+            "verification_summary": summary,
+            "final_status": summary["final_status"],
+            "histogram_guard": {"enabled": False, "status": "not_run"},
+            "clip_metadata_cross_check": {"status": "not_run"},
+        }
 
 
 class MemoryRcp2Transport:
@@ -363,6 +596,56 @@ class MemoryRcp2Transport:
         if host in self._rejected:
             raise Rcp2RejectedError(f"Camera at {host} rejected the calibration payload.")
         self._states[host] = dict(values)
+
+    def apply_state_transactionally(
+        self,
+        session: object,
+        values: Dict[str, object],
+        *,
+        stop_on_failure: bool = True,
+        enable_histogram_guard: bool = False,
+        include_clip_metadata_cross_check: bool = False,
+    ) -> Dict[str, object]:
+        del enable_histogram_guard, include_clip_metadata_cross_check
+        host = str((session or {}).get("host") or "")
+        if host in self._rejected:
+            raise Rcp2RejectedError(f"Camera at {host} rejected the calibration payload.")
+        before_state = dict(self._states.get(host) or {})
+        original_before_state = dict(before_state)
+        requested = clamp_calibration_values(values)
+        working_state = dict(before_state)
+        per_field: Dict[str, Dict[str, object]] = {}
+        write_sequence_trace: List[Dict[str, object]] = []
+        for index, field_name in enumerate(SAFE_FIELD_ORDER, start=1):
+            working_state[field_name] = requested[field_name]
+            self._states[host] = dict(working_state)
+            applied_state = dict(self._overrides.get(host) or self._states.get(host) or {})
+            result = _build_field_verification(
+                field_name=field_name,
+                requested_value=requested[field_name],
+                applied_value=applied_state.get(field_name),
+                parameter_id=PARAMETER_SPECS[field_name].parameter_id,
+                set_action="simulated_write",
+            )
+            result["step"] = index
+            result["before_value"] = _coerce_field_value(field_name, before_state.get(field_name))
+            per_field[field_name] = result
+            write_sequence_trace.append(dict(result))
+            if stop_on_failure and str(result["verification_status"]) not in {"EXACT_MATCH", "WITHIN_TOLERANCE"}:
+                break
+            before_state[field_name] = applied_state.get(field_name)
+        final_readback = dict(self._overrides.get(host) or self._states.get(host) or {})
+        summary = _summarize_field_verifications(per_field)
+        return {
+            "before_state": original_before_state,
+            "final_readback": final_readback,
+            "per_field": per_field,
+            "write_sequence_trace": write_sequence_trace,
+            "verification_summary": summary,
+            "final_status": summary["final_status"],
+            "histogram_guard": {"enabled": False, "status": "not_run"},
+            "clip_metadata_cross_check": {"status": "not_run"},
+        }
 
 
 def normalize_transport_kind(value: str) -> str:
@@ -450,6 +733,16 @@ class WebSocketRcp2Transport:
 
         return _matches
 
+    @staticmethod
+    def _multi_parameter_matcher(*parameter_ids: str):
+        expected = {str(parameter_id or "").strip().upper().removeprefix("RCP_PARAM_") for parameter_id in parameter_ids if str(parameter_id or "").strip()}
+
+        def _matches(message: Dict[str, object]) -> bool:
+            message_id = str(message.get("id") or "").strip().upper().removeprefix("RCP_PARAM_")
+            return message_id in expected or str(message.get("type") or "") == "rcp_cur_clip_list"
+
+        return _matches
+
     def _read_parameter_state(self, session: Rcp2WebSocketSession, field_name: str) -> Rcp2ParameterState:
         spec = PARAMETER_SPECS[field_name]
         client = self._client(session.host, session.port)
@@ -493,6 +786,103 @@ class WebSocketRcp2Transport:
         if current is None or int(state.message_index) >= int(current.message_index):
             session.parameter_states[spec.field_name] = state
         return state
+
+    def _best_effort_histogram_guard(self, session: Rcp2WebSocketSession) -> Dict[str, object]:
+        client = self._client(session.host, session.port)
+        try:
+            messages = client.request_messages(
+                session,
+                {"type": "rcp_get", "id": "HISTOGRAM"},
+                matcher=self._multi_parameter_matcher("HISTOGRAM", "DSHIST"),
+                timeout_ms=self.operation_timeout_ms,
+                settle_timeout_ms=self.settle_timeout_ms,
+            )
+        except Exception:
+            return {"enabled": True, "status": "not_available", "clipping_detected": False}
+        clip_values: Dict[str, float] = {}
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            for key, value in message.items():
+                if key in {"bottom_clip_r", "bottom_clip_g", "bottom_clip_b", "top_clip_r", "top_clip_g", "top_clip_b"}:
+                    try:
+                        clip_values[key] = float(value)
+                    except (TypeError, ValueError):
+                        continue
+        clipping_detected = any(float(value) > 0.0 for value in clip_values.values())
+        payload = {
+            "enabled": True,
+            "status": "success" if clip_values else "not_available",
+            "clipping_detected": clipping_detected,
+            "clip_values": clip_values,
+        }
+        if clipping_detected:
+            payload["note"] = "Clipping detected on gray reference — measurement invalid"
+        return payload
+
+    def _best_effort_clip_metadata(self, session: Rcp2WebSocketSession, applied_state: Dict[str, object]) -> Dict[str, object]:
+        client = self._client(session.host, session.port)
+        try:
+            messages = client.request_messages(
+                session,
+                {"type": "rcp_get", "id": "CLIP_LIST"},
+                matcher=self._multi_parameter_matcher("CLIP_LIST"),
+                timeout_ms=self.operation_timeout_ms,
+                settle_timeout_ms=self.settle_timeout_ms,
+            )
+        except Exception:
+            return {"status": "not_available", "metadata_match_status": "NOT_AVAILABLE"}
+        clip_entry: Dict[str, object] = {}
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            clips = message.get("clips")
+            if isinstance(clips, list) and clips:
+                first = clips[0]
+                if isinstance(first, dict):
+                    clip_entry = dict(first)
+                    break
+            if str(message.get("type") or "") == "rcp_cur_clip_list":
+                clip_entry = dict(message)
+        if not clip_entry:
+            return {"status": "not_available", "metadata_match_status": "NOT_AVAILABLE"}
+        comparisons = {}
+        statuses = []
+        for field_name, metadata_keys in {
+            "kelvin": ("kelvin", "color_temperature"),
+            "tint": ("tint",),
+            "exposureAdjust": ("exposure_adjust", "exposureAdjust"),
+        }.items():
+            metadata_value = None
+            for key in metadata_keys:
+                if key in clip_entry:
+                    metadata_value = clip_entry.get(key)
+                    break
+            if metadata_value is None:
+                comparisons[field_name] = {"status": "NOT_AVAILABLE"}
+                statuses.append("NOT_AVAILABLE")
+                continue
+            status = _field_verification_status(field_name, applied_state.get(field_name), metadata_value)
+            comparisons[field_name] = {
+                "metadata_value": _coerce_field_value(field_name, metadata_value),
+                "applied_value": _coerce_field_value(field_name, applied_state.get(field_name)),
+                "delta": _field_delta(field_name, applied_state.get(field_name), metadata_value),
+                "status": status,
+            }
+            statuses.append(status)
+        if any(status == "MISMATCH" for status in statuses):
+            match_status = "MISMATCH"
+        elif any(status == "WITHIN_TOLERANCE" for status in statuses):
+            match_status = "WITHIN_TOLERANCE"
+        elif all(status == "EXACT_MATCH" for status in statuses if status != "NOT_AVAILABLE") and any(status != "NOT_AVAILABLE" for status in statuses):
+            match_status = "EXACT_MATCH"
+        else:
+            match_status = "NOT_AVAILABLE"
+        return {
+            "status": "success",
+            "metadata_match_status": match_status,
+            "fields": comparisons,
+        }
 
     @staticmethod
     def _camera_info_summary(camera_info: Dict[str, object]) -> Dict[str, object]:
@@ -590,7 +980,7 @@ class WebSocketRcp2Transport:
         if not isinstance(session, Rcp2WebSocketSession):
             raise Rcp2ApplyError("Invalid WebSocket RCP2 session.")
         requested = clamp_calibration_values(values)
-        for field_name in ("exposureAdjust", "kelvin", "tint"):
+        for field_name in SAFE_FIELD_ORDER:
             current_state = self._read_parameter_state(session, field_name)
             raw_target = int(round(float(requested[field_name]) * current_state.divider))
             min_value = current_state.edit_info.get("min")
@@ -606,6 +996,101 @@ class WebSocketRcp2Transport:
             if current_state.raw_value == raw_target:
                 continue
             self._write_parameter_state(session, field_name, raw_target)
+
+    def apply_state_transactionally(
+        self,
+        session: object,
+        values: Dict[str, object],
+        *,
+        stop_on_failure: bool = True,
+        enable_histogram_guard: bool = False,
+        include_clip_metadata_cross_check: bool = False,
+    ) -> Dict[str, object]:
+        if not isinstance(session, Rcp2WebSocketSession):
+            raise Rcp2ApplyError("Invalid WebSocket RCP2 session.")
+        requested = clamp_calibration_values(values)
+        before_state = self.read_state(session)
+        per_field: Dict[str, Dict[str, object]] = {}
+        write_sequence_trace: List[Dict[str, object]] = []
+        histogram_guard = {"enabled": False, "status": "not_run", "clipping_detected": False}
+        invalid_input = False
+        if enable_histogram_guard:
+            histogram_guard = self._best_effort_histogram_guard(session)
+            invalid_input = bool(histogram_guard.get("clipping_detected"))
+        if invalid_input:
+            summary = _summarize_field_verifications(per_field, invalid_input=True)
+            return {
+                "before_state": before_state,
+                "final_readback": before_state,
+                "per_field": per_field,
+                "write_sequence_trace": write_sequence_trace,
+                "verification_summary": summary,
+                "final_status": summary["final_status"],
+                "histogram_guard": histogram_guard,
+                "clip_metadata_cross_check": {"status": "not_run"},
+            }
+
+        for index, field_name in enumerate(SAFE_FIELD_ORDER, start=1):
+            current_state = self._read_parameter_state(session, field_name)
+            raw_target = int(round(float(requested[field_name]) * current_state.divider))
+            min_value = current_state.edit_info.get("min")
+            max_value = current_state.edit_info.get("max")
+            if min_value is not None and raw_target < int(min_value):
+                raise Rcp2InvalidPayloadError(
+                    f"{PARAMETER_SPECS[field_name].parameter_id} target {raw_target} is below the camera minimum {int(min_value)}."
+                )
+            if max_value is not None and raw_target > int(max_value):
+                raise Rcp2InvalidPayloadError(
+                    f"{PARAMETER_SPECS[field_name].parameter_id} target {raw_target} is above the camera maximum {int(max_value)}."
+                )
+            set_action = "skipped_noop"
+            try:
+                if current_state.raw_value != raw_target:
+                    self._write_parameter_state(session, field_name, raw_target)
+                    set_action = "rcp_set"
+                verified_state = self._read_parameter_state(session, field_name)
+                result = _build_field_verification(
+                    field_name=field_name,
+                    requested_value=requested[field_name],
+                    applied_value=verified_state.value,
+                    requested_raw_value=raw_target,
+                    applied_raw_value=verified_state.raw_value,
+                    parameter_id=verified_state.parameter_id,
+                    set_action=set_action,
+                )
+            except Rcp2TimeoutError as exc:
+                result = _build_field_verification(
+                    field_name=field_name,
+                    requested_value=requested[field_name],
+                    applied_value=None,
+                    requested_raw_value=raw_target,
+                    parameter_id=PARAMETER_SPECS[field_name].parameter_id,
+                    verification_status="TIMEOUT",
+                    note=str(exc),
+                    set_action=set_action or "rcp_set",
+                )
+            result["step"] = index
+            result["before_value"] = _coerce_field_value(field_name, current_state.value)
+            per_field[field_name] = result
+            write_sequence_trace.append(dict(result))
+            if stop_on_failure and str(result.get("verification_status") or "") not in {"EXACT_MATCH", "WITHIN_TOLERANCE"}:
+                break
+
+        final_readback = self.read_state(session)
+        clip_metadata_cross_check = (
+            self._best_effort_clip_metadata(session, final_readback) if include_clip_metadata_cross_check else {"status": "not_run"}
+        )
+        summary = _summarize_field_verifications(per_field, invalid_input=invalid_input)
+        return {
+            "before_state": before_state,
+            "final_readback": final_readback,
+            "per_field": per_field,
+            "write_sequence_trace": write_sequence_trace,
+            "verification_summary": summary,
+            "final_status": summary["final_status"],
+            "histogram_guard": histogram_guard,
+            "clip_metadata_cross_check": clip_metadata_cross_check,
+        }
 
 
 class LiveRcp2Transport:
@@ -758,9 +1243,85 @@ class LiveRcp2Transport:
         if not isinstance(session, LiveRcp2Session):
             raise Rcp2ApplyError("Invalid live RCP2 session.")
         requested = clamp_calibration_values(values)
-        self._write_int(session, "r3dmatch_rcp_set_exposure_adjust", int(round(float(requested["exposureAdjust"]) * 1000.0)))
         self._write_int(session, "r3dmatch_rcp_set_color_temperature", int(requested["kelvin"]))
         self._write_int(session, "r3dmatch_rcp_set_tint", int(round(float(requested["tint"]) * 1000.0)))
+        self._write_int(session, "r3dmatch_rcp_set_exposure_adjust", int(round(float(requested["exposureAdjust"]) * 1000.0)))
+
+    def apply_state_transactionally(
+        self,
+        session: object,
+        values: Dict[str, object],
+        *,
+        stop_on_failure: bool = True,
+        enable_histogram_guard: bool = False,
+        include_clip_metadata_cross_check: bool = False,
+    ) -> Dict[str, object]:
+        del enable_histogram_guard, include_clip_metadata_cross_check
+        if not isinstance(session, LiveRcp2Session):
+            raise Rcp2ApplyError("Invalid live RCP2 session.")
+        before_state = self.read_state(session)
+        requested = clamp_calibration_values(values)
+        per_field: Dict[str, Dict[str, object]] = {}
+        write_sequence_trace: List[Dict[str, object]] = []
+        io_map = {
+            "kelvin": ("r3dmatch_rcp_set_color_temperature", "r3dmatch_rcp_get_color_temperature", 1.0),
+            "tint": ("r3dmatch_rcp_set_tint", "r3dmatch_rcp_get_tint", 1000.0),
+            "exposureAdjust": ("r3dmatch_rcp_set_exposure_adjust", "r3dmatch_rcp_get_exposure_adjust", 1000.0),
+        }
+        current_state = dict(before_state)
+        for index, field_name in enumerate(SAFE_FIELD_ORDER, start=1):
+            setter_name, getter_name, divider = io_map[field_name]
+            target_raw_value = int(round(float(requested[field_name]) * float(divider)))
+            before_value = current_state.get(field_name)
+            set_action = "skipped_noop"
+            try:
+                current_raw_value = self._read_int(session, getter_name)
+                if current_raw_value != target_raw_value:
+                    self._write_int(session, setter_name, target_raw_value)
+                    set_action = "native_set"
+                applied_raw_value = self._read_int(session, getter_name)
+                applied_value = float(applied_raw_value) / float(divider)
+                if field_name == "kelvin":
+                    applied_value = int(round(applied_value))
+                result = _build_field_verification(
+                    field_name=field_name,
+                    requested_value=requested[field_name],
+                    applied_value=applied_value,
+                    requested_raw_value=target_raw_value,
+                    applied_raw_value=applied_raw_value,
+                    parameter_id=PARAMETER_SPECS[field_name].parameter_id,
+                    set_action=set_action,
+                )
+            except Rcp2TimeoutError as exc:
+                result = _build_field_verification(
+                    field_name=field_name,
+                    requested_value=requested[field_name],
+                    applied_value=None,
+                    requested_raw_value=target_raw_value,
+                    parameter_id=PARAMETER_SPECS[field_name].parameter_id,
+                    verification_status="TIMEOUT",
+                    note=str(exc),
+                    set_action=set_action,
+                )
+            result["step"] = index
+            result["before_value"] = _coerce_field_value(field_name, before_value)
+            per_field[field_name] = result
+            write_sequence_trace.append(dict(result))
+            current_state[field_name] = result.get("applied_value", current_state.get(field_name))
+            if stop_on_failure and str(result.get("verification_status") or "") not in {"EXACT_MATCH", "WITHIN_TOLERANCE"}:
+                break
+        final_readback = self.read_state(session)
+        summary = _summarize_field_verifications(per_field)
+        return {
+            "before_state": before_state,
+            "final_readback": final_readback,
+            "per_field": per_field,
+            "write_sequence_trace": write_sequence_trace,
+            "verification_summary": summary,
+            "final_status": summary["final_status"],
+            "histogram_guard": {"enabled": False, "status": "not_run"},
+            "clip_metadata_cross_check": {"status": "not_run"},
+        }
 
 
 def create_live_transport(
@@ -954,22 +1515,85 @@ def load_apply_targets(
 
 
 def _verification_result(requested: Dict[str, object], readback: Dict[str, object]) -> Dict[str, object]:
-    mismatches: List[str] = []
-    if abs(float(readback.get("exposureAdjust", 0.0) or 0.0) - float(requested["exposureAdjust"])) > EXPOSURE_VERIFY_TOLERANCE:
-        mismatches.append("exposureAdjust")
-    if abs(float(readback.get("kelvin", 0.0) or 0.0) - float(requested["kelvin"])) > KELVIN_VERIFY_TOLERANCE:
-        mismatches.append("kelvin")
-    if abs(float(readback.get("tint", 0.0) or 0.0) - float(requested["tint"])) > TINT_VERIFY_TOLERANCE:
-        mismatches.append("tint")
+    return _legacy_verification_from_transaction(requested, readback)
+
+
+def _generic_apply_state_transactionally(
+    transport: Rcp2Transport,
+    session: object,
+    desired: Dict[str, object],
+    *,
+    stop_on_failure: bool = True,
+) -> Dict[str, object]:
+    before_state = dict(transport.read_state(session) or {})
+    original_before_state = dict(before_state)
+    working_state = dict(before_state)
+    per_field: Dict[str, Dict[str, object]] = {}
+    write_sequence_trace: List[Dict[str, object]] = []
+    for index, field_name in enumerate(SAFE_FIELD_ORDER, start=1):
+        next_values = dict(working_state)
+        next_values[field_name] = desired[field_name]
+        try:
+            transport.write_state(session, next_values)
+            readback = dict(transport.read_state(session) or {})
+            result = _build_field_verification(
+                field_name=field_name,
+                requested_value=desired[field_name],
+                applied_value=readback.get(field_name),
+                parameter_id=PARAMETER_SPECS[field_name].parameter_id,
+                set_action="transport_write_state",
+            )
+            working_state = dict(readback)
+        except Rcp2TimeoutError as exc:
+            result = _build_field_verification(
+                field_name=field_name,
+                requested_value=desired[field_name],
+                applied_value=None,
+                parameter_id=PARAMETER_SPECS[field_name].parameter_id,
+                verification_status="TIMEOUT",
+                note=str(exc),
+                set_action="transport_write_state",
+            )
+        result["step"] = index
+        result["before_value"] = _coerce_field_value(field_name, before_state.get(field_name))
+        per_field[field_name] = result
+        write_sequence_trace.append(dict(result))
+        before_state[field_name] = working_state.get(field_name, before_state.get(field_name))
+        if stop_on_failure and str(result.get("verification_status") or "") not in {"EXACT_MATCH", "WITHIN_TOLERANCE"}:
+            break
+    final_readback = dict(transport.read_state(session) or {})
+    summary = _summarize_field_verifications(per_field)
     return {
-        "matches": not mismatches,
-        "mismatched_fields": mismatches,
-        "tolerances": {
-            "exposureAdjust": EXPOSURE_VERIFY_TOLERANCE,
-            "kelvin": KELVIN_VERIFY_TOLERANCE,
-            "tint": TINT_VERIFY_TOLERANCE,
-        },
+        "before_state": original_before_state,
+        "final_readback": final_readback,
+        "per_field": per_field,
+        "write_sequence_trace": write_sequence_trace,
+        "verification_summary": summary,
+        "final_status": summary["final_status"],
+        "histogram_guard": {"enabled": False, "status": "not_run"},
+        "clip_metadata_cross_check": {"status": "not_run"},
     }
+
+
+def _apply_state_transactionally(
+    transport: Rcp2Transport,
+    session: object,
+    desired: Dict[str, object],
+    *,
+    stop_on_failure: bool = True,
+    enable_histogram_guard: bool = False,
+    include_clip_metadata_cross_check: bool = False,
+) -> Dict[str, object]:
+    transactional = getattr(transport, "apply_state_transactionally", None)
+    if callable(transactional):
+        return transactional(
+            session,
+            desired,
+            stop_on_failure=stop_on_failure,
+            enable_histogram_guard=enable_histogram_guard,
+            include_clip_metadata_cross_check=include_clip_metadata_cross_check,
+        )
+    return _generic_apply_state_transactionally(transport, session, desired, stop_on_failure=stop_on_failure)
 
 
 def operator_apply_tolerances() -> Dict[str, float]:
@@ -1049,7 +1673,7 @@ def classify_operator_apply_result(
     requested = dict(result_row.get("requested") or {})
     readback = dict(result_row.get("readback") or {})
 
-    if raw_status in {"dry_run", "failed_to_connect", "timeout", "rejected_by_camera", "invalid_payload"}:
+    if raw_status in {"dry_run", "failed_to_connect", "timeout", "rejected_by_camera", "invalid_payload", "invalid_input"}:
         return {
             "raw_status": raw_status,
             "display_status": raw_status,
@@ -1284,7 +1908,7 @@ def summarize_apply_report(
     operator_status = "success"
     if operator_counts:
         if any(
-            key in {"failed_to_connect", "timeout", "rejected_by_camera", "mismatch_after_writeback", "invalid_payload"}
+            key in {"failed_to_connect", "timeout", "rejected_by_camera", "mismatch_after_writeback", "invalid_payload", "invalid_input"}
             for key in operator_counts
         ):
             operator_status = "partial" if any(key in {"applied_successfully", "applied_with_deviation", "dry_run"} for key in operator_counts) else "failed"
@@ -1310,6 +1934,8 @@ def apply_calibration_payload(
     sdk_root: str = DEFAULT_RCP2_SDK_ROOT,
     transport_kind: str = DEFAULT_TRANSPORT_KIND,
     retry_count: int = DEFAULT_APPLY_RETRY_COUNT,
+    enable_histogram_guard: bool = False,
+    include_clip_metadata_cross_check: bool = False,
 ) -> Dict[str, object]:
     resolved_map = camera_ip_map or DEFAULT_CAMERA_IP_MAP
     targets = load_apply_targets(payload_path, requested_cameras=requested_cameras, camera_ip_map=resolved_map)
@@ -1370,20 +1996,24 @@ def apply_calibration_payload(
             session = None
             try:
                 session = active_transport.open(host=host, port=port, camera_label=target.inventory_camera_label)
-                before_state = active_transport.read_state(session)
-                active_transport.write_state(session, desired)
-                readback = active_transport.read_state(session)
-                verification = _verification_result(desired, readback)
-                if active_transport.mode == "dry_run":
-                    status = "dry_run"
-                elif verification["matches"]:
-                    status = "applied_successfully"
-                else:
-                    status = "mismatch_after_writeback"
+                transaction = _apply_state_transactionally(
+                    active_transport,
+                    session,
+                    desired,
+                    stop_on_failure=True,
+                    enable_histogram_guard=enable_histogram_guard,
+                    include_clip_metadata_cross_check=include_clip_metadata_cross_check,
+                )
+                before_state = dict(transaction.get("before_state") or {})
+                readback = dict(transaction.get("final_readback") or {})
+                verification = _legacy_verification_from_transaction(desired, readback, transaction)
+                status = _apply_status_from_transaction(transaction, transport_mode=getattr(active_transport, "mode", ""))
+                failure_reason = _failure_reason_from_transaction(transaction, status=status)
                 attempts.append(
                     {
                         "attempt": attempt_number,
                         "status": status,
+                        "failure_reason": failure_reason,
                     }
                 )
                 final_row = {
@@ -1392,12 +2022,20 @@ def apply_calibration_payload(
                     "inventory_camera_label": target.inventory_camera_label,
                     "inventory_camera_ip": host,
                     "status": status,
-                    "failure_reason": "mismatch_after_writeback" if status == "mismatch_after_writeback" else "",
+                    "failure_reason": failure_reason,
                     "requested": desired,
                     "raw_requested": raw_requested,
                     "before_state": before_state,
                     "readback": readback,
                     "verification": verification,
+                    "camera_verification": {
+                        "per_field": dict(transaction.get("per_field") or {}),
+                        "write_sequence_trace": list(transaction.get("write_sequence_trace") or []),
+                        "verification_summary": dict(transaction.get("verification_summary") or {}),
+                        "final_status": str(transaction.get("final_status") or ""),
+                        "histogram_guard": dict(transaction.get("histogram_guard") or {}),
+                        "clip_metadata_cross_check": dict(transaction.get("clip_metadata_cross_check") or {}),
+                    },
                     "warnings": safety_warnings,
                     "confidence": target.confidence,
                     "is_hero_camera": target.is_hero_camera,
@@ -1447,7 +2085,7 @@ def apply_calibration_payload(
         key = str(item.get("status") or "unknown")
         status_counts[key] = status_counts.get(key, 0) + 1
     overall_status = "success"
-    if any(item.get("status") in {"failed_to_connect", "timeout", "rejected_by_camera", "mismatch_after_writeback", "invalid_payload"} for item in results):
+    if any(item.get("status") in {"failed_to_connect", "timeout", "rejected_by_camera", "mismatch_after_writeback", "invalid_payload", "invalid_input"} for item in results):
         overall_status = "partial" if any(item.get("status") in {"applied_successfully", "dry_run"} for item in results) else "failed"
     if active_transport.mode == "dry_run" and overall_status == "success":
         overall_status = "dry_run"
@@ -1470,9 +2108,39 @@ def apply_calibration_payload(
         "operator_tolerances": operator_summary["operator_tolerances"],
         "results": operator_summary["results"],
     }
+    transaction_summary_rows: List[Dict[str, object]] = []
+    for row in operator_summary["results"]:
+        camera_verification = dict(row.get("camera_verification") or {})
+        transaction_summary_rows.append(
+            {
+                "camera_id": row.get("camera_id"),
+                "clip_id": row.get("clip_id"),
+                "inventory_camera_label": row.get("inventory_camera_label"),
+                "requested": row.get("requested"),
+                "readback": row.get("readback"),
+                "camera_verification": camera_verification,
+                "status": row.get("status"),
+                "failure_reason": row.get("failure_reason"),
+            }
+        )
+    post_apply_verification_payload = {
+        "schema_version": TRANSACTIONAL_VERIFICATION_SCHEMA,
+        "started_at": started_at,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "payload_path": str(Path(payload_path).expanduser().resolve()),
+        "transport_mode": active_transport.mode,
+        "transport_kind": resolved_transport_kind,
+        "status": overall_status,
+        "camera_count": len(transaction_summary_rows),
+        "results": transaction_summary_rows,
+    }
+    summary["post_apply_verification"] = post_apply_verification_payload
     if out_path:
         output_path = Path(out_path).expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        post_apply_path = _default_post_apply_verification_path(str(output_path))
+        post_apply_path.write_text(json.dumps(post_apply_verification_payload, indent=2), encoding="utf-8")
         summary["report_path"] = str(output_path)
+        summary["post_apply_verification_path"] = str(post_apply_path)
     return summary

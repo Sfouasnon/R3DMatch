@@ -38,6 +38,13 @@ LOW_CONFIDENCE_THRESHOLD = 0.35
 SPHERE_INTERIOR_RADIUS_RATIO = 0.78
 SPHERE_MAX_SATURATION = 0.08
 SPHERE_MIN_COMPONENT_FRACTION = 0.12
+SPHERE_ZONE_DEFINITIONS = (
+    ("bright_side", "Bright", 0.24),
+    ("center", "Center", 0.0),
+    ("dark_side", "Dark", -0.24),
+)
+SPHERE_ZONE_HALF_WIDTH_RATIO = 0.34
+SPHERE_ZONE_HALF_HEIGHT_RATIO = 0.11
 
 
 @dataclass
@@ -782,21 +789,26 @@ def measure_exposure_region(image: np.ndarray, region: SamplingRegion, *, low_pe
     return measurement
 
 
-def measure_sphere_region_statistics(
-    image: np.ndarray,
-    roi: SphereROI,
+def _measure_pixel_cloud_statistics(
+    pixels: np.ndarray,
     *,
-    sampling_variant: str = "refined",
+    sampling_confidence: Optional[float] = None,
+    sampling_method: str = "circle_mask",
+    mask_fraction: float = 1.0,
+    interior_fraction: float = 1.0,
+    interior_radius_ratio: float = 1.0,
     low_percentile: float = 5.0,
     high_percentile: float = 95.0,
 ) -> Dict[str, object]:
-    pixels, info = extract_circle_pixels(image, roi, sampling_variant=sampling_variant)
-    luminance = np.clip(pixels[:, 0] * 0.2126 + pixels[:, 1] * 0.7152 + pixels[:, 2] * 0.0722, 1e-6, 1.0)
+    pixel_array = np.asarray(pixels, dtype=np.float32).reshape(-1, 3)
+    if pixel_array.size == 0:
+        raise ValueError("sample region produced no pixels")
+    luminance = np.clip(pixel_array[:, 0] * 0.2126 + pixel_array[:, 1] * 0.7152 + pixel_array[:, 2] * 0.0722, 1e-6, 1.0)
     measurement = trimmed_luminance_measurement(luminance, low_percentile=low_percentile, high_percentile=high_percentile)
-    valid_mask = np.all((pixels > 0.002) & (pixels < 0.998), axis=1)
-    valid_pixels = pixels[valid_mask]
+    valid_mask = np.all((pixel_array > 0.002) & (pixel_array < 0.998), axis=1)
+    valid_pixels = pixel_array[valid_mask]
     if valid_pixels.size == 0:
-        valid_pixels = pixels
+        valid_pixels = pixel_array
     valid_luminance = np.clip(valid_pixels[:, 0] * 0.2126 + valid_pixels[:, 1] * 0.7152 + valid_pixels[:, 2] * 0.0722, 1e-6, 1.0)
     trimmed_luminance = percentile_clip(valid_luminance, low_percentile, high_percentile)
     low = float(trimmed_luminance.min())
@@ -810,6 +822,7 @@ def measure_sphere_region_statistics(
     log_values = np.log2(np.clip(trimmed_luminance, 1e-6, 1.0))
     return {
         "measured_log2_luminance": float(measurement["measured_log2_luminance"]),
+        "measured_ire": float((2.0 ** float(measurement["measured_log2_luminance"])) * 100.0),
         "measured_rgb_mean": [float(rgb_mean[0]), float(rgb_mean[1]), float(rgb_mean[2])],
         "measured_rgb_chromaticity": [float(chroma[0]), float(chroma[1]), float(chroma[2])],
         "valid_pixel_count": int(trimmed_pixels.shape[0]),
@@ -817,13 +830,312 @@ def measure_sphere_region_statistics(
         "black_fraction": float(np.mean(np.min(valid_pixels, axis=1) <= 0.002)) if valid_pixels.size else 0.0,
         "roi_variance": float(np.var(trimmed_luminance)) if trimmed_luminance.size else 0.0,
         "gray_log2_stddev": float(np.std(log_values)) if log_values.size else 0.0,
+        "gray_luminance_distribution": {
+            "count": int(trimmed_luminance.size),
+            "mean": float(np.mean(trimmed_luminance)) if trimmed_luminance.size else 0.0,
+            "median": float(np.median(trimmed_luminance)) if trimmed_luminance.size else 0.0,
+            "stddev": float(np.std(trimmed_luminance)) if trimmed_luminance.size else 0.0,
+            "minimum": float(np.min(trimmed_luminance)) if trimmed_luminance.size else 0.0,
+            "maximum": float(np.max(trimmed_luminance)) if trimmed_luminance.size else 0.0,
+            "p05": float(np.percentile(trimmed_luminance, 5.0)) if trimmed_luminance.size else 0.0,
+            "p95": float(np.percentile(trimmed_luminance, 95.0)) if trimmed_luminance.size else 0.0,
+            "preview_values": [float(value) for value in trimmed_luminance[: min(32, trimmed_luminance.size)].tolist()],
+        },
+        "gray_log2_distribution": {
+            "count": int(log_values.size),
+            "mean": float(np.mean(log_values)) if log_values.size else 0.0,
+            "median": float(np.median(log_values)) if log_values.size else 0.0,
+            "stddev": float(np.std(log_values)) if log_values.size else 0.0,
+            "minimum": float(np.min(log_values)) if log_values.size else 0.0,
+            "maximum": float(np.max(log_values)) if log_values.size else 0.0,
+            "p05": float(np.percentile(log_values, 5.0)) if log_values.size else 0.0,
+            "p95": float(np.percentile(log_values, 95.0)) if log_values.size else 0.0,
+            "preview_values": [float(value) for value in log_values[: min(32, log_values.size)].tolist()],
+        },
         "clipped_fraction": float(measurement["clipped_fraction"]),
         "retained_fraction": float(measurement["retained_fraction"]),
-        "confidence": combine_confidence(float(measurement["confidence"]), info.get("sampling_confidence")),
-        "sampling_method": info.get("sampling_method", "circle_mask"),
-        "mask_fraction": float(info.get("mask_fraction", 1.0)),
-        "interior_fraction": float(info.get("interior_fraction", 1.0)),
-        "interior_radius_ratio": float(info.get("interior_radius_ratio", 1.0)),
+        "confidence": combine_confidence(float(measurement["confidence"]), sampling_confidence),
+        "sampling_method": sampling_method,
+        "mask_fraction": float(mask_fraction),
+        "interior_fraction": float(interior_fraction),
+        "interior_radius_ratio": float(interior_radius_ratio),
+    }
+
+
+def _sphere_gradient_axis(
+    pixels_hwc: np.ndarray,
+    mask: np.ndarray,
+    roi: SphereROI,
+) -> Dict[str, object]:
+    height, width = mask.shape
+    yy, xx = np.meshgrid(np.arange(height, dtype=np.float32), np.arange(width, dtype=np.float32), indexing="ij")
+    dx = xx[mask] - float(roi.cx)
+    dy = yy[mask] - float(roi.cy)
+    if dx.size < 32:
+        return {
+            "vector": [0.0, -1.0],
+            "magnitude": 0.0,
+            "confidence": 0.0,
+            "source": "fallback_vertical",
+        }
+    luminance = (
+        pixels_hwc[..., 0] * 0.2126
+        + pixels_hwc[..., 1] * 0.7152
+        + pixels_hwc[..., 2] * 0.0722
+    )[mask]
+    radial = np.sqrt(dx ** 2 + dy ** 2) / max(float(roi.r), 1.0)
+    weights = np.clip(1.0 - (radial * 0.6), 0.25, 1.0).astype(np.float32)
+    design = np.stack([dx, dy, np.ones_like(dx, dtype=np.float32)], axis=1).astype(np.float32)
+    try:
+        weighted_design = design * weights[:, None]
+        weighted_values = luminance.astype(np.float32) * weights
+        coefficients, _, _, _ = np.linalg.lstsq(weighted_design, weighted_values, rcond=None)
+        gradient = np.asarray(coefficients[:2], dtype=np.float32)
+    except np.linalg.LinAlgError:
+        gradient = np.zeros(2, dtype=np.float32)
+    magnitude = float(np.linalg.norm(gradient))
+    luminance_stddev = float(np.std(luminance)) if luminance.size else 0.0
+    confidence = 0.0
+    if magnitude > 1e-8 and luminance_stddev > 1e-8:
+        confidence = float(np.clip((magnitude * float(roi.r)) / max(luminance_stddev, 1e-6), 0.0, 1.0))
+        vector = gradient / magnitude
+        source = "fitted_luminance_plane"
+    else:
+        vector = np.asarray([0.0, -1.0], dtype=np.float32)
+        source = "fallback_vertical"
+    return {
+        "vector": [float(vector[0]), float(vector[1])],
+        "magnitude": magnitude,
+        "confidence": confidence,
+        "source": source,
+    }
+
+
+def _sphere_zone_geometries(
+    width: int,
+    height: int,
+    roi: SphereROI,
+    axis_vector: Tuple[float, float],
+) -> List[Dict[str, object]]:
+    axis = np.asarray(axis_vector, dtype=np.float32)
+    axis_norm = float(np.linalg.norm(axis))
+    if axis_norm <= 1e-8:
+        axis = np.asarray([0.0, -1.0], dtype=np.float32)
+    else:
+        axis = axis / axis_norm
+    perpendicular = np.asarray([-axis[1], axis[0]], dtype=np.float32)
+    half_width = float(max(1.0, float(roi.r) * SPHERE_ZONE_HALF_WIDTH_RATIO))
+    half_height = float(max(1.0, float(roi.r) * SPHERE_ZONE_HALF_HEIGHT_RATIO))
+    geometries: List[Dict[str, object]] = []
+    for label, display_label, offset_ratio in SPHERE_ZONE_DEFINITIONS:
+        center = np.asarray(
+            [
+                float(roi.cx) + (float(roi.r) * float(offset_ratio) * float(axis[0])),
+                float(roi.cy) + (float(roi.r) * float(offset_ratio) * float(axis[1])),
+            ],
+            dtype=np.float32,
+        )
+        corners = np.asarray(
+            [
+                center - (axis * half_height) - (perpendicular * half_width),
+                center - (axis * half_height) + (perpendicular * half_width),
+                center + (axis * half_height) + (perpendicular * half_width),
+                center + (axis * half_height) - (perpendicular * half_width),
+            ],
+            dtype=np.float32,
+        )
+        clipped_corners = np.asarray(
+            [
+                [
+                    float(np.clip(point[0], 0.0, float(max(width - 1, 0)))),
+                    float(np.clip(point[1], 0.0, float(max(height - 1, 0)))),
+                ]
+                for point in corners
+            ],
+            dtype=np.float32,
+        )
+        x_values = clipped_corners[:, 0]
+        y_values = clipped_corners[:, 1]
+        x0 = max(0, min(width - 1, int(np.floor(float(np.min(x_values))))))
+        x1 = max(x0 + 1, min(width, int(np.ceil(float(np.max(x_values))))))
+        y0 = max(0, min(height - 1, int(np.floor(float(np.min(y_values))))))
+        y1 = max(y0 + 1, min(height, int(np.ceil(float(np.max(y_values))))))
+        geometries.append(
+            {
+                "label": label,
+                "display_label": display_label,
+                "center": {"x": float(center[0]), "y": float(center[1])},
+                "offset_ratio": float(offset_ratio),
+                "polygon": {
+                    "pixel": [{"x": float(point[0]), "y": float(point[1])} for point in clipped_corners],
+                    "normalized_within_roi": [
+                        {
+                            "x": float(point[0]) / float(max(width, 1)),
+                            "y": float(point[1]) / float(max(height, 1)),
+                        }
+                        for point in clipped_corners
+                    ],
+                },
+                "pixel": {"x0": int(x0), "y0": int(y0), "x1": int(x1), "y1": int(y1)},
+                "normalized_within_roi": {
+                    "x": float(x0) / float(max(width, 1)),
+                    "y": float(y0) / float(max(height, 1)),
+                    "w": float(x1 - x0) / float(max(width, 1)),
+                    "h": float(y1 - y0) / float(max(height, 1)),
+                },
+            }
+        )
+    return geometries
+
+
+def measure_sphere_region_statistics(
+    image: np.ndarray,
+    roi: SphereROI,
+    *,
+    sampling_variant: str = "refined",
+    low_percentile: float = 5.0,
+    high_percentile: float = 95.0,
+) -> Dict[str, object]:
+    pixels, info = extract_circle_pixels(image, roi, sampling_variant=sampling_variant)
+    return _measure_pixel_cloud_statistics(
+        pixels,
+        sampling_confidence=info.get("sampling_confidence"),
+        sampling_method=str(info.get("sampling_method", "circle_mask")),
+        mask_fraction=float(info.get("mask_fraction", 1.0)),
+        interior_fraction=float(info.get("interior_fraction", 1.0)),
+        interior_radius_ratio=float(info.get("interior_radius_ratio", 1.0)),
+        low_percentile=low_percentile,
+        high_percentile=high_percentile,
+    )
+
+
+def measure_sphere_zone_profile_statistics(
+    image: np.ndarray,
+    roi: SphereROI,
+    *,
+    sampling_variant: str = "refined",
+    low_percentile: float = 5.0,
+    high_percentile: float = 95.0,
+) -> Dict[str, object]:
+    mask, metadata = build_sphere_sampling_mask(image, roi, sampling_variant=sampling_variant)
+    pixels_hwc = np.moveaxis(image, 0, -1)
+    height, width = mask.shape
+    yy, xx = np.meshgrid(np.arange(height, dtype=np.float32), np.arange(width, dtype=np.float32), indexing="ij")
+    interior_radius = max(float(roi.r) * float(metadata.get("interior_radius_ratio", 1.0) or 1.0), 1.0)
+    interior_circle = ((xx - roi.cx) ** 2 + (yy - roi.cy) ** 2) <= interior_radius ** 2
+    gradient_axis = _sphere_gradient_axis(pixels_hwc, mask, roi)
+    axis_x = float((gradient_axis.get("vector") or [0.0, -1.0])[0])
+    axis_y = float((gradient_axis.get("vector") or [0.0, -1.0])[1])
+    perpendicular_x = float(-axis_y)
+    perpendicular_y = float(axis_x)
+    zone_measurements: List[Dict[str, object]] = []
+    for zone_bounds in _sphere_zone_geometries(width, height, roi, (axis_x, axis_y)):
+        pixel_bounds = dict(zone_bounds["pixel"])
+        zone_center = dict(zone_bounds["center"])
+        center_x = float(zone_center.get("x", float(roi.cx)) or float(roi.cx))
+        center_y = float(zone_center.get("y", float(roi.cy)) or float(roi.cy))
+        along = ((xx - center_x) * axis_x) + ((yy - center_y) * axis_y)
+        across = ((xx - center_x) * perpendicular_x) + ((yy - center_y) * perpendicular_y)
+        rect_half_width = max(float(roi.r) * SPHERE_ZONE_HALF_WIDTH_RATIO, 1.0)
+        rect_half_height = max(float(roi.r) * SPHERE_ZONE_HALF_HEIGHT_RATIO, 1.0)
+        rect_mask = (np.abs(along) <= rect_half_height) & (np.abs(across) <= rect_half_width)
+        zone_mask = mask & rect_mask
+        sampling_method = str(metadata.get("sampling_method", "circle_mask"))
+        if not np.any(zone_mask):
+            zone_mask = interior_circle & rect_mask
+            sampling_method = f"{sampling_method}_zone_fallback"
+        if not np.any(zone_mask):
+            zone_mask = interior_circle & (
+                (np.abs(((xx - center_x) * axis_x) + ((yy - center_y) * axis_y)) <= (rect_half_height * 1.25))
+                & (np.abs(((xx - center_x) * perpendicular_x) + ((yy - center_y) * perpendicular_y)) <= (rect_half_width * 1.25))
+            )
+            sampling_method = f"{sampling_method}_expanded_fallback"
+        zone_pixels = pixels_hwc[zone_mask]
+        rect_area = float(max(np.sum(rect_mask), 1))
+        zone_fraction = float(np.sum(zone_mask)) / rect_area
+        zone_stats = _measure_pixel_cloud_statistics(
+            zone_pixels,
+            sampling_confidence=combine_confidence(float(metadata.get("sampling_confidence", 0.0) or 0.0), zone_fraction),
+            sampling_method=sampling_method,
+            mask_fraction=float(metadata.get("mask_fraction", 1.0) or 1.0),
+            interior_fraction=float(metadata.get("interior_fraction", 1.0) or 1.0),
+            interior_radius_ratio=float(metadata.get("interior_radius_ratio", 1.0) or 1.0),
+            low_percentile=low_percentile,
+            high_percentile=high_percentile,
+        )
+        zone_measurements.append(
+            {
+                "label": str(zone_bounds["label"]),
+                "display_label": str(zone_bounds["display_label"]),
+                "bounds": {
+                    "pixel": pixel_bounds,
+                    "normalized_within_roi": dict(zone_bounds["normalized_within_roi"]),
+                    "polygon": dict(zone_bounds["polygon"]),
+                },
+                "measured_log2_luminance": float(zone_stats["measured_log2_luminance"]),
+                "measured_ire": float(zone_stats["measured_ire"]),
+                "measured_rgb_mean": [float(value) for value in zone_stats["measured_rgb_mean"]],
+                "measured_rgb_chromaticity": [float(value) for value in zone_stats["measured_rgb_chromaticity"]],
+                "valid_pixel_count": int(zone_stats["valid_pixel_count"]),
+                "roi_variance": float(zone_stats["roi_variance"]),
+                "gray_luminance_distribution": dict(zone_stats["gray_luminance_distribution"]),
+                "gray_log2_distribution": dict(zone_stats["gray_log2_distribution"]),
+                "confidence": float(zone_stats["confidence"]),
+                "sampling_method": str(zone_stats["sampling_method"]),
+                "zone_fraction": zone_fraction,
+            }
+        )
+    ordered_map = {str(item["label"]): item for item in zone_measurements}
+    ordered_zones = [ordered_map[label] for label, _, _ in SPHERE_ZONE_DEFINITIONS if label in ordered_map]
+    zone_log2 = np.asarray([float(item["measured_log2_luminance"]) for item in ordered_zones], dtype=np.float32)
+    zone_ires = np.asarray([float(item["measured_ire"]) for item in ordered_zones], dtype=np.float32)
+    rgb_means = np.asarray([item["measured_rgb_mean"] for item in ordered_zones], dtype=np.float32)
+    chroma = np.asarray([item["measured_rgb_chromaticity"] for item in ordered_zones], dtype=np.float32)
+    rgb_mean = np.median(rgb_means, axis=0)
+    chroma_mean = np.median(chroma, axis=0)
+    bright_ire = float(ordered_map.get("bright_side", {}).get("measured_ire", 0.0) or 0.0)
+    center_ire = float(ordered_map.get("center", {}).get("measured_ire", 0.0) or 0.0)
+    dark_ire = float(ordered_map.get("dark_side", {}).get("measured_ire", 0.0) or 0.0)
+    return {
+        "measured_log2_luminance": float(np.median(zone_log2)) if ordered_zones else 0.0,
+        "measured_ire": float(np.median(zone_ires)) if ordered_zones else 0.0,
+        "measured_rgb_mean": [float(rgb_mean[0]), float(rgb_mean[1]), float(rgb_mean[2])] if ordered_zones else [0.0, 0.0, 0.0],
+        "measured_rgb_chromaticity": [float(chroma_mean[0]), float(chroma_mean[1]), float(chroma_mean[2])] if ordered_zones else [1.0 / 3.0] * 3,
+        "valid_pixel_count": int(sum(int(item["valid_pixel_count"]) for item in ordered_zones)),
+        "saturation_fraction": 0.0,
+        "black_fraction": 0.0,
+        "roi_variance": float(np.median(np.asarray([float(item["roi_variance"]) for item in ordered_zones], dtype=np.float32))) if ordered_zones else 0.0,
+        "gray_log2_stddev": float(np.std(zone_log2)) if ordered_zones else 0.0,
+        "clipped_fraction": 0.0,
+        "retained_fraction": float(np.median(np.asarray([float(item.get("zone_fraction", 0.0) or 0.0) for item in ordered_zones], dtype=np.float32))) if ordered_zones else 0.0,
+        "confidence": float(np.median(np.asarray([float(item.get("confidence", 0.0) or 0.0) for item in ordered_zones], dtype=np.float32))) if ordered_zones else 0.0,
+        "sampling_method": str(metadata.get("sampling_method", "circle_mask")),
+        "mask_fraction": float(metadata.get("mask_fraction", 1.0) or 1.0),
+        "interior_fraction": float(metadata.get("interior_fraction", 1.0) or 1.0),
+        "interior_radius_ratio": float(metadata.get("interior_radius_ratio", 1.0) or 1.0),
+        "neutral_sample_count": len(ordered_zones),
+        "neutral_sample_log2_spread": float(np.max(zone_log2) - np.min(zone_log2)) if ordered_zones else 0.0,
+        "neutral_sample_chromaticity_spread": float(np.max(np.linalg.norm(chroma - chroma_mean, axis=1))) if ordered_zones else 0.0,
+        "zone_measurements": ordered_zones,
+        "bright_ire": bright_ire,
+        "center_ire": center_ire,
+        "dark_ire": dark_ire,
+        "top_ire": bright_ire,
+        "mid_ire": center_ire,
+        "bottom_ire": dark_ire,
+        "zone_spread_ire": float(np.max(zone_ires) - np.min(zone_ires)) if ordered_zones else 0.0,
+        "zone_spread_stops": float(np.max(zone_log2) - np.min(zone_log2)) if ordered_zones else 0.0,
+        "aggregate_sphere_profile": f"Bright {bright_ire:.0f} / Center {center_ire:.0f} / Dark {dark_ire:.0f} IRE",
+        "measurement_geometry": "three_band_gradient_aligned_profile_within_refined_sphere_mask",
+        "dominant_gradient_axis": {
+            "x": axis_x,
+            "y": axis_y,
+            "perpendicular_x": perpendicular_x,
+            "perpendicular_y": perpendicular_y,
+            "magnitude": float(gradient_axis.get("magnitude", 0.0) or 0.0),
+            "confidence": float(gradient_axis.get("confidence", 0.0) or 0.0),
+            "source": str(gradient_axis.get("source") or "fitted_luminance_plane"),
+        },
     }
 
 
