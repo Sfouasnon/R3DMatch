@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,9 +40,9 @@ SPHERE_INTERIOR_RADIUS_RATIO = 0.78
 SPHERE_MAX_SATURATION = 0.08
 SPHERE_MIN_COMPONENT_FRACTION = 0.12
 SPHERE_ZONE_DEFINITIONS = (
-    ("bright_side", "Bright", 0.24),
-    ("center", "Center", 0.0),
-    ("dark_side", "Dark", -0.24),
+    ("bright_side", "Sample 1", 0.24),
+    ("center", "Sample 2", 0.0),
+    ("dark_side", "Sample 3", -0.24),
 )
 SPHERE_ZONE_HALF_WIDTH_RATIO = 0.34
 SPHERE_ZONE_HALF_HEIGHT_RATIO = 0.11
@@ -690,8 +691,8 @@ def build_sphere_sampling_mask(
             "luminance_high": 1.0,
         }
 
-    erosion_radius = max(1, int(round(max(roi.r * (1.0 - interior_radius_ratio), 1.0))))
-    interior_mask = morphology.binary_erosion(base_mask, morphology.disk(erosion_radius))
+    interior_radius = max(float(roi.r) * float(interior_radius_ratio), 1.0)
+    interior_mask = ((xx - roi.cx) ** 2 + (yy - roi.cy) ** 2) <= interior_radius ** 2
     if not np.any(interior_mask):
         interior_mask = base_mask.copy()
 
@@ -726,6 +727,7 @@ def build_sphere_sampling_mask(
         "mask_fraction": mask_fraction,
         "interior_fraction": interior_area / float(max(base_mask.sum(), 1)),
         "interior_radius_ratio": float(interior_radius_ratio),
+        "interior_radius_pixels": float(interior_radius),
         "sampling_confidence": sampling_confidence,
         "saturation_threshold": saturation_threshold,
         "luminance_low": luminance_low,
@@ -1016,20 +1018,40 @@ def measure_sphere_zone_profile_statistics(
     sampling_variant: str = "refined",
     low_percentile: float = 5.0,
     high_percentile: float = 95.0,
+    gradient_axis_override: Optional[Tuple[float, float]] = None,
 ) -> Dict[str, object]:
+    measure_started_at = time.perf_counter()
+    phase_started_at = measure_started_at
     mask, metadata = build_sphere_sampling_mask(image, roi, sampling_variant=sampling_variant)
+    build_mask_seconds = time.perf_counter() - phase_started_at
     pixels_hwc = np.moveaxis(image, 0, -1)
     height, width = mask.shape
     yy, xx = np.meshgrid(np.arange(height, dtype=np.float32), np.arange(width, dtype=np.float32), indexing="ij")
     interior_radius = max(float(roi.r) * float(metadata.get("interior_radius_ratio", 1.0) or 1.0), 1.0)
     interior_circle = ((xx - roi.cx) ** 2 + (yy - roi.cy) ** 2) <= interior_radius ** 2
-    gradient_axis = _sphere_gradient_axis(pixels_hwc, mask, roi)
-    axis_x = float((gradient_axis.get("vector") or [0.0, -1.0])[0])
-    axis_y = float((gradient_axis.get("vector") or [0.0, -1.0])[1])
+    gradient_started_at = time.perf_counter()
+    if gradient_axis_override is None:
+        gradient_axis = _sphere_gradient_axis(pixels_hwc, mask, roi)
+        axis_x = float((gradient_axis.get("vector") or [0.0, -1.0])[0])
+        axis_y = float((gradient_axis.get("vector") or [0.0, -1.0])[1])
+    else:
+        axis_x = float(gradient_axis_override[0])
+        axis_y = float(gradient_axis_override[1])
+        gradient_axis = {
+            "vector": [axis_x, axis_y],
+            "magnitude": 0.0,
+            "confidence": 1.0,
+            "source": "reused_from_raw_profile",
+        }
+    gradient_axis_seconds = time.perf_counter() - gradient_started_at
     perpendicular_x = float(-axis_y)
     perpendicular_y = float(axis_x)
     zone_measurements: List[Dict[str, object]] = []
-    for zone_bounds in _sphere_zone_geometries(width, height, roi, (axis_x, axis_y)):
+    zone_geometry_started_at = time.perf_counter()
+    zone_geometries = _sphere_zone_geometries(width, height, roi, (axis_x, axis_y))
+    zone_geometry_seconds = time.perf_counter() - zone_geometry_started_at
+    zone_measurement_started_at = time.perf_counter()
+    for zone_bounds in zone_geometries:
         pixel_bounds = dict(zone_bounds["pixel"])
         zone_center = dict(zone_bounds["center"])
         center_x = float(zone_center.get("x", float(roi.cx)) or float(roi.cx))
@@ -1085,6 +1107,7 @@ def measure_sphere_zone_profile_statistics(
                 "zone_fraction": zone_fraction,
             }
         )
+    zone_measurement_seconds = time.perf_counter() - zone_measurement_started_at
     ordered_map = {str(item["label"]): item for item in zone_measurements}
     ordered_zones = [ordered_map[label] for label, _, _ in SPHERE_ZONE_DEFINITIONS if label in ordered_map]
     zone_log2 = np.asarray([float(item["measured_log2_luminance"]) for item in ordered_zones], dtype=np.float32)
@@ -1120,12 +1143,15 @@ def measure_sphere_zone_profile_statistics(
         "bright_ire": bright_ire,
         "center_ire": center_ire,
         "dark_ire": dark_ire,
+        "sample_1_ire": bright_ire,
+        "sample_2_ire": center_ire,
+        "sample_3_ire": dark_ire,
         "top_ire": bright_ire,
         "mid_ire": center_ire,
         "bottom_ire": dark_ire,
         "zone_spread_ire": float(np.max(zone_ires) - np.min(zone_ires)) if ordered_zones else 0.0,
         "zone_spread_stops": float(np.max(zone_log2) - np.min(zone_log2)) if ordered_zones else 0.0,
-        "aggregate_sphere_profile": f"Bright {bright_ire:.0f} / Center {center_ire:.0f} / Dark {dark_ire:.0f} IRE",
+        "aggregate_sphere_profile": f"Sample 1 {bright_ire:.0f} / Sample 2 {center_ire:.0f} / Sample 3 {dark_ire:.0f} IRE",
         "measurement_geometry": "three_band_gradient_aligned_profile_within_refined_sphere_mask",
         "dominant_gradient_axis": {
             "x": axis_x,
@@ -1135,6 +1161,13 @@ def measure_sphere_zone_profile_statistics(
             "magnitude": float(gradient_axis.get("magnitude", 0.0) or 0.0),
             "confidence": float(gradient_axis.get("confidence", 0.0) or 0.0),
             "source": str(gradient_axis.get("source") or "fitted_luminance_plane"),
+        },
+        "timing": {
+            "build_mask_seconds": float(build_mask_seconds),
+            "gradient_axis_seconds": float(gradient_axis_seconds),
+            "zone_geometry_seconds": float(zone_geometry_seconds),
+            "zone_measurement_seconds": float(zone_measurement_seconds),
+            "total_measurement_seconds": float(time.perf_counter() - measure_started_at),
         },
     }
 

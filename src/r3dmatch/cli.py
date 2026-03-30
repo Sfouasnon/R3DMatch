@@ -281,7 +281,7 @@ def review_calibration_command(
     target_type: str = typer.Option(..., "--target-type", help="Target type: gray_card, gray_sphere, or color_chart"),
     processing_mode: str = typer.Option("both", "--processing-mode", help="Processing mode: exposure, color, or both"),
     mode: str = typer.Option("scene", "--mode", help="Matching mode: scene or view"),
-    matching_domain: str = typer.Option("scene", "--matching-domain", help="Matching domain: scene or perceptual"),
+    matching_domain: str = typer.Option("perceptual", "--matching-domain", help="Matching domain: scene or perceptual"),
     review_mode: str = typer.Option("full_contact_sheet", "--review-mode", help="Review mode: full_contact_sheet or lightweight_analysis"),
     lut: Optional[str] = typer.Option(None, "--lut", help="Optional LUT override (.cube)"),
     calibration: Optional[str] = typer.Option(None, "--calibration", help="Optional legacy/single exposure calibration JSON"),

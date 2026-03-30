@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
@@ -24,6 +25,7 @@ from .execution import raise_if_cancelled
 from .identity import clip_id_from_path, legacy_camera_group_from_clip_id, subset_key_from_clip_id
 from .luts import CubeLut, apply_lut, load_cube_lut
 from .models import ClipResult, FrameStat, MonitoringContext, SamplePlan, SphereROI
+from .progress import emit_review_progress
 from .sdk import resolve_backend
 from .sidecar import write_sidecar_file
 
@@ -46,11 +48,32 @@ def analyze_path(
     target_type: Optional[str] = None,
     selected_clip_ids: Optional[List[str]] = None,
     selected_clip_groups: Optional[List[str]] = None,
+    progress_path: Optional[str] = None,
+    half_res_decode: bool = False,
+    workload_trace_path: Optional[str] = None,
+    runtime_trace_path: Optional[str] = None,
+    invocation_source: str = "direct_cli",
+    measurement_source: str = "scene_sdk_decode_with_proxy_monitoring",
 ) -> Dict[str, object]:
+    analysis_started_at = time.perf_counter()
+    emit_review_progress(
+        progress_path,
+        phase="analysis_start",
+        detail="Starting source discovery.",
+        stage_label="Scanning sources",
+    )
     raise_if_cancelled("Run cancelled before source discovery.")
     clips = discover_clips(input_path)
     if not clips:
         raise ValueError(f"No .R3D clips found under {input_path}")
+    emit_review_progress(
+        progress_path,
+        phase="source_scan_complete",
+        detail=f"Discovered {len(clips)} clip(s).",
+        stage_label="Scanning sources",
+        clip_count=len(clips),
+        elapsed_seconds=time.perf_counter() - analysis_started_at,
+    )
 
     requested_clip_ids = {str(item).strip() for item in (selected_clip_ids or []) if str(item).strip()}
     requested_clip_groups = {str(item).strip() for item in (selected_clip_groups or []) if str(item).strip()}
@@ -68,16 +91,51 @@ def analyze_path(
                 "No .R3D clips matched the requested subset selection "
                 f"(clip_ids={sorted(requested_clip_ids)}, clip_groups={sorted(requested_clip_groups)})"
             )
+    emit_review_progress(
+        progress_path,
+        phase="subset_resolved",
+        detail=f"Resolved subset to {len(clips)} clip(s).",
+        stage_label="Resolving subset",
+        clip_count=len(clips),
+        elapsed_seconds=time.perf_counter() - analysis_started_at,
+        extra={
+            "selected_clip_ids": sorted(requested_clip_ids),
+            "selected_clip_groups": sorted(requested_clip_groups),
+        },
+    )
 
     out_root = Path(out_dir).expanduser().resolve()
     analysis_dir = out_root / "analysis"
     sidecar_dir = out_root / "sidecars"
     analysis_dir.mkdir(parents=True, exist_ok=True)
     sidecar_dir.mkdir(parents=True, exist_ok=True)
+    rendered_preview_context = None
+    if str(measurement_source or "").strip() == "rendered_preview_ipp2":
+        rendered_preview_context = _resolve_rendered_preview_context()
+    emit_review_progress(
+        progress_path,
+        phase="measurement_start",
+        detail="Starting measurement phase." if str(measurement_source or "").strip() != "rendered_preview_ipp2" else "Starting IPP2 render-and-measure phase.",
+        stage_label="Measuring clips",
+        clip_count=len(clips),
+        elapsed_seconds=time.perf_counter() - analysis_started_at,
+    )
 
     provisional: list[ClipResult] = []
-    for clip in clips:
+    for clip_index, clip in enumerate(clips, start=1):
         raise_if_cancelled("Run cancelled during clip measurement.")
+        clip_id = clip_id_from_path(str(clip))
+        clip_started_at = time.perf_counter()
+        emit_review_progress(
+            progress_path,
+            phase="clip_measurement_start",
+            detail="Measuring clip." if str(measurement_source or "").strip() != "rendered_preview_ipp2" else "Rendering and measuring clip in IPP2.",
+            stage_label="Measuring clips",
+            clip_index=clip_index,
+            clip_count=len(clips),
+            current_clip_id=clip_id,
+            elapsed_seconds=time.perf_counter() - analysis_started_at,
+        )
         provisional.append(
             analyze_clip(
                 str(clip),
@@ -88,7 +146,22 @@ def analyze_path(
                 sampling_strategy=sampling_strategy,
                 calibration_roi=calibration_roi,
                 target_type=target_type,
+                half_res_decode=half_res_decode,
+                measurement_source=measurement_source,
+                measurement_output_dir=str(out_root),
+                rendered_preview_context=rendered_preview_context,
             )
+        )
+        emit_review_progress(
+            progress_path,
+            phase="clip_measurement_complete",
+            detail=f"Finished measuring {clip_id}.",
+            stage_label="Measuring clips",
+            clip_index=clip_index,
+            clip_count=len(clips),
+            current_clip_id=clip_id,
+            elapsed_seconds=time.perf_counter() - analysis_started_at,
+            extra={"clip_elapsed_seconds": time.perf_counter() - clip_started_at},
         )
 
     should_use_array_batch = calibration_mode == "array-gray-sphere" or (
@@ -144,6 +217,14 @@ def analyze_path(
         }
 
     final_results: list[ClipResult] = []
+    emit_review_progress(
+        progress_path,
+        phase="analysis_finalize_start",
+        detail="Writing analysis outputs.",
+        stage_label="Writing analysis",
+        clip_count=len(provisional),
+        elapsed_seconds=time.perf_counter() - analysis_started_at,
+    )
     for item in provisional:
         raise_if_cancelled("Run cancelled while writing analysis outputs.")
         derived_group_baseline = group_baselines[item.group_key]
@@ -222,6 +303,14 @@ def analyze_path(
             diagnostics={
                 **item.diagnostics,
                 "pending_color_gains": resolved_color_gains,
+                "runtime_trace": {
+                    **dict((item.diagnostics or {}).get("runtime_trace") or {}),
+                    "invocation_source": invocation_source,
+                },
+                "workload_trace": {
+                    **dict((item.diagnostics or {}).get("workload_trace") or {}),
+                    "invocation_source": invocation_source,
+                },
             },
         )
         final_results.append(result)
@@ -304,7 +393,89 @@ def analyze_path(
         "selected_clip_ids": sorted(requested_clip_ids) if requested_clip_ids else None,
         "selected_clip_groups": sorted(requested_clip_groups) if requested_clip_groups else None,
     }
+    runtime_rows = []
+    if workload_trace_path or runtime_trace_path:
+        workload_rows = []
+        for item in final_results:
+            workload = dict((item.diagnostics or {}).get("workload_trace") or {})
+            runtime = dict((item.diagnostics or {}).get("runtime_trace") or {})
+            workload_rows.append(
+                {
+                    "clip_id": item.clip_id,
+                    "group_key": item.group_key,
+                    "representative_frame_index": int(workload.get("representative_frame_index", item.sample_plan.start_frame) or 0),
+                    "frames_analyzed": int(workload.get("frames_analyzed", len(item.frame_stats)) or 0),
+                    "decode_width": int(workload.get("decode_width", 0) or 0),
+                    "decode_height": int(workload.get("decode_height", 0) or 0),
+                    "decode_half_res": bool(workload.get("decode_half_res", half_res_decode)),
+                    "measurement_domain": str(workload.get("measurement_domain") or "scene_sdk_decode_with_proxy_monitoring"),
+                    "detection_count": int(workload.get("detection_count", 0) or 0),
+                    "gradient_axis_count": int(workload.get("gradient_axis_count", 0) or 0),
+                    "region_stat_count": int(workload.get("region_stat_count", 0) or 0),
+                    "strategy_reuse": bool(workload.get("strategy_reuse", True)),
+                    "total_measurement_time_seconds": float(workload.get("total_measurement_time_seconds", 0.0) or 0.0),
+                }
+            )
+            runtime_rows.append(
+                {
+                    "clip_id": item.clip_id,
+                    "group_key": item.group_key,
+                    "invocation_source": str(runtime.get("invocation_source") or invocation_source),
+                    "backend": str(runtime.get("backend") or item.backend),
+                    "measurement_domain": str(runtime.get("measurement_domain") or workload.get("measurement_domain") or "scene_sdk_decode_with_proxy_monitoring"),
+                    "measurement_source": str(runtime.get("measurement_source") or "scene_sdk_decode_with_proxy_monitoring"),
+                    "representative_frame_index": int(runtime.get("representative_frame_index", item.sample_plan.start_frame) or 0),
+                    "frames_analyzed": int(runtime.get("frames_analyzed", len(item.frame_stats)) or 0),
+                    "decode_width": int(runtime.get("decode_width", workload.get("decode_width", 0)) or 0),
+                    "decode_height": int(runtime.get("decode_height", workload.get("decode_height", 0)) or 0),
+                    "decode_half_res": bool(runtime.get("decode_half_res", workload.get("decode_half_res", half_res_decode))),
+                    "detection_count": int(runtime.get("detection_count", workload.get("detection_count", 0)) or 0),
+                    "gradient_axis_count": int(runtime.get("gradient_axis_count", workload.get("gradient_axis_count", 0)) or 0),
+                    "region_stat_count": int(runtime.get("region_stat_count", workload.get("region_stat_count", 0)) or 0),
+                    "strategy_reuse": bool(runtime.get("strategy_reuse", workload.get("strategy_reuse", True))),
+                    "durations_seconds": dict(runtime.get("durations_seconds") or {}),
+                    "frame_runtime": list(runtime.get("frame_runtime") or []),
+                    "total_measurement_time_seconds": float(runtime.get("total_measurement_time_seconds", workload.get("total_measurement_time_seconds", 0.0)) or 0.0),
+                    "rendered_image_path": str(
+                        runtime.get("rendered_image_path")
+                        or workload.get("rendered_image_path")
+                        or ""
+                    ),
+                }
+            )
+    if workload_trace_path:
+        write_json(
+            Path(workload_trace_path).expanduser().resolve(),
+            {
+                "measurement_domain": "scene_sdk_decode_with_proxy_monitoring",
+                "measurement_source": str(measurement_source or "scene_sdk_decode_with_proxy_monitoring"),
+                "half_res_decode_enabled": bool(half_res_decode),
+                "invocation_source": invocation_source,
+                "clip_count": len(workload_rows),
+                "clips": workload_rows,
+            },
+        )
+    if runtime_trace_path:
+        write_json(
+            Path(runtime_trace_path).expanduser().resolve(),
+            {
+                "measurement_domain": str(measurement_source or "scene_sdk_decode_with_proxy_monitoring"),
+                "measurement_source": str(measurement_source or "scene_sdk_decode_with_proxy_monitoring"),
+                "half_res_decode_enabled": bool(half_res_decode),
+                "invocation_source": invocation_source,
+                "clip_count": len(runtime_rows),
+                "clips": runtime_rows,
+            },
+        )
     write_json(out_root / "summary.json", summary)
+    emit_review_progress(
+        progress_path,
+        phase="analysis_complete",
+        detail=f"Analysis complete for {len(final_results)} clip(s).",
+        stage_label="Analysis complete",
+        clip_count=len(final_results),
+        elapsed_seconds=time.perf_counter() - analysis_started_at,
+    )
     return summary
 
 
@@ -318,11 +489,28 @@ def analyze_clip(
     sampling_strategy: str,
     calibration_roi: Optional[Dict[str, float]] = None,
     target_type: Optional[str] = None,
+    half_res_decode: bool = False,
+    measurement_source: str = "scene_sdk_decode_with_proxy_monitoring",
+    measurement_output_dir: Optional[str] = None,
+    rendered_preview_context: Optional[Dict[str, object]] = None,
 ) -> ClipResult:
     raise_if_cancelled("Run cancelled before clip decode.")
+    clip_started_at = time.perf_counter()
+    runtime_trace: Dict[str, object] = {
+        "measurement_domain": str(measurement_source or "scene_sdk_decode_with_proxy_monitoring"),
+        "measurement_source": str(measurement_source or "scene_sdk_decode_with_proxy_monitoring"),
+        "frame_runtime": [],
+    }
+    function_durations: Dict[str, float] = {}
+    phase_started_at = time.perf_counter()
     backend_impl = resolve_backend(backend)
+    function_durations["resolve_backend_seconds"] = time.perf_counter() - phase_started_at
+    phase_started_at = time.perf_counter()
     clip = backend_impl.inspect_clip(source_path)
+    function_durations["inspect_clip_seconds"] = time.perf_counter() - phase_started_at
+    phase_started_at = time.perf_counter()
     sample_plan = build_sample_plan(clip.total_frames, sample_count=sample_count, strategy=sampling_strategy)
+    function_durations["build_sample_plan_seconds"] = time.perf_counter() - phase_started_at
     monitoring = MonitoringContext(
         mode=mode,
         ipp2_color_space=clip.color_space,
@@ -333,6 +521,21 @@ def analyze_clip(
     )
     monitoring.resolved_lut_path = monitoring.lut_override_path or monitoring.active_lut_path
     lut = resolve_lut(monitoring.resolved_lut_path) if mode == "view" else None
+
+    if str(measurement_source or "").strip() == "rendered_preview_ipp2":
+        return _analyze_clip_via_rendered_preview(
+            clip=clip,
+            sample_plan=sample_plan,
+            source_path=source_path,
+            backend_name=backend_impl.name,
+            global_reference=math.log2(0.18),
+            calibration_roi=calibration_roi,
+            target_type=target_type,
+            measurement_output_dir=measurement_output_dir,
+            rendered_preview_context=rendered_preview_context or _resolve_rendered_preview_context(),
+            clip_started_at=clip_started_at,
+            function_durations=function_durations,
+        )
 
     frame_stats: list[FrameStat] = []
     accepted_values: list[float] = []
@@ -348,21 +551,49 @@ def analyze_clip(
     representative_neutral_samples: list[dict[str, object]] = []
     sphere_sampling_measurements: list[dict[str, object]] = []
     sphere_sampling_confidences: list[float] = []
+    decode_width = 0
+    decode_height = 0
+    detection_count = 0
+    gradient_axis_count = 0
+    region_stat_count = 0
+    phase_started_at = time.perf_counter()
+    decode_wait_started_at = phase_started_at
     for frame_index, timestamp_seconds, image in backend_impl.decode_frames(
         source_path,
         start_frame=sample_plan.start_frame,
         max_frames=sample_plan.max_frames,
         frame_step=sample_plan.frame_step,
+        half_res=half_res_decode,
     ):
         raise_if_cancelled("Run cancelled during frame measurement.")
+        frame_decode_seconds = time.perf_counter() - decode_wait_started_at
+        _, decode_height, decode_width = image.shape
+        analyze_started_at = time.perf_counter()
         stat = analyze_frame(frame_index, timestamp_seconds, image, mode=mode, lut=lut)
+        analyze_seconds = time.perf_counter() - analyze_started_at
         frame_stats.append(stat)
+        measurement_started_at = time.perf_counter()
         measurement = measure_frame_color_and_exposure(
             image,
             mode=mode,
             lut=lut,
             calibration_roi=calibration_roi,
             target_type=target_type,
+        )
+        measurement_seconds = time.perf_counter() - measurement_started_at
+        workload = dict(measurement.get("workload_trace") or {})
+        detection_count += int(workload.get("detection_count", 0) or 0)
+        gradient_axis_count += int(workload.get("gradient_axis_count", 0) or 0)
+        region_stat_count += int(workload.get("region_stat_count", 0) or 0)
+        runtime_trace["frame_runtime"].append(
+            {
+                "frame_index": int(frame_index),
+                "timestamp_seconds": float(timestamp_seconds),
+                "decode_wait_seconds": float(frame_decode_seconds),
+                "analyze_frame_seconds": float(analyze_seconds),
+                "measure_frame_seconds": float(measurement_seconds),
+                "measurement_runtime": dict(measurement.get("measurement_runtime") or {}),
+            }
         )
         measured_log_values.append(measurement["measured_log2_luminance"])
         measured_log_values_raw.append(measurement["measured_log2_luminance_raw"])
@@ -380,6 +611,8 @@ def analyze_clip(
             sphere_sampling_confidences.append(float(measurement.get("gray_sphere_sampling_confidence", 0.0) or 0.0))
         if stat.accepted:
             accepted_values.append(stat.log_luminance_median)
+        decode_wait_started_at = time.perf_counter()
+    function_durations["decode_and_measure_seconds"] = time.perf_counter() - phase_started_at
     if not accepted_values:
         accepted_values = [item.log_luminance_median for item in frame_stats]
 
@@ -403,8 +636,39 @@ def analyze_clip(
         "neutral_samples": representative_neutral_samples,
         "calibration_roi": calibration_roi,
         "calibration_measurement_mode": "shared_roi" if calibration_roi is not None else "center_region_fallback",
-        "exposure_measurement_domain": "monitoring",
-        "monitoring_preview_transform": "REDLine / IPP2 / Rec709 / BT1886 / Medium / Medium",
+        "exposure_measurement_domain": "scene_sdk_decode_with_proxy_monitoring",
+        "monitoring_preview_transform": "Local monitoring proxy over SDK decode (not REDLine IPP2 render)",
+        "workload_trace": {
+            "representative_frame_index": int(sample_plan.start_frame),
+            "frames_analyzed": len(frame_stats),
+            "decode_width": int(decode_width),
+            "decode_height": int(decode_height),
+            "decode_half_res": bool(half_res_decode),
+            "measurement_domain": "scene_sdk_decode_with_proxy_monitoring",
+            "detection_count": int(detection_count),
+            "gradient_axis_count": int(gradient_axis_count),
+            "region_stat_count": int(region_stat_count),
+            "strategy_reuse": True,
+            "total_measurement_time_seconds": time.perf_counter() - clip_started_at,
+        },
+        "runtime_trace": {
+            "invocation_source": "",
+            "backend": backend_impl.name,
+            "measurement_domain": "scene_sdk_decode_with_proxy_monitoring",
+            "measurement_source": "scene_sdk_decode_with_proxy_monitoring",
+            "representative_frame_index": int(sample_plan.start_frame),
+            "frames_analyzed": len(frame_stats),
+            "decode_width": int(decode_width),
+            "decode_height": int(decode_height),
+            "decode_half_res": bool(half_res_decode),
+            "detection_count": int(detection_count),
+            "gradient_axis_count": int(gradient_axis_count),
+            "region_stat_count": int(region_stat_count),
+            "strategy_reuse": True,
+            "durations_seconds": function_durations,
+            "frame_runtime": list(runtime_trace["frame_runtime"]),
+            "total_measurement_time_seconds": time.perf_counter() - clip_started_at,
+        },
     }
     if sphere_sampling_measurements:
         diagnostics.update(
@@ -431,6 +695,229 @@ def analyze_clip(
         monitoring=monitoring,
         clip_metadata=clip,
         frame_stats=frame_stats,
+        diagnostics=diagnostics,
+    )
+
+
+def _resolve_rendered_preview_context() -> Dict[str, object]:
+    from .report import (
+        _detect_redline_capabilities,
+        _measurement_preview_settings_for_domain,
+        _resolve_redline_executable,
+    )
+
+    redline_executable = _resolve_redline_executable()
+    return {
+        "redline_executable": redline_executable,
+        "redline_capabilities": _detect_redline_capabilities(redline_executable),
+        "preview_settings": _measurement_preview_settings_for_domain("perceptual"),
+    }
+
+
+def _analyze_clip_via_rendered_preview(
+    *,
+    clip,
+    sample_plan: SamplePlan,
+    source_path: str,
+    backend_name: str,
+    global_reference: float,
+    calibration_roi: Optional[Dict[str, float]],
+    target_type: Optional[str],
+    measurement_output_dir: Optional[str],
+    rendered_preview_context: Dict[str, object],
+    clip_started_at: float,
+    function_durations: Dict[str, float],
+) -> ClipResult:
+    from .report import _measure_rendered_preview_roi_ipp2, _preview_transform_label, render_preview_frame
+
+    if measurement_output_dir is None:
+        raise RuntimeError("Rendered-preview measurement requires a measurement output directory.")
+    measurement_root = Path(measurement_output_dir).expanduser().resolve() / "previews" / "_measurement"
+    measurement_root.mkdir(parents=True, exist_ok=True)
+    preview_path = measurement_root / f"{clip.clip_id}.original.analysis.measurement.jpg"
+
+    render_started_at = time.perf_counter()
+    render = render_preview_frame(
+        source_path,
+        str(preview_path),
+        frame_index=int(sample_plan.start_frame),
+        redline_executable=str(rendered_preview_context["redline_executable"]),
+        redline_capabilities=dict(rendered_preview_context["redline_capabilities"]),
+        preview_settings=dict(rendered_preview_context["preview_settings"]),
+        use_as_shot_metadata=True,
+    )
+    render_seconds = time.perf_counter() - render_started_at
+    function_durations["render_preview_seconds"] = float(render_seconds)
+    if int(render["returncode"]) != 0:
+        raise RuntimeError(
+            f"REDLine preview render failed for {clip.clip_id} during lightweight measurement. "
+            f"Command: {' '.join(render['command'])}. STDERR: {str(render['stderr']).strip()}"
+        )
+    actual_preview_path = Path(str(render["output_path"])).expanduser().resolve()
+    if not actual_preview_path.exists():
+        raise RuntimeError(
+            f"REDLine preview render did not create expected file for lightweight measurement: {actual_preview_path}"
+        )
+
+    measure_started_at = time.perf_counter()
+    measured = _measure_rendered_preview_roi_ipp2(
+        str(actual_preview_path),
+        calibration_roi if str(target_type or "").strip().lower().replace("-", "_") == "gray_sphere" else calibration_roi,
+    )
+    measure_seconds = time.perf_counter() - measure_started_at
+    function_durations["measure_rendered_preview_seconds"] = float(measure_seconds)
+
+    measured_log2 = float(
+        measured.get(
+            "measured_log2_luminance_monitoring",
+            measured.get("measured_log2_luminance", 0.0),
+        )
+        or 0.0
+    )
+    raw_offset = float(global_reference - measured_log2)
+    measurement_runtime = dict(measured.get("measurement_runtime") or {})
+    frame_runtime = {
+        "frame_index": int(sample_plan.start_frame),
+        "timestamp_seconds": float(sample_plan.start_frame / max(float(clip.fps or 24.0), 1e-6)),
+        "render_preview_seconds": float(render_seconds),
+        "measure_frame_seconds": float(measure_seconds),
+        "measurement_runtime": measurement_runtime,
+        "rendered_image_path": str(actual_preview_path),
+    }
+    diagnostics = {
+        "sampled_frames": 1,
+        "accepted_frames": 1,
+        "measured_log2_luminance": measured_log2,
+        "measured_log2_luminance_monitoring": measured_log2,
+        "measured_log2_luminance_raw": measured_log2,
+        "measured_rgb_mean": [float(value) for value in measured.get("measured_rgb_mean", [0.0, 0.0, 0.0])],
+        "measured_rgb_chromaticity": [float(value) for value in measured.get("measured_rgb_chromaticity", [1 / 3, 1 / 3, 1 / 3])],
+        "valid_pixel_count": int(measured.get("valid_pixel_count", 0) or 0),
+        "saturation_fraction": float(measured.get("measured_saturation_fraction_monitoring", 0.0) or 0.0),
+        "black_fraction": 0.0,
+        "neutral_sample_count": int(measured.get("neutral_sample_count", 0) or 0),
+        "neutral_sample_log2_spread": float(measured.get("neutral_sample_log2_spread", 0.0) or 0.0),
+        "neutral_sample_chromaticity_spread": float(measured.get("neutral_sample_chromaticity_spread", 0.0) or 0.0),
+        "neutral_samples": [dict(item) for item in list(measured.get("neutral_samples") or [])],
+        "calibration_roi": calibration_roi,
+        "calibration_measurement_mode": str(
+            "gray_sphere_three_zone_profile" if str(target_type or "").strip().lower().replace("-", "_") == "gray_sphere" else "rendered_preview_sampling"
+        ),
+        "exposure_measurement_domain": "rendered_preview_ipp2",
+        "monitoring_preview_transform": _preview_transform_label(dict(rendered_preview_context["preview_settings"])),
+        "rendered_measurement_preview_path": str(actual_preview_path),
+        "rendered_measurement_command": list(render.get("command") or []),
+        "rendered_measurement_returncode": int(render.get("returncode", 0) or 0),
+        "rendered_measurement_stdout": str(render.get("stdout") or ""),
+        "rendered_measurement_stderr": str(render.get("stderr") or ""),
+        "rendered_measurement_source": "rendered_preview_ipp2",
+        "rendered_measurement_domain": "rendered_preview_ipp2",
+        "measurement_render_resolution": {
+            "width": int(measured.get("render_width", 0) or 0),
+            "height": int(measured.get("render_height", 0) or 0),
+        },
+        "workload_trace": {
+            "representative_frame_index": int(sample_plan.start_frame),
+            "frames_analyzed": 1,
+            "decode_width": int(measured.get("render_width", 0) or 0),
+            "decode_height": int(measured.get("render_height", 0) or 0),
+            "decode_half_res": False,
+            "measurement_domain": "rendered_preview_ipp2",
+            "measurement_source": "rendered_preview_ipp2",
+            "detection_count": 1,
+            "gradient_axis_count": 1 if list(measured.get("zone_measurements") or []) else 0,
+            "region_stat_count": 1,
+            "strategy_reuse": True,
+            "render_time_seconds": float(render_seconds),
+            "detection_time_seconds": float(measurement_runtime.get("sphere_detection_seconds", 0.0) or 0.0),
+            "gradient_time_seconds": float(measurement_runtime.get("gradient_axis_seconds", 0.0) or 0.0),
+            "stat_time_seconds": float(measurement_runtime.get("zone_stat_seconds", 0.0) or 0.0),
+            "total_measurement_time_seconds": float(time.perf_counter() - clip_started_at),
+            "rendered_image_path": str(actual_preview_path),
+        },
+        "runtime_trace": {
+            "invocation_source": "",
+            "backend": backend_name,
+            "measurement_domain": "rendered_preview_ipp2",
+            "measurement_source": "rendered_preview_ipp2",
+            "representative_frame_index": int(sample_plan.start_frame),
+            "frames_analyzed": 1,
+            "decode_width": int(measured.get("render_width", 0) or 0),
+            "decode_height": int(measured.get("render_height", 0) or 0),
+            "decode_half_res": False,
+            "detection_count": 1,
+            "gradient_axis_count": 1 if list(measured.get("zone_measurements") or []) else 0,
+            "region_stat_count": 1,
+            "strategy_reuse": True,
+            "durations_seconds": dict(function_durations),
+            "frame_runtime": [frame_runtime],
+            "total_measurement_time_seconds": float(time.perf_counter() - clip_started_at),
+            "render_time_seconds": float(render_seconds),
+            "detection_time_seconds": float(measurement_runtime.get("sphere_detection_seconds", 0.0) or 0.0),
+            "gradient_time_seconds": float(measurement_runtime.get("gradient_axis_seconds", 0.0) or 0.0),
+            "stat_time_seconds": float(measurement_runtime.get("zone_stat_seconds", 0.0) or 0.0),
+            "rendered_image_path": str(actual_preview_path),
+        },
+    }
+    diagnostics.update(
+        {
+            "gray_exposure_summary": str(measured.get("gray_exposure_summary") or "n/a"),
+            "bright_ire": float(measured.get("bright_ire", 0.0) or 0.0),
+            "center_ire": float(measured.get("center_ire", 0.0) or 0.0),
+            "dark_ire": float(measured.get("dark_ire", 0.0) or 0.0),
+            "sample_1_ire": float(measured.get("sample_1_ire", measured.get("bright_ire", 0.0)) or 0.0),
+            "sample_2_ire": float(measured.get("sample_2_ire", measured.get("center_ire", 0.0)) or 0.0),
+            "sample_3_ire": float(measured.get("sample_3_ire", measured.get("dark_ire", 0.0)) or 0.0),
+            "top_ire": float(measured.get("top_ire", 0.0) or 0.0),
+            "mid_ire": float(measured.get("mid_ire", 0.0) or 0.0),
+            "bottom_ire": float(measured.get("bottom_ire", 0.0) or 0.0),
+            "zone_spread_ire": float(measured.get("zone_spread_ire", 0.0) or 0.0),
+            "zone_spread_stops": float(measured.get("zone_spread_stops", 0.0) or 0.0),
+            "zone_measurements": [dict(item) for item in list(measured.get("zone_measurements") or [])],
+            "sphere_detection_confidence": float(measured.get("sphere_detection_confidence", 0.0) or 0.0),
+            "sphere_detection_label": str(measured.get("sphere_detection_label") or ""),
+            "sphere_detection_source": str(measured.get("sphere_roi_source") or ""),
+            "sphere_detection_details": dict(measured.get("sphere_detection_details") or {}),
+            "detected_sphere_roi": dict(measured.get("detected_sphere_roi") or {}),
+            "measurement_crop_bounds": dict(measured.get("measurement_crop_bounds") or {}),
+            "measurement_crop_size": dict(measured.get("measurement_crop_size") or {}),
+            "detection_failed": bool(measured.get("detection_failed")),
+            "dominant_gradient_axis": dict(measured.get("dominant_gradient_axis") or {}),
+        }
+    )
+    frame_stat = FrameStat(
+        frame_index=int(sample_plan.start_frame),
+        timestamp_seconds=float(sample_plan.start_frame / max(float(clip.fps or 24.0), 1e-6)),
+        log_luminance_median=measured_log2,
+        clipped_fraction=0.0,
+        valid_fraction=1.0,
+        accepted=not bool(measured.get("detection_failed")),
+        reason="sphere_detection_failed" if bool(measured.get("detection_failed")) else None,
+    )
+    return ClipResult(
+        clip_id=clip.clip_id,
+        group_key=clip.group_key,
+        source_path=clip.source_path,
+        backend=backend_name,
+        clip_statistic_log2=measured_log2,
+        group_key_statistic_log2=measured_log2,
+        global_reference_log2=global_reference,
+        raw_offset_stops=raw_offset,
+        camera_baseline_stops=0.0,
+        clip_trim_stops=raw_offset,
+        final_offset_stops=raw_offset,
+        confidence=float(measured.get("sphere_detection_confidence", 0.0) or 0.0),
+        sample_plan=sample_plan,
+        monitoring=MonitoringContext(
+            mode="view",
+            ipp2_color_space="BT.709",
+            ipp2_gamma_curve="BT.1886",
+            active_lut_path=None,
+            lut_override_path=None,
+            resolved_lut_path=None,
+        ),
+        clip_metadata=clip,
+        frame_stats=[frame_stat],
         diagnostics=diagnostics,
     )
 
@@ -611,11 +1098,16 @@ def _sphere_roi_for_region(region: np.ndarray) -> SphereROI:
 def _measure_gray_sphere_statistics(raw_region: np.ndarray, monitoring_region: np.ndarray) -> Dict[str, object]:
     sphere_roi = _sphere_roi_for_region(raw_region)
     legacy_raw = measure_sphere_region_statistics(raw_region, sphere_roi, sampling_variant="legacy")
-    refined_raw = measure_sphere_region_statistics(raw_region, sphere_roi, sampling_variant="refined")
     legacy_monitoring = measure_sphere_region_statistics(monitoring_region, sphere_roi, sampling_variant="legacy")
-    refined_monitoring = measure_sphere_region_statistics(monitoring_region, sphere_roi, sampling_variant="refined")
     raw_profile = measure_sphere_zone_profile_statistics(raw_region, sphere_roi, sampling_variant="refined")
-    monitoring_profile = measure_sphere_zone_profile_statistics(monitoring_region, sphere_roi, sampling_variant="refined")
+    raw_axis = dict(raw_profile.get("dominant_gradient_axis") or {})
+    raw_vector = list(raw_axis.get("vector") or [0.0, -1.0])
+    monitoring_profile = measure_sphere_zone_profile_statistics(
+        monitoring_region,
+        sphere_roi,
+        sampling_variant="refined",
+        gradient_axis_override=(float(raw_vector[0]), float(raw_vector[1])),
+    )
     return {
         "measured_log2_luminance": float(monitoring_profile["measured_log2_luminance"]),
         "measured_log2_luminance_monitoring": float(monitoring_profile["measured_log2_luminance"]),
@@ -623,8 +1115,8 @@ def _measure_gray_sphere_statistics(raw_region: np.ndarray, monitoring_region: n
         "measured_rgb_mean": [float(value) for value in raw_profile["measured_rgb_mean"]],
         "measured_rgb_chromaticity": [float(value) for value in raw_profile["measured_rgb_chromaticity"]],
         "valid_pixel_count": int(monitoring_profile["valid_pixel_count"]),
-        "saturation_fraction": float(refined_monitoring["saturation_fraction"]),
-        "black_fraction": float(refined_monitoring["black_fraction"]),
+        "saturation_fraction": float(monitoring_profile["saturation_fraction"]),
+        "black_fraction": float(monitoring_profile["black_fraction"]),
         "roi_variance": float(monitoring_profile["roi_variance"]),
         "monitoring_roi_variance": float(monitoring_profile["roi_variance"]),
         "raw_roi_variance": float(raw_profile["roi_variance"]),
@@ -642,7 +1134,7 @@ def _measure_gray_sphere_statistics(raw_region: np.ndarray, monitoring_region: n
         "zone_spread_stops": float(monitoring_profile["zone_spread_stops"]),
         "sphere_zone_profile_monitoring": [dict(item) for item in monitoring_profile["zone_measurements"]],
         "sphere_zone_profile_raw": [dict(item) for item in raw_profile["zone_measurements"]],
-        "raw_saturation_fraction": float(refined_raw["saturation_fraction"]),
+        "raw_saturation_fraction": float(raw_profile["saturation_fraction"]),
         "sphere_sampling_comparison": {
             "measurement_geometry": "three_band_gradient_aligned_profile_within_refined_sphere_mask",
             "sphere_roi_within_roi": {"cx": sphere_roi.cx, "cy": sphere_roi.cy, "r": sphere_roi.r},
@@ -656,26 +1148,32 @@ def _measure_gray_sphere_statistics(raw_region: np.ndarray, monitoring_region: n
                 "rgb_chromaticity_raw": [float(value) for value in legacy_raw["measured_rgb_chromaticity"]],
             },
             "refined": {
-                "monitoring_log2": float(refined_monitoring["measured_log2_luminance"]),
-                "raw_log2": float(refined_raw["measured_log2_luminance"]),
+                "monitoring_log2": float(monitoring_profile["measured_log2_luminance"]),
+                "raw_log2": float(raw_profile["measured_log2_luminance"]),
                 "confidence": float(raw_profile["confidence"]),
-                "mask_fraction": float(refined_raw["mask_fraction"]),
+                "mask_fraction": float(raw_profile["mask_fraction"]),
                 "sampling_method": str(raw_profile["sampling_method"]),
-                "rgb_mean_raw": [float(value) for value in refined_raw["measured_rgb_mean"]],
-                "rgb_chromaticity_raw": [float(value) for value in refined_raw["measured_rgb_chromaticity"]],
+                "rgb_mean_raw": [float(value) for value in raw_profile["measured_rgb_mean"]],
+                "rgb_chromaticity_raw": [float(value) for value in raw_profile["measured_rgb_chromaticity"]],
                 "top_ire": float(raw_profile["top_ire"]),
                 "mid_ire": float(raw_profile["mid_ire"]),
                 "bottom_ire": float(raw_profile["bottom_ire"]),
                 "profile_summary": str(raw_profile["aggregate_sphere_profile"]),
             },
-            "delta_raw_log2": float(refined_raw["measured_log2_luminance"] - legacy_raw["measured_log2_luminance"]),
-            "delta_monitoring_log2": float(refined_monitoring["measured_log2_luminance"] - legacy_monitoring["measured_log2_luminance"]),
+            "delta_raw_log2": float(raw_profile["measured_log2_luminance"] - legacy_raw["measured_log2_luminance"]),
+            "delta_monitoring_log2": float(monitoring_profile["measured_log2_luminance"] - legacy_monitoring["measured_log2_luminance"]),
             "window_reference_raw_log2": float(raw_profile["measured_log2_luminance"]),
             "window_reference_monitoring_log2": float(monitoring_profile["measured_log2_luminance"]),
             "window_reference_profile": str(monitoring_profile["aggregate_sphere_profile"]),
         },
         "gray_sphere_sampling_confidence": float(raw_profile["confidence"]),
         "calibration_measurement_mode": "gray_sphere_three_zone_profile",
+        "workload_trace": {
+            "measurement_domain": "scene_sdk_decode_with_proxy_monitoring",
+            "detection_count": 0,
+            "gradient_axis_count": 1,
+            "region_stat_count": 2,
+        },
     }
 
 
@@ -719,21 +1217,45 @@ def measure_frame_color_and_exposure(
     calibration_roi: Optional[Dict[str, float]] = None,
     target_type: Optional[str] = None,
 ) -> Dict[str, object]:
+    measurement_started_at = time.perf_counter()
+    phase_started_at = time.perf_counter()
     raw_region = np.clip(image, 0.0, 1.0)
     raw_region = _extract_normalized_roi_region(raw_region, calibration_roi) if calibration_roi is not None else extract_center_region(raw_region, fraction=0.4)
+    raw_region_seconds = time.perf_counter() - phase_started_at
+    phase_started_at = time.perf_counter()
     monitoring_region = np.clip(image, 0.0, 1.0)
     if mode == "view":
         monitoring_region = apply_lut(monitoring_region, lut) if lut is not None else np.power(monitoring_region, 1.0 / 2.4)
     monitoring_region = _apply_monitoring_review_transform(monitoring_region)
     monitoring_region = _extract_normalized_roi_region(monitoring_region, calibration_roi) if calibration_roi is not None else extract_center_region(monitoring_region, fraction=0.4)
+    monitoring_region_seconds = time.perf_counter() - phase_started_at
+
+    measurement_runtime = {
+        "raw_region_seconds": float(raw_region_seconds),
+        "monitoring_region_seconds": float(monitoring_region_seconds),
+    }
 
     if str(target_type or "").strip().lower().replace("-", "_") == "gray_sphere" and calibration_roi is not None:
-        return _measure_gray_sphere_statistics(raw_region, monitoring_region)
+        phase_started_at = time.perf_counter()
+        result = _measure_gray_sphere_statistics(raw_region, monitoring_region)
+        measurement_runtime["gray_sphere_statistics_seconds"] = float(time.perf_counter() - phase_started_at)
+        measurement_runtime["total_measurement_seconds"] = float(time.perf_counter() - measurement_started_at)
+        result["measurement_runtime"] = measurement_runtime
+        return result
 
+    phase_started_at = time.perf_counter()
     raw_stats = _measure_three_sample_statistics(raw_region)
+    measurement_runtime["raw_three_sample_seconds"] = float(time.perf_counter() - phase_started_at)
+    phase_started_at = time.perf_counter()
     monitoring_stats = _measure_three_sample_statistics(monitoring_region)
+    measurement_runtime["monitoring_three_sample_seconds"] = float(time.perf_counter() - phase_started_at)
+    phase_started_at = time.perf_counter()
     saturation_monitoring = _measure_region_statistics(monitoring_region)
+    measurement_runtime["saturation_monitoring_seconds"] = float(time.perf_counter() - phase_started_at)
+    phase_started_at = time.perf_counter()
     saturation_raw = _measure_region_statistics(raw_region)
+    measurement_runtime["saturation_raw_seconds"] = float(time.perf_counter() - phase_started_at)
+    measurement_runtime["total_measurement_seconds"] = float(time.perf_counter() - measurement_started_at)
     return {
         "measured_log2_luminance": monitoring_stats["measured_log2_luminance"],
         "measured_log2_luminance_monitoring": monitoring_stats["measured_log2_luminance"],
@@ -752,12 +1274,22 @@ def measure_frame_color_and_exposure(
         "neutral_samples": monitoring_stats["neutral_samples"],
         "neutral_samples_raw": raw_stats["neutral_samples"],
         "raw_saturation_fraction": saturation_raw["saturation_fraction"],
+        "workload_trace": {
+            "measurement_domain": "scene_sdk_decode_with_proxy_monitoring",
+            "detection_count": 0,
+            "gradient_axis_count": 0,
+            "region_stat_count": 4,
+        },
+        "measurement_runtime": measurement_runtime,
     }
 
 
 def build_sample_plan(total_frames: int, *, sample_count: int, strategy: str) -> SamplePlan:
     if strategy not in {"uniform", "head"}:
         raise ValueError("sampling strategy must be uniform or head")
+    if sample_count <= 1:
+        representative_frame = max(0, min(total_frames - 1, total_frames // 2))
+        return SamplePlan(strategy="representative", sample_count=1, start_frame=representative_frame, frame_step=1, max_frames=1)
     if strategy == "head":
         return SamplePlan(strategy=strategy, sample_count=sample_count, start_frame=0, frame_step=1, max_frames=min(total_frames, sample_count))
     frame_step = max(total_frames // max(sample_count, 1), 1)

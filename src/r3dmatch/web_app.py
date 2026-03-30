@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import threading
@@ -22,6 +23,7 @@ from flask import Flask, Response, jsonify, redirect, render_template_string, re
 from .ftps_ingest import normalize_source_mode, plan_ftps_request, source_mode_label
 from .identity import clip_id_from_path, subset_key_from_clip_id
 from .matching import discover_clips
+from .progress import load_review_progress, review_progress_path_for
 from .rcp2_apply import (
     apply_calibration_payload,
     build_camera_verification_report,
@@ -463,12 +465,10 @@ PAGE_TEMPLATE = """
             </select>
           </div>
           <div class="field">
-            <label for="matching_domain">Matching Domain</label>
-            <select id="matching_domain" name="matching_domain">
-              <option value="scene" {% if form.matching_domain == 'scene' %}selected{% endif %}>Scene-Referred (REDWideGamutRGB / Log3G10)</option>
-              <option value="perceptual" {% if form.matching_domain == 'perceptual' %}selected{% endif %}>Perceptual (IPP2 / BT.709 / BT.1886)</option>
-            </select>
-            <div class="meta">Choose whether matching is solved in a camera-space style domain or the human review display domain.</div>
+            <label for="matching_domain_display">Measurement Domain</label>
+            <input id="matching_domain" name="matching_domain" type="hidden" value="perceptual">
+            <input id="matching_domain_display" type="text" value="Perceptual (IPP2 / BT.709 / BT.1886)" readonly>
+            <div id="matching-domain-note" class="meta">Lightweight review is locked to the perceptual IPP2 monitoring domain so sphere measurement, operator review, and recommended corrections all use the same rendered pixels.</div>
           </div>
           <div class="field">
             <label for="review_mode">Review Mode</label>
@@ -481,12 +481,13 @@ PAGE_TEMPLATE = """
         </div>
       </div>
 
-      <div class="card">
-        <h2 class="section-title">ROI</h2>
-        <div class="field">
+      <details class="card">
+        <summary>Advanced / Debug Controls</summary>
+        <div class="meta" style="margin-top:12px;">Sphere localization is the default spatial basis for gray-sphere calibration. Manual ROI is available here only for fallback debugging.</div>
+        <div class="field" style="margin-top:14px;">
           <label for="roi_mode">ROI Mode</label>
           <select id="roi_mode" name="roi_mode">
-            {% for value, label in [('draw', 'draw'), ('center', 'center'), ('full', 'full'), ('manual', 'manual')] %}
+            {% for value, label in [('sphere_auto', 'sphere_auto'), ('draw', 'draw'), ('center', 'center'), ('full', 'full'), ('manual', 'manual')] %}
               <option value="{{ value }}" {% if form.roi_mode == value %}selected{% endif %}>{{ label }}</option>
             {% endfor %}
           </select>
@@ -513,7 +514,7 @@ PAGE_TEMPLATE = """
         {% else %}
           <div class="meta">{{ scan.preview_warning or 'Preview available after scan or first render.' }}</div>
         {% endif %}
-      </div>
+      </details>
 
       <div class="card">
         <h2 class="section-title">Strategies</h2>
@@ -944,14 +945,19 @@ PAGE_TEMPLATE = """
     }
 
     function applyRoiMode() {
-      const mode = document.getElementById('roi_mode').value;
+      const roiModeField = document.getElementById('roi_mode');
       const manualRow = document.getElementById('manual-roi-row');
       const desc = document.getElementById('roi-description');
       const x = document.getElementById('roi_x');
       const y = document.getElementById('roi_y');
       const w = document.getElementById('roi_w');
       const h = document.getElementById('roi_h');
-      if (mode === 'center') {
+      if (!roiModeField || !manualRow || !desc || !x || !y || !w || !h) return;
+      const mode = roiModeField.value;
+      if (mode === 'sphere_auto') {
+        desc.textContent = 'Automatic sphere detection drives the gray-sphere measurement workflow.';
+        manualRow.style.display = 'none';
+      } else if (mode === 'center') {
         x.value = '0.35'; y.value = '0.35'; w.value = '0.30'; h.value = '0.30';
         desc.textContent = 'Center crop (30% of frame)';
         manualRow.style.display = 'none';
@@ -968,7 +974,10 @@ PAGE_TEMPLATE = """
       }
       updateOverlayFromInputs();
     }
-    document.getElementById('roi_mode').addEventListener('change', applyRoiMode);
+    const roiModeField = document.getElementById('roi_mode');
+    if (roiModeField) {
+      roiModeField.addEventListener('change', applyRoiMode);
+    }
 
     function applySourceMode() {
       const mode = document.getElementById('source_mode').value;
@@ -989,14 +998,35 @@ PAGE_TEMPLATE = """
     }
     document.getElementById('source_mode').addEventListener('change', applySourceMode);
 
+    function applyReviewMode() {
+      const reviewMode = document.getElementById('review_mode').value;
+      const matchingDomain = document.getElementById('matching_domain');
+      const note = document.getElementById('matching-domain-note');
+      const lightweight = reviewMode === 'lightweight_analysis';
+      if (matchingDomain) {
+        matchingDomain.value = 'perceptual';
+      }
+      if (note) {
+        note.textContent = lightweight
+          ? 'Lightweight Analysis is locked to the perceptual IPP2 domain so sphere measurement, operator review, and recommended corrections all use the same rendered pixels.'
+          : 'Review runs use the perceptual IPP2 monitoring domain so sphere measurement and operator review stay aligned.';
+      }
+    }
+    document.getElementById('review_mode').addEventListener('change', applyReviewMode);
+
     function updateOverlayFromInputs() {
       const stage = document.getElementById('roi-stage');
       const overlay = document.getElementById('roi-overlay');
-      if (!stage || !overlay) return;
-      const x = parseFloat(document.getElementById('roi_x').value || '0');
-      const y = parseFloat(document.getElementById('roi_y').value || '0');
-      const w = parseFloat(document.getElementById('roi_w').value || '0');
-      const h = parseFloat(document.getElementById('roi_h').value || '0');
+      const desc = document.getElementById('roi-description');
+      const xField = document.getElementById('roi_x');
+      const yField = document.getElementById('roi_y');
+      const wField = document.getElementById('roi_w');
+      const hField = document.getElementById('roi_h');
+      if (!stage || !overlay || !desc || !xField || !yField || !wField || !hField) return;
+      const x = parseFloat(xField.value || '0');
+      const y = parseFloat(yField.value || '0');
+      const w = parseFloat(wField.value || '0');
+      const h = parseFloat(hField.value || '0');
       if (w <= 0 || h <= 0) {
         overlay.style.display = 'none';
         return;
@@ -1010,7 +1040,7 @@ PAGE_TEMPLATE = """
       const py = Math.round(y * stage.clientHeight);
       const pw = Math.round(w * stage.clientWidth);
       const ph = Math.round(h * stage.clientHeight);
-      document.getElementById('roi-description').textContent = 'Custom ROI: ' + pw + ' x ' + ph + ' at (' + px + ', ' + py + ')';
+      desc.textContent = 'Custom ROI: ' + pw + ' x ' + ph + ' at (' + px + ', ' + py + ')';
     }
 
     function wireDrawRoi() {
@@ -1022,7 +1052,8 @@ PAGE_TEMPLATE = """
       let startX = 0;
       let startY = 0;
       canvas.addEventListener('mousedown', (event) => {
-        if (document.getElementById('roi_mode').value !== 'draw') return;
+        const roiModeField = document.getElementById('roi_mode');
+        if (!roiModeField || roiModeField.value !== 'draw') return;
         dragging = true;
         const rect = stage.getBoundingClientRect();
         startX = clamp(event.clientX - rect.left, 0, rect.width);
@@ -1148,6 +1179,7 @@ PAGE_TEMPLATE = """
     }
     applyRoiMode();
     applySourceMode();
+    applyReviewMode();
     wireSubsetPanel();
     wireDrawRoi();
     updateOverlayFromInputs();
@@ -1160,6 +1192,8 @@ PAGE_TEMPLATE = """
 
 def build_review_web_command(repo_root: str, form: Dict[str, object]) -> List[str]:
     source_mode = normalize_source_mode(str(form.get("source_mode", "local_folder")))
+    review_mode = normalize_review_mode(str(form.get("review_mode", "full_contact_sheet")))
+    matching_domain_value = "perceptual"
     input_path = str(form["input_path"]) if source_mode == "local_folder" else str(Path(str(form["output_path"])).expanduser().resolve() / "ingest")
     args = [
         "python3",
@@ -1178,9 +1212,9 @@ def build_review_web_command(repo_root: str, form: Dict[str, object]) -> List[st
         "--processing-mode",
         str(form["processing_mode"]),
         "--matching-domain",
-        str(form["matching_domain"]),
+        matching_domain_value,
         "--review-mode",
-        str(form["review_mode"]),
+        review_mode,
         "--preview-mode",
         str(form["preview_mode"]),
     ]
@@ -1188,8 +1222,9 @@ def build_review_web_command(repo_root: str, form: Dict[str, object]) -> List[st
         args.extend(["--ftps-reel", str(form["ftps_reel"]), "--ftps-clips", str(form["ftps_clips"])])
         for camera in [item.strip() for item in str(form.get("ftps_cameras", "")).split(",") if item.strip()]:
             args.extend(["--ftps-camera", camera])
+    roi_mode = str(form.get("roi_mode", "sphere_auto"))
     roi_values = [form.get("roi_x"), form.get("roi_y"), form.get("roi_w"), form.get("roi_h")]
-    if all(value not in (None, "") for value in roi_values):
+    if roi_mode in {"draw", "manual", "center", "full"} and all(value not in (None, "") for value in roi_values):
         args.extend(["--roi-x", str(form["roi_x"]), "--roi-y", str(form["roi_y"]), "--roi-w", str(form["roi_w"]), "--roi-h", str(form["roi_h"])])
     if form.get("run_label"):
         args.extend(["--run-label", str(form["run_label"])])
@@ -1205,7 +1240,10 @@ def build_review_web_command(repo_root: str, form: Dict[str, object]) -> List[st
         args.extend(["--hero-clip-id", str(form["hero_clip_id"])])
     if form.get("preview_lut"):
         args.extend(["--preview-lut", str(form["preview_lut"])])
-    shell_command = f'cd "{repo_root}"; setenv PYTHONPATH "$PWD/src"; ' + " ".join(shlex.quote(item) for item in args)
+    shell_command = (
+        f'cd "{repo_root}"; setenv PYTHONPATH "$PWD/src"; setenv R3DMATCH_INVOCATION_SOURCE web_ui; '
+        + " ".join(shlex.quote(item) for item in args)
+    )
     return ["/bin/tcsh", "-c", shell_command]
 
 
@@ -1346,7 +1384,7 @@ def _default_form() -> Dict[str, object]:
         "backend": "red",
         "target_type": "gray_sphere",
         "processing_mode": "both",
-        "matching_domain": "scene",
+        "matching_domain": "perceptual",
         "roi_x": "",
         "roi_y": "",
         "roi_w": "",
@@ -1361,7 +1399,7 @@ def _default_form() -> Dict[str, object]:
         "preview_lut": "",
         "apply_cameras": "",
         "verification_after_path": "",
-        "roi_mode": "draw",
+        "roi_mode": "sphere_auto",
         "advanced_clip_selection": False,
     }
 
@@ -1375,6 +1413,7 @@ def _parse_form(post_data) -> Dict[str, object]:
     form["selected_clip_ids"] = [str(item).strip() for item in post_data.getlist("selected_clip_ids") if str(item).strip()]
     form["selected_clip_groups"] = [str(item).strip() for item in post_data.getlist("selected_clip_groups") if str(item).strip()]
     form["advanced_clip_selection"] = post_data.get("advanced_clip_selection", "").strip().lower() in {"1", "true", "on", "yes"}
+    form["matching_domain"] = "perceptual"
     return form
 
 
@@ -1412,7 +1451,7 @@ def _validate_form(form: Dict[str, object], *, require_output: bool = True, requ
         normalize_review_mode(str(form.get("review_mode", "full_contact_sheet")))
     except ValueError as exc:
         return str(exc)
-    roi_mode = str(form.get("roi_mode", "draw"))
+    roi_mode = str(form.get("roi_mode", "sphere_auto"))
     if roi_mode in {"draw", "manual"}:
         roi_values = [str(form.get("roi_x", "")).strip(), str(form.get("roi_y", "")).strip(), str(form.get("roi_w", "")).strip(), str(form.get("roi_h", "")).strip()]
         if not all(roi_values):
@@ -1911,6 +1950,7 @@ def _build_operator_surfaces(
             }
         )
     return {
+        "review_payload": review_payload or {},
         "recommendation": {
             "strategy_label": str(((recommendation.get("recommended_strategy") or {}).get("strategy_label")) or "Pending"),
             "strategy_key": str(((recommendation.get("recommended_strategy") or {}).get("strategy_key")) or ""),
@@ -2096,6 +2136,78 @@ def _bullet_list_html(items: List[str]) -> str:
     return "<ul class='surface-list'>" + "".join(f"<li>{html.escape(item)}</li>" for item in cleaned) + "</ul>"
 
 
+def _calibration_overview_from_payload(
+    review_payload: Optional[Dict[str, object]],
+    run_assessment: Dict[str, object],
+    readiness: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    rows = [dict(item) for item in list((review_payload or {}).get("per_camera_analysis") or [])]
+    retained_rows = [row for row in rows if str(row.get("reference_use") or "").strip().lower() != "excluded"]
+    sample_2_values = [
+        float(row.get("sample_2_ire"))
+        for row in retained_rows
+        if row.get("sample_2_ire") is not None
+    ]
+    best_reference = None
+    if retained_rows:
+        best_reference = min(
+            retained_rows,
+            key=lambda row: (
+                abs(float(row.get("camera_offset_from_anchor", row.get("final_offset_stops", 0.0)) or 0.0)),
+                -float(row.get("trust_score", 0.0) or 0.0),
+                -float(row.get("confidence", 0.0) or 0.0),
+                str(row.get("camera_label") or row.get("clip_id") or ""),
+            ),
+        )
+    status = str(run_assessment.get("status") or "")
+    readiness_state = str((readiness or {}).get("state") or "")
+    if not status:
+        status = {
+            "Ready for Commit": "READY",
+            "Commit with Warnings": "READY_WITH_WARNINGS",
+            "Do Not Commit": "DO_NOT_PUSH",
+            "Ready for Review": "PENDING",
+        }.get(readiness_state, "")
+    if status == "READY":
+        state_title = "Array is within calibration tolerance"
+        state_tone = "success"
+        action_line = "Calibration payload is ready for review and camera sync."
+    elif status == "READY_WITH_WARNINGS":
+        state_title = "Array is near calibration tolerance"
+        state_tone = "warning"
+        action_line = "Review excluded or unstable cameras before normalizing the array."
+    elif status in {"DO_NOT_PUSH", "REVIEW_REQUIRED"}:
+        state_title = "Array is out of calibration"
+        state_tone = "danger"
+        action_line = "Review the retained cluster before normalizing the array."
+    else:
+        state_title = "Array calibration review pending"
+        state_tone = "pending"
+        action_line = "Run review to measure the current gray-sphere alignment."
+    range_text = "n/a"
+    if sample_2_values:
+        range_text = f"{min(sample_2_values):.0f} IRE to {max(sample_2_values):.0f} IRE"
+    return {
+        "state_title": state_title,
+        "state_tone": state_tone,
+        "action_line": action_line,
+        "retained_count": len(retained_rows),
+        "excluded_count": max(0, len(rows) - len(retained_rows)),
+        "sample_2_ire_min": min(sample_2_values) if sample_2_values else None,
+        "sample_2_ire_max": max(sample_2_values) if sample_2_values else None,
+        "sample_2_ire_range_text": range_text,
+        "best_reference_camera": str((best_reference or {}).get("camera_label") or "n/a"),
+        "best_reference_clip_id": str((best_reference or {}).get("clip_id") or ""),
+        "best_reference_summary": str((best_reference or {}).get("measured_gray_exposure_summary") or "n/a"),
+        "best_reference_offset": float((best_reference or {}).get("camera_offset_from_anchor", (best_reference or {}).get("final_offset_stops", 0.0)) or 0.0),
+        "best_reference_reason": (
+            "Closest fit to the retained cluster target."
+            if best_reference
+            else "No retained camera candidate is available yet."
+        ),
+    }
+
+
 def _render_decision_surface(surface: Dict[str, object]) -> str:
     recommendation = dict(surface.get("recommendation") or {})
     run_assessment = dict(surface.get("run_assessment") or {})
@@ -2109,8 +2221,8 @@ def _render_decision_surface(surface: Dict[str, object]) -> str:
     failure_modes = list(surface.get("failure_modes") or [])
     visuals = dict(surface.get("lightweight_visuals") or {})
     excluded_cameras = list(physical.get("excluded_cameras") or [])
-    readiness_state = str(readiness.get("state") or "Ready for Review")
-    readiness_tone = str(readiness.get("tone") or "pending")
+    overview = _calibration_overview_from_payload(dict(surface.get("review_payload") or {}), run_assessment, readiness)
+    readiness_tone = str(overview.get("state_tone") or readiness.get("tone") or "pending")
     shared_kelvin_text = "per-camera" if wb_model.get("shared_kelvin") is None else str(wb_model.get("shared_kelvin"))
     shared_tint_text = "per-camera" if wb_model.get("shared_tint") is None else str(wb_model.get("shared_tint"))
     failure_html = "".join(
@@ -2134,19 +2246,16 @@ def _render_decision_surface(surface: Dict[str, object]) -> str:
     )
     optimal_reference = str(optimal_exposure_summary.get("reference_clip_id") or "No single camera")
     optimal_anchor_reason = str((optimal_exposure_summary.get("selection_diagnostics") or {}).get("anchor_reason") or "")
+    excluded_count = int(overview.get("excluded_count", 0) or 0)
     decision_subline = (
-        f"{int(physical.get('excluded_camera_count', 0) or 0)} camera excluded from reference, corrections still applied."
-        if int(physical.get("excluded_camera_count", 0) or 0) == 1
-        else f"{int(physical.get('excluded_camera_count', 0) or 0)} cameras excluded from reference, corrections still applied."
-        if int(physical.get("excluded_camera_count", 0) or 0) > 1
-        else "No cameras excluded from reference in this subset."
+        f"Retained gray sphere Sample 2 values span {overview.get('sample_2_ire_range_text', 'n/a')} across {int(overview.get('retained_count', 0) or 0)} retained cameras."
+        if int(overview.get("retained_count", 0) or 0) > 0
+        else "No retained cameras are available for a calibration summary yet."
     )
     summary_sentence = (
-        f"Most cameras are consistent. {int(physical.get('excluded_camera_count', 0) or 0)} camera is significantly out of family and excluded from reference."
-        if int(physical.get("excluded_camera_count", 0) or 0) == 1
-        else f"Most cameras are consistent. {int(physical.get('excluded_camera_count', 0) or 0)} cameras are excluded from reference."
-        if int(physical.get("excluded_camera_count", 0) or 0) > 1
-        else "Most cameras are consistent and the array remains usable for review."
+        f"Closest current reference candidate: {overview.get('best_reference_camera', 'n/a')}."
+        if str(overview.get("best_reference_camera") or "").strip() and str(overview.get("best_reference_camera")) != "n/a"
+        else "Reference candidate will appear after review measures the retained camera cluster."
     )
     why_chosen_points = [
         "Minimizes correction spread across the stable cameras." if strategy_key == "median" else "Matches the camera already closest to correct gray exposure.",
@@ -2174,7 +2283,12 @@ def _render_decision_surface(surface: Dict[str, object]) -> str:
         f"Shared Tint Anchor: {shared_tint_text}.",
     ]
     validation_points = [
-        summary_sentence,
+        f"Retained gray sphere Sample 2 range: {overview.get('sample_2_ire_range_text', 'n/a')}.",
+        (
+            f"Closest current reference candidate: {overview.get('best_reference_camera')} ({overview.get('best_reference_summary')})."
+            if str(overview.get("best_reference_camera") or "").strip() and str(overview.get("best_reference_camera")) != "n/a"
+            else "No retained reference candidate is available yet."
+        ),
         f"Mean exposure error: {float(exposure.get('mean_exposure_error', 0.0) or 0.0):.4f}.",
         f"Max neutral error: {float(neutrality.get('max_post_neutral_error', 0.0) or 0.0):.4f}.",
         f"Kelvin stability: {'stable' if kelvin_tint.get('kelvin_is_stable') else 'review required'}.",
@@ -2187,18 +2301,13 @@ def _render_decision_surface(surface: Dict[str, object]) -> str:
     ]
     trust_points = [
         str(run_assessment.get("anchor_summary") or "No anchor summary available."),
-        f"Trusted cameras: {int(run_assessment.get('trusted_camera_count', 0) or 0)} / {int(run_assessment.get('camera_count', 0) or 0)}.",
-        f"Excluded cameras: {int(run_assessment.get('excluded_camera_count', 0) or 0)}.",
-        "Safe to push later." if bool(run_assessment.get("safe_to_push_later")) else "Not safe to push later without review.",
+        f"Retained cameras: {int(overview.get('retained_count', 0) or 0)} / {int(run_assessment.get('camera_count', 0) or 0)}.",
+        f"Excluded cameras: {excluded_count}.",
+        str(overview.get("best_reference_reason") or ""),
         *[str(item) for item in run_assessment.get("gating_reasons", []) if str(item).strip()],
     ]
-    decision_title = {
-        "Ready for Commit": "SAFE TO COMMIT",
-        "Commit with Warnings": "COMMIT WITH WARNINGS",
-        "Do Not Commit": "DO NOT COMMIT",
-        "Ready for Review": "READY FOR REVIEW",
-    }.get(readiness_state, readiness_state.upper())
-    banner_subtitle = str(readiness.get("reason") or "Run review to generate a recommendation and commit readiness summary.")
+    decision_title = str(overview.get("state_title") or "Array calibration review pending")
+    banner_subtitle = str(overview.get("action_line") or readiness.get("reason") or "Run review to generate a calibration summary.")
     visuals_html = ""
     if visuals:
         chart_cards = []
@@ -2242,42 +2351,34 @@ def _render_decision_surface(surface: Dict[str, object]) -> str:
                 f"{_chart_frame_html('Camera Trust', 'Click to enlarge', str(visuals.get('trust_chart_svg') or ''))}"
                 "</div>"
             )
-        if visuals.get("stability_chart_svg"):
-            chart_cards.append(
-                "<div class='summary-panel'>"
-                "<div class='surface-heading-row'><h3>Sample Stability Ranking</h3></div>"
-                "<p class='surface-copy'>Lower spread means a steadier gray reading. Cameras past the threshold need caution.</p>"
-                f"{_chart_frame_html('Sample Stability Ranking', 'Click to enlarge', str(visuals.get('stability_chart_svg') or ''))}"
-                "</div>"
-            )
         if chart_cards:
             visuals_html = f'<div class="summary-grid" style="margin-top: 16px;">{"".join(chart_cards)}</div>'
     return f"""
     <div class="decision-banner {html.escape(readiness_tone)}">
-      <div class="decision-banner-kicker">Calibration Decision</div>
+      <div class="decision-banner-kicker">Array Calibration Review</div>
       <div class="decision-banner-title">{html.escape(decision_title)}</div>
       <p class="decision-banner-subtitle">{html.escape(banner_subtitle)}</p>
       <p class="decision-banner-subtitle" style="margin-top:8px;font-size:15px;font-weight:700;">{html.escape(decision_subline)}</p>
       <div class="decision-banner-metrics">
+        <div><span class="metric-label">Sample 2 IRE Range</span><span class="metric-value">{html.escape(str(overview.get('sample_2_ire_range_text') or 'n/a'))}</span></div>
+        <div><span class="metric-label">Retained Cameras</span><span class="metric-value">{int(overview.get('retained_count', 0) or 0)}</span></div>
+        <div><span class="metric-label">Excluded Cameras</span><span class="metric-value">{excluded_count}</span></div>
+        <div><span class="metric-label">Reference Candidate</span><span class="metric-value">{html.escape(str(overview.get('best_reference_camera') or 'n/a'))}</span></div>
         <div><span class="metric-label">Strategy</span><span class="metric-value">{html.escape(strategy_label)}</span></div>
-        <div><span class="metric-label">Outliers</span><span class="metric-value">{len(list(physical.get('outliers') or []))}</span></div>
-        <div><span class="metric-label">Excluded Cameras</span><span class="metric-value">{int(physical.get('excluded_camera_count', 0) or 0)}</span></div>
-        <div><span class="metric-label">Confidence</span><span class="metric-value">{float(recommendation.get('confidence_score', 0.0) or 0.0):.2f}</span></div>
-        <div><span class="metric-label">Run Status</span><span class="metric-value">{html.escape(run_status.replace('_', ' ') or readiness_state)}</span></div>
-        <div><span class="metric-label">Recommendation Strength</span><span class="metric-value">{html.escape(recommendation_strength.replace('_', ' '))}</span></div>
+        <div><span class="metric-label">Review State</span><span class="metric-value">{html.escape(run_status.replace('_', ' ') or 'pending')}</span></div>
       </div>
     </div>
     <div class="summary-grid">
       <div class="summary-panel">
         <div class="surface-heading-row">
-          <h3>Recommendation</h3>
-          {_badge_html(readiness_state, readiness_tone)}
+          <h3>Calibration Recommendation</h3>
+          {_badge_html(str(overview.get("state_title") or "Review pending"), readiness_tone)}
         </div>
         <p class="surface-kicker">At A Glance</p>
         <p class="surface-lead">{html.escape(summary_sentence)}</p>
         <div class="surface-metrics">
-          <div><span class="metric-label">Hero Camera</span><span class="metric-value">{html.escape(str(recommendation.get('hero_camera') or 'Not selected'))}</span></div>
-          <div><span class="metric-label">Confidence</span><span class="metric-value">{float(recommendation.get('confidence_score', 0.0) or 0.0):.2f}</span></div>
+          <div><span class="metric-label">Reference Candidate</span><span class="metric-value">{html.escape(str(overview.get('best_reference_camera') or 'n/a'))}</span></div>
+          <div><span class="metric-label">Candidate Profile</span><span class="metric-value">{html.escape(str(overview.get('best_reference_summary') or 'n/a'))}</span></div>
           <div><span class="metric-label">Source Mode</span><span class="metric-value">{html.escape(str(recommendation.get('source_mode_label') or ''))}</span></div>
         </div>
         <p class="surface-kicker">Why This Was Chosen</p>
@@ -2303,15 +2404,15 @@ def _render_decision_surface(surface: Dict[str, object]) -> str:
           {_badge_html(str(physical.get('status') or 'pending'), 'success' if str(physical.get('status') or '') == 'success' else 'warning')}
         </div>
         <p class="surface-kicker">Subset Health</p>
-        <p class="surface-lead">{'Cluster usable' if physical.get('cluster_is_usable_after_exclusions') else 'Review required'}</p>
+        <p class="surface-lead">{'Retained cluster is usable' if physical.get('cluster_is_usable_after_exclusions') else 'Retained cluster needs review'}</p>
         <div class="surface-metrics">
           <div><span class="metric-label">Mean Exposure Error</span><span class="metric-value">{float(exposure.get('mean_exposure_error', 0.0) or 0.0):.4f}</span></div>
           <div><span class="metric-label">Max Neutral Error</span><span class="metric-value">{float(neutrality.get('max_post_neutral_error', 0.0) or 0.0):.4f}</span></div>
           <div><span class="metric-label">Kelvin Stability</span><span class="metric-value">{'stable' if kelvin_tint.get('kelvin_is_stable') else 'review'}</span></div>
           <div><span class="metric-label">Tint Variation</span><span class="metric-value">{'present' if kelvin_tint.get('tint_carries_variation') else 'flat'}</span></div>
-          <div><span class="metric-label">Mean Confidence</span><span class="metric-value">{float(confidence.get('mean_confidence', 0.0) or 0.0):.2f}</span></div>
+          <div><span class="metric-label">Measurement Stability</span><span class="metric-value">{float(confidence.get('mean_confidence', 0.0) or 0.0):.2f}</span></div>
           <div><span class="metric-label">Outliers</span><span class="metric-value">{len(list(physical.get('outliers') or []))}</span></div>
-          <div><span class="metric-label">Excluded Cameras</span><span class="metric-value">{int(physical.get('excluded_camera_count', 0) or 0)}</span></div>
+          <div><span class="metric-label">Excluded Cameras</span><span class="metric-value">{excluded_count}</span></div>
         </div>
         {_bullet_list_html(validation_points)}
         <p class="surface-kicker" style="margin-top:14px;">Warnings and Exclusions</p>
@@ -2320,11 +2421,11 @@ def _render_decision_surface(surface: Dict[str, object]) -> str:
       </div>
       <div class="summary-panel">
         <div class="surface-heading-row">
-          <h3>Should I Trust This Run?</h3>
+          <h3>Calibration Review Notes</h3>
           {_badge_html(run_status.replace('_', ' ') or 'Pending', readiness_tone)}
         </div>
-        <p class="surface-kicker">Run Gating</p>
-        <p class="surface-lead">{html.escape(str(run_assessment.get('operator_note') or 'Review the trusted camera group before any later push.'))}</p>
+        <p class="surface-kicker">Operator Guidance</p>
+        <p class="surface-lead">{html.escape(str(run_assessment.get('operator_note') or 'Review the retained camera group before normalizing the array.'))}</p>
         {_bullet_list_html(trust_points)}
       </div>
     </div>
@@ -2653,7 +2754,9 @@ def _resolved_output_path_for_form(form: Dict[str, object], scan: Dict[str, obje
 
 
 def _roi_description(form: Dict[str, object]) -> str:
-    mode = str(form.get("roi_mode", "draw"))
+    mode = str(form.get("roi_mode", "sphere_auto"))
+    if mode == "sphere_auto":
+        return "Automatic sphere detection drives the gray-sphere measurement workflow."
     if mode == "center":
         return "Center crop (30% of frame)"
     if mode == "full":
@@ -2927,6 +3030,12 @@ def _load_review_manifest(output_root: Optional[Path], *, started_at: Optional[f
     return payload
 
 
+def _load_review_progress(output_root: Optional[Path], *, started_at: Optional[float] = None) -> Optional[Dict[str, object]]:
+    if output_root is None:
+        return None
+    return load_review_progress(review_progress_path_for(output_root), started_at=started_at)
+
+
 def _update_progress_timestamp(task: TaskState, previous_state: tuple[object, ...]) -> None:
     current_state = (
         task.stage,
@@ -2977,6 +3086,7 @@ def _infer_progress(task: TaskState) -> None:
     is_approve = "approve-master-rmd" in task.command
     review_validation = _load_review_validation(output_root, started_at=task.started_at) if is_review else None
     review_manifest = _load_review_manifest(output_root, started_at=task.started_at) if is_review else None
+    review_progress = _load_review_progress(output_root, started_at=task.started_at) if is_review else None
     resolved_review_mode = normalize_review_mode(
         str(
             task.review_mode
@@ -3010,12 +3120,17 @@ def _infer_progress(task: TaskState) -> None:
                 if ".000000." not in p.name and _path_is_current(p, started_at=task.started_at)
             ] if previews_dir.exists() else []
             clip_count = len([p for p in analysis_dir.glob("*.analysis.json") if _path_is_current(p, started_at=task.started_at)]) if analysis_dir.exists() else 0
+            progress_clip_count = int((review_progress or {}).get("clip_count", 0) or 0)
+            progress_clip_index = int((review_progress or {}).get("clip_index", 0) or 0)
             strategies_count = max(1, len([item for item in task.strategies_text.split(", ") if item])) if task.strategies_text else 1
             expected_previews = clip_count * (1 + strategies_count * 3) if clip_count and resolved_review_mode == "full_contact_sheet" else 0
-            task.clip_count = clip_count or task.clip_count
+            task.clip_count = clip_count or progress_clip_count or task.clip_count
             if resolved_review_mode == "lightweight_analysis":
-                task.items_total = clip_count or task.items_total
-                task.items_completed = min(task.items_completed, task.items_total) if task.items_total else task.items_completed
+                task.items_total = clip_count or progress_clip_count or task.items_total
+                if progress_clip_index:
+                    task.items_completed = max(task.items_completed, min(progress_clip_index, task.items_total or progress_clip_index))
+                else:
+                    task.items_completed = min(task.items_completed, task.items_total) if task.items_total else task.items_completed
             else:
                 task.items_total = expected_previews or task.items_total
                 task.items_completed = min(len(visible_previews), task.items_total or len(visible_previews))
@@ -3040,6 +3155,10 @@ def _infer_progress(task: TaskState) -> None:
             elif clip_count:
                 task.stage_index = 1
                 task.stage = REVIEW_STAGES[1]
+            elif review_progress:
+                progress_stage = str(review_progress.get("stage_label") or "").strip()
+                if progress_stage:
+                    task.stage = progress_stage
             else:
                 task.stage_index = 0
                 task.stage = REVIEW_STAGES[0]
@@ -3152,6 +3271,7 @@ def _status_payload(task: TaskState) -> Dict[str, object]:
         base = task.snapshot()
     output_root = _canonical_output_root_from_base(base)
     review_validation = _load_review_validation(output_root, started_at=float(base.get("started_at") or 0.0)) if "review-calibration" in base["command"] else None
+    review_progress = _load_review_progress(output_root, started_at=float(base.get("started_at") or 0.0)) if "review-calibration" in base["command"] else None
     canonical_output_root = _output_root_from_validation_payload(review_validation)
     if canonical_output_root is not None and canonical_output_root != output_root:
         output_root = canonical_output_root
@@ -3176,6 +3296,8 @@ def _status_payload(task: TaskState) -> Dict[str, object]:
     status_detail = validation_errors[0] if validation_errors else ""
     if not status_detail and base.get("status") not in {"completed"} and validation_warnings:
         status_detail = validation_warnings[0]
+    if not status_detail and isinstance(review_progress, dict):
+        status_detail = str(review_progress.get("detail") or "")
     if not status_detail and "review-calibration" in base["command"] and base.get("status") == "failed" and base.get("returncode") == 0 and review_validation is None:
         status_detail = "Fresh review_validation.json was not produced for this run."
     operator_surfaces = _build_operator_surfaces(
@@ -3205,6 +3327,7 @@ def _status_payload(task: TaskState) -> Dict[str, object]:
             "source_mode_label": source_mode_label(str(base.get("source_mode") or "local_folder")) if base.get("source_mode") else "",
             "status_detail": status_detail,
             "review_validation": review_validation,
+            "review_progress": review_progress,
             "validation_status": review_validation.get("status") if isinstance(review_validation, dict) else None,
             "validation_path": review_validation.get("validation_path") if isinstance(review_validation, dict) else None,
             "validation_errors": validation_errors,

@@ -18,6 +18,7 @@ from .execution import raise_if_cancelled
 from .ftps_ingest import DEFAULT_CAMERA_IP_MAP, ingest_ftps_batch, normalize_source_mode, source_mode_label
 from .identity import group_key_from_clip_id, inventory_camera_label_from_clip_id, inventory_camera_label_from_source_path
 from .matching import analyze_path
+from .progress import emit_review_progress, review_progress_path_for
 from .report import (
     build_contact_sheet_report,
     build_review_package,
@@ -474,11 +475,15 @@ def _physical_validation_capability(
     analysis_root: Path,
     *,
     summary_payload: Optional[Dict[str, object]],
+    review_payload: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     array_path = analysis_root / "array_calibration.json"
     array_payload = _load_optional_json(array_path)
     backend = str((array_payload or {}).get("backend") or (summary_payload or {}).get("backend") or "").strip().lower()
     measurement_domain = str(
+        (review_payload or {}).get("exposure_measurement_domain")
+        or (review_payload or {}).get("matching_domain")
+        or
         (array_payload or {}).get("measurement_domain")
         or (summary_payload or {}).get("mode")
         or ""
@@ -976,6 +981,11 @@ def _build_human_summary(
             "The main camera cluster remains usable, but one or more cameras were excluded from the safe commit set. "
             "Proceed only with the non-excluded cameras and review the flagged outliers separately."
         )
+    elif physical_validation.get("status") == "unsupported" and str(report_payload.get("matching_domain") or "") == "perceptual":
+        pass_fail = (
+            "Perceptual lightweight review completed in the authoritative IPP2 monitoring domain. "
+            "Use the rendered monitoring measurements and operator guidance for commit decisions."
+        )
     else:
         pass_fail = "Physical validation did not fully pass; review the flagged failure modes before committing calibration values."
     per_camera_summary = [
@@ -1013,6 +1023,28 @@ def _build_post_apply_validation(
 ) -> Dict[str, object]:
     exposure = physical_validation.get("exposure") or {}
     neutrality = physical_validation.get("neutrality") or {}
+    if not exposure and not neutrality:
+        return {
+            "status": "unsupported",
+            "verification_mode": "modeled_from_recommended_commit_values",
+            "recommended_strategy": (recommendation.get("recommended_strategy") or {}).get("strategy_key"),
+            "summary": {
+                "pre_mean_exposure_error": 0.0,
+                "post_mean_exposure_error": 0.0,
+                "pre_mean_neutral_error": 0.0,
+                "post_mean_neutral_error": 0.0,
+                "pre_combined_variance": 0.0,
+                "post_combined_variance": 0.0,
+                "exposure_error_reduced": False,
+                "neutrality_improved": False,
+                "variance_reduced": False,
+            },
+            "notes": [
+                "Scene-domain physical validation is not applicable to this perceptual lightweight review.",
+                "No modeled post-apply comparison was produced because no scene-domain physical rows were available.",
+            ],
+            "per_camera": [],
+        }
     exp_rows = {str(item.get("clip_id") or ""): item for item in exposure.get("per_camera", [])}
     neu_rows = {str(item.get("clip_id") or ""): item for item in neutrality.get("per_camera", [])}
     per_camera: List[Dict[str, object]] = []
@@ -1277,6 +1309,7 @@ def validate_review_run_contract(analysis_dir: str) -> Dict[str, object]:
     capability = _physical_validation_capability(
         analysis_root,
         summary_payload=parsed_payloads.get("summary_json"),
+        review_payload=parsed_payloads.get("review_package_json") or parsed_payloads.get("contact_sheet_json"),
     )
     array_payload = _load_optional_json(analysis_root / "array_calibration.json")
     if capability.get("applicable"):
@@ -1407,6 +1440,8 @@ def review_calibration(
     preview_lut: Optional[str] = None,
     require_real_redline: bool = False,
 ) -> Dict[str, object]:
+    workflow_started_at = time.perf_counter()
+    invocation_source = str(os.getenv("R3DMATCH_INVOCATION_SOURCE", "direct_cli") or "direct_cli")
     resolved_source_mode = normalize_source_mode(source_mode)
     subset_definition = _load_clip_subset_definition(clip_subset_file) if clip_subset_file else None
     merged_clip_ids = [str(item) for item in (selected_clip_ids or []) if str(item).strip()]
@@ -1415,7 +1450,7 @@ def review_calibration(
         merged_clip_ids = list(dict.fromkeys([*subset_definition["clip_ids"], *merged_clip_ids]))
         merged_clip_groups = list(dict.fromkeys([*subset_definition["clip_groups"], *merged_clip_groups]))
         run_label = run_label or subset_definition.get("run_label")
-    resolved_matching_domain = normalize_matching_domain(matching_domain)
+    resolved_matching_domain = "perceptual"
     resolved_run_label = resolve_run_label(
         run_label=run_label,
         selected_clip_ids=merged_clip_ids,
@@ -1426,6 +1461,20 @@ def review_calibration(
         run_label=resolved_run_label,
         selected_clip_ids=merged_clip_ids,
         selected_clip_groups=merged_clip_groups,
+    )
+    progress_path = review_progress_path_for(resolved_out_dir)
+    emit_review_progress(
+        progress_path,
+        phase="review_start",
+        detail="Starting review calibration.",
+        stage_label="Preparing review",
+        review_mode=review_mode,
+        elapsed_seconds=0.0,
+        extra={
+            "source_mode": resolved_source_mode,
+            "run_label": resolved_run_label,
+            "invocation_source": invocation_source,
+        },
     )
     source_input_path = input_path
     ingest_manifest = None
@@ -1446,6 +1495,14 @@ def review_calibration(
         )
         source_input_path = str(ingest_root)
     raise_if_cancelled("Run cancelled before analysis.")
+    emit_review_progress(
+        progress_path,
+        phase="analysis_dispatch",
+        detail="Dispatching source analysis.",
+        stage_label="Analyzing sources",
+        review_mode=review_mode,
+        elapsed_seconds=time.perf_counter() - workflow_started_at,
+    )
     analyze_summary = analyze_path(
         source_input_path,
         out_dir=resolved_out_dir,
@@ -1456,14 +1513,29 @@ def review_calibration(
         exposure_calibration_path=exposure_calibration_path,
         color_calibration_path=color_calibration_path,
         calibration_mode=calibration_mode,
-        sample_count=sample_count,
+        sample_count=1 if normalize_review_mode(review_mode) == "lightweight_analysis" else sample_count,
         sampling_strategy=sampling_strategy,
         calibration_roi=calibration_roi,
         target_type=target_type,
         selected_clip_ids=merged_clip_ids,
         selected_clip_groups=merged_clip_groups,
+        progress_path=str(progress_path),
+        half_res_decode=normalize_review_mode(review_mode) == "lightweight_analysis",
+        workload_trace_path=str(Path(resolved_out_dir).expanduser().resolve() / "measurement_workload_trace.json"),
+        runtime_trace_path=str(Path(resolved_out_dir).expanduser().resolve() / "lightweight_runtime_trace.json"),
+        invocation_source=invocation_source,
+        measurement_source="rendered_preview_ipp2",
     )
     raise_if_cancelled("Run cancelled before review package generation.")
+    emit_review_progress(
+        progress_path,
+        phase="report_build_start",
+        detail="Building review package.",
+        stage_label="Building report",
+        review_mode=review_mode,
+        elapsed_seconds=time.perf_counter() - workflow_started_at,
+        extra={"clip_count": int(analyze_summary.get("clip_count", 0) or 0)},
+    )
     package = build_review_package(
         source_input_path,
         out_dir=resolved_out_dir,
@@ -1494,6 +1566,7 @@ def review_calibration(
         source_mode_label_value=source_mode_label(resolved_source_mode),
         source_input_path=source_input_path,
         ingest_manifest=ingest_manifest,
+        progress_path=str(progress_path),
     )
     package["analyze_summary"] = analyze_summary
     package["analysis_dir"] = resolved_out_dir
@@ -1512,6 +1585,15 @@ def review_calibration(
     package_manifest_path = package.get("package_manifest")
     if package_manifest_path:
         Path(str(package_manifest_path)).write_text(json.dumps(package, indent=2), encoding="utf-8")
+    emit_review_progress(
+        progress_path,
+        phase="review_complete",
+        detail="Review package complete.",
+        stage_label="Complete",
+        review_mode=review_mode,
+        elapsed_seconds=time.perf_counter() - workflow_started_at,
+        extra={"validation_status": package.get("review_validation", {}).get("status")},
+    )
     if validation["status"] != "success":
         raise ReviewValidationError(_format_review_validation_failure(validation))
     return package

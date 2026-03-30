@@ -34,6 +34,7 @@ class R3DBackend(ABC):
         start_frame: int,
         max_frames: int,
         frame_step: int,
+        half_res: bool = False,
     ) -> Iterable[DecodedFrame]:
         raise NotImplementedError
 
@@ -70,6 +71,7 @@ class MockR3DBackend(R3DBackend):
         start_frame: int,
         max_frames: int,
         frame_step: int,
+        half_res: bool = False,
     ) -> Iterable[DecodedFrame]:
         clip = self.inspect_clip(source_path)
         selected = list(range(start_frame, clip.total_frames, frame_step))[:max_frames]
@@ -98,6 +100,8 @@ class MockR3DBackend(R3DBackend):
                 if frame_index == 0:
                     patch_luma = np.clip(0.18 + ((clip_seed % 7) - 3) * 0.015, 0.08, 0.4)
                     rgb[:, 16:34, 28:68] = patch_luma
+                if half_res:
+                    rgb = rgb[:, ::2, ::2]
                 yield frame_index, frame_index / clip.fps, rgb
 
         return iterator()
@@ -174,6 +178,7 @@ class RedSdkDecoder(R3DBackend):
         start_frame: int,
         max_frames: int,
         frame_step: int,
+        half_res: bool = False,
     ) -> Iterable[DecodedFrame]:
         clip = self.inspect_clip(source_path)
         selected = list(range(start_frame, clip.total_frames, frame_step))[:max_frames]
@@ -184,7 +189,7 @@ class RedSdkDecoder(R3DBackend):
                     frame = self._native.decode_frame(
                         source_path,
                         frame_index,
-                        True,
+                        half_res,
                         clip.color_space,
                         clip.gamma_curve,
                     )
