@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,7 @@ from .report import (
     normalize_target_strategy_name,
 )
 from .rmd import write_rmds_from_analysis
+from .runtime_env import runtime_health_payload
 from .transcode import write_transcode_plan
 from .validation import validate_pipeline
 from .workflow import approve_master_rmd, clear_preview_cache, normalize_matching_domain, review_calibration
@@ -559,6 +561,21 @@ def desktop_ui_command() -> None:
     from .desktop_app import launch_desktop_ui
 
     launch_desktop_ui(str(Path.cwd()))
+
+
+@app.command("runtime-health")
+def runtime_health_command(
+    html_path: Optional[str] = typer.Option(None, "--html-path", help="Optional contact_sheet.html path for asset validation"),
+    require_red_backend: bool = typer.Option(False, "--require-red-backend", help="Require RED SDK configuration to be valid"),
+    strict: bool = typer.Option(False, "--strict", help="Exit non-zero when required runtime dependencies are unavailable"),
+) -> None:
+    payload = runtime_health_payload(html_path=html_path)
+    typer.echo(json.dumps(payload, indent=2))
+    failed = not bool(payload.get("html_pdf_ready"))
+    if require_red_backend:
+        failed = failed or not bool(payload.get("red_backend_ready"))
+    if strict and failed:
+        raise typer.Exit(code=1)
 
 
 def main() -> None:

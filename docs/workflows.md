@@ -1,53 +1,76 @@
 # Workflows
 
-## Standard Review Workflow
+## Recommended Operator Path
 
-1. Run `review-calibration` on a clip set or subset.
-2. Inspect:
-   - `report/contact_sheet.html`
-   - `report/review_validation.json`
-   - `report/debug_exposure_trace/summary.json`
-3. Check:
-   - trust classes
-   - run status
-   - recommendation strength
-4. Only carry a run forward when the assessment supports it.
+### 1. Launch the web UI
 
-## Weak-Set Workflow
+```bash
+/bin/sh scripts/run_r3dmatch_web.sh 5000
+```
 
-If a run lands in `REVIEW_REQUIRED` or `DO_NOT_PUSH`:
+What this does:
 
-- inspect the trusted vs untrusted cameras
-- review stability and confidence signals
-- identify outliers or inconsistent readings
-- remeasure or rerun rather than treating the result as push-ready
+- uses the project runtime
+- exports `PYTHONPATH`
+- auto-fills `DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib` on macOS when needed
+- preserves `RED_SDK_ROOT`
+- preserves `RED_SDK_REDISTRIBUTABLE_DIR`
+- runs a strict runtime preflight before starting the app
 
-## Read-Only Camera Verification Workflow
+Open:
 
-1. Read current camera state:
+- `http://127.0.0.1:5000`
 
-   ```bash
-   r3dmatch read-camera-state 10.20.61.191 --camera-label WIFI_RED
-   ```
+### 2. Run a full review
 
-2. Compare a payload to live state without writing:
+In the web UI:
 
-   ```bash
-   r3dmatch verify-camera-state /path/to/report/calibration_commit_payload.json \
-     --camera WIFI_RED \
-     --live-read
-   ```
+1. scan the calibration folder
+2. keep `Measurement Domain = Perceptual (IPP2 / BT.709 / BT.1886)`
+3. choose `Full Contact Sheet`
+4. run review
 
-3. Review:
-   - verification level
-   - mismatched fields
-   - tolerance notes
+Primary outputs:
 
-## Later Push Workflow
+- `report/contact_sheet.html`
+- `report/preview_contact_sheet.pdf`
+- `report/contact_sheet.json`
+- `report/review_package.json`
+- `report/ipp2_validation.json`
 
-Writeback exists, but it should remain an explicit later step:
+## Recommended CLI Health Check
 
-- review first
-- verify current state
-- confirm the run is strong enough
-- only then consider live apply commands in a controlled operator workflow
+```bash
+./.venv/bin/python -m r3dmatch.cli runtime-health --strict --require-red-backend
+```
+
+This reports:
+
+- interpreter path
+- active virtual environment
+- `DYLD_FALLBACK_LIBRARY_PATH`
+- `RED_SDK_ROOT`
+- resolved RED SDK redistributable directory
+- WeasyPrint importability
+- whether HTML→PDF export should work
+
+## Direct CLI Review Path
+
+If you want a single shell command instead of the web UI:
+
+```bash
+/bin/sh scripts/run_r3dmatch_review.sh /path/to/r3d/files \
+  --out /path/to/run \
+  --target-type gray_sphere \
+  --processing-mode both \
+  --backend red \
+  --review-mode full_contact_sheet \
+  --preview-mode monitoring \
+  --target-strategy median
+```
+
+## Troubleshooting
+
+- If `runtime-health` reports missing WeasyPrint native libraries, fix the runtime before starting review.
+- If `RED_SDK_ROOT` is missing, export it and relaunch.
+- If HTML loads but PDF export fails, inspect the `pdf_export_preflight` block in `contact_sheet.json`.

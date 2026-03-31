@@ -56,6 +56,13 @@ Optional external components are isolated behind clear boundaries:
 - REDLine for preview rendering
 - legacy raw TCP RCP2 fallback for debugging only
 
+The RED SDK is expected to live outside the repo:
+
+- `RED_SDK_ROOT` is the authoritative SDK root
+- `RED_SDK_REDISTRIBUTABLE_DIR` may override the runtime redistributable path
+- the native bridge should be rebuilt with `scripts/build_red_sdk_bridge.sh` after SDK changes
+- repo-local `src/RED_SDK/...` payloads are not part of the runtime contract
+
 ## Why The Boundaries Matter
 
 - calibration logic stays testable with the mock backend

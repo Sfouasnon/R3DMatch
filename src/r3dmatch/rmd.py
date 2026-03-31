@@ -129,9 +129,9 @@ def _sdk_settings_from_sidecar(sidecar_payload: Dict[str, object]) -> Dict[str, 
 
 
 def _write_real_rmd_for_clip(clip_id: str, sidecar_payload: Dict[str, object], out_dir: str | Path) -> tuple[Path, Dict[str, object]]:
-    native = sdk._load_red_native_module()
-    if native is None or not hasattr(native, "create_rmd_from_settings"):
-        raise RuntimeError("RED SDK bridge does not expose create_rmd_from_settings.")
+    native = sdk.load_configured_red_native_module()
+    if not hasattr(native, "create_rmd_from_settings"):
+        raise RuntimeError("RED SDK bridge does not expose create_rmd_from_settings. Rebuild the native bridge with scripts/build_red_sdk_bridge.sh.")
     if hasattr(native, "sdk_available") and not native.sdk_available():
         raise RuntimeError(getattr(native, "unavailable_message", lambda: "RED SDK bridge unavailable.")())
 

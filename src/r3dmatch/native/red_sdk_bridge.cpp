@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -32,7 +33,7 @@ bool sdk_available() {
 }
 
 std::string unavailable_message() {
-    return "RED SDK bridge is not available. Build the native bridge with RED_SDK_ROOT set to a local RED SDK install.";
+    return "RED SDK bridge is not available. Set RED_SDK_ROOT to a local RED SDK install and rebuild the native bridge with scripts/build_red_sdk_bridge.sh.";
 }
 
 std::string basename_from_path(const std::string &path) {
@@ -43,11 +44,41 @@ std::string basename_from_path(const std::string &path) {
     return path.substr(offset + 1U);
 }
 
-#ifdef R3DMATCH_RED_SDK_ENABLED
-
 std::string getenv_or_empty(const char *name) {
     const char *value = std::getenv(name);
     return value == nullptr ? std::string() : std::string(value);
+}
+
+std::string compiled_sdk_root() {
+#ifdef R3DMATCH_RED_SDK_ROOT
+    return R3DMATCH_RED_SDK_ROOT;
+#else
+    return std::string();
+#endif
+}
+
+std::string compiled_sdk_include_dir() {
+#ifdef R3DMATCH_RED_SDK_INCLUDE_DIR
+    return R3DMATCH_RED_SDK_INCLUDE_DIR;
+#else
+    return std::string();
+#endif
+}
+
+std::string compiled_sdk_library_dir() {
+#ifdef R3DMATCH_RED_SDK_LIBRARY_DIR
+    return R3DMATCH_RED_SDK_LIBRARY_DIR;
+#else
+    return std::string();
+#endif
+}
+
+std::string compiled_sdk_redistributable_dir() {
+#ifdef R3DMATCH_RED_SDK_REDIS_DIR
+    return R3DMATCH_RED_SDK_REDIS_DIR;
+#else
+    return std::string();
+#endif
 }
 
 std::string resolve_libraries_path() {
@@ -55,12 +86,14 @@ std::string resolve_libraries_path() {
     if (!env_lib.empty()) {
         return env_lib;
     }
-#ifdef R3DMATCH_RED_SDK_REDIS_DIR
-    return R3DMATCH_RED_SDK_REDIS_DIR;
-#else
-    return ".";
-#endif
+    return compiled_sdk_redistributable_dir();
 }
+
+bool directory_exists(const std::string &path) {
+    return !path.empty() && std::filesystem::exists(std::filesystem::path(path));
+}
+
+#ifdef R3DMATCH_RED_SDK_ENABLED
 
 bool red_debug_enabled() {
     const std::string value = getenv_or_empty("R3DMATCH_RED_DEBUG");
@@ -91,6 +124,17 @@ std::string bool_string(bool value) {
 class ScopedSdkSession {
 public:
     ScopedSdkSession() : libraries_path_(resolve_libraries_path()) {
+        if (libraries_path_.empty()) {
+            throw std::runtime_error(
+                "RED SDK redistributable path could not be resolved. Set RED_SDK_ROOT or RED_SDK_REDISTRIBUTABLE_DIR and rebuild the native bridge if needed."
+            );
+        }
+        if (!directory_exists(libraries_path_)) {
+            throw std::runtime_error(
+                "RED SDK redistributable path does not exist: '" + libraries_path_
+                + "'. Set RED_SDK_ROOT or RED_SDK_REDISTRIBUTABLE_DIR and rebuild the native bridge if needed."
+            );
+        }
         red_debug_log("InitializeSdk redistributable_path=" + libraries_path_);
         init_status_ = InitializeSdk(libraries_path_.c_str(), OPTION_RED_NONE);
         if (init_status_ != ISInitializeOK) {
@@ -295,6 +339,26 @@ py::array_t<float> decode_to_rgb_float32(
 
 }  // namespace
 
+py::dict bridge_configuration() {
+    py::dict payload;
+#ifdef R3DMATCH_RED_SDK_ENABLED
+    payload["sdk_enabled"] = true;
+    payload["compiled_red_sdk_root"] = compiled_sdk_root();
+    payload["compiled_include_dir"] = compiled_sdk_include_dir();
+    payload["compiled_library_dir"] = compiled_sdk_library_dir();
+    payload["compiled_redistributable_dir"] = compiled_sdk_redistributable_dir();
+#else
+    payload["sdk_enabled"] = false;
+    payload["compiled_red_sdk_root"] = py::none();
+    payload["compiled_include_dir"] = py::none();
+    payload["compiled_library_dir"] = py::none();
+    payload["compiled_redistributable_dir"] = py::none();
+#endif
+    payload["env_red_sdk_root"] = getenv_or_empty("RED_SDK_ROOT");
+    payload["env_red_sdk_redistributable_dir"] = getenv_or_empty("RED_SDK_REDISTRIBUTABLE_DIR");
+    return payload;
+}
+
 py::dict read_metadata(const std::string &path) {
 #ifndef R3DMATCH_RED_SDK_ENABLED
     throw std::runtime_error(unavailable_message());
@@ -438,6 +502,7 @@ PYBIND11_MODULE(_red_sdk_bridge, m) {
     m.doc() = "R3DMatch RED SDK bridge";
     m.def("sdk_available", &sdk_available);
     m.def("unavailable_message", &unavailable_message);
+    m.def("bridge_configuration", &bridge_configuration);
     m.def("read_metadata", &read_metadata, py::arg("path"));
     m.def(
         "decode_frame",

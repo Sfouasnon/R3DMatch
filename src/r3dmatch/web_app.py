@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -41,6 +42,7 @@ from .report import (
     normalize_review_mode,
     review_mode_label,
 )
+from .runtime_env import ensure_runtime_environment, runtime_health_payload
 from .workflow import (
     matching_domain_label,
     post_apply_verification_path_for,
@@ -270,6 +272,37 @@ PAGE_TEMPLATE = """
     {% if message %}
       <div class="status info">{{ message }}</div>
     {% endif %}
+
+    <div class="card">
+      <h2 class="section-title">Runtime Health</h2>
+      <div class="summary-grid">
+        <div class="summary-panel">
+          <span class="metric-label">Interpreter</span>
+          <span class="metric-value" style="font-size:16px; line-height:1.4;">{{ runtime_health.interpreter }}</span>
+          <div class="meta">Virtual env: {{ runtime_health.virtual_env or 'none' }}</div>
+        </div>
+        <div class="summary-panel">
+          <span class="metric-label">HTML → PDF</span>
+          <span class="metric-value">{{ 'Ready' if runtime_health.html_pdf_ready else 'Blocked' }}</span>
+          <div class="meta">WeasyPrint: {{ 'ok' if runtime_health.weasyprint_importable else 'import failed' }}</div>
+          <div class="meta">DYLD: {{ runtime_health.dyld_fallback_library_path or '<unset>' }}</div>
+        </div>
+        <div class="summary-panel">
+          <span class="metric-label">RED Backend</span>
+          <span class="metric-value">{{ 'Ready' if runtime_health.red_backend_ready else 'Check setup' }}</span>
+          <div class="meta">RED_SDK_ROOT: {{ runtime_health.red_sdk_root or '<unset>' }}</div>
+          {% if runtime_health.resolved_red_sdk_redistributable_dir %}
+            <div class="meta">Redistributable: {{ runtime_health.resolved_red_sdk_redistributable_dir }}</div>
+          {% endif %}
+        </div>
+      </div>
+      {% if not runtime_health.html_pdf_ready and runtime_health.weasyprint_error %}
+        <div class="meta" style="margin-top:12px;">PDF export preflight: {{ runtime_health.weasyprint_error }}</div>
+      {% endif %}
+      {% if not runtime_health.red_backend_ready and runtime_health.red_backend_error %}
+        <div class="meta" style="margin-top:8px;">RED backend preflight: {{ runtime_health.red_backend_error }}</div>
+      {% endif %}
+    </div>
 
     <form method="post" action="{{ url_for('scan') }}">
       <div class="card">
@@ -563,7 +596,7 @@ PAGE_TEMPLATE = """
           <button type="submit" formaction="{{ url_for('approve_master') }}" class="secondary">Approve Master RMD</button>
           <button type="submit" formaction="{{ url_for('clear_preview') }}" class="secondary">Clear Preview Cache</button>
           {% if report_url %}
-            <a class="link-button secondary" href="{{ report_url }}" target="_blank" rel="noopener">Open Report</a>
+            <a class="link-button secondary" href="{{ report_url }}" target="_blank" rel="noopener">Open Report (HTML)</a>
           {% endif %}
         </div>
       </div>
@@ -624,10 +657,10 @@ PAGE_TEMPLATE = """
       </ul>
       <div class="actions" id="completion-actions">
         {% if task.report_ready and task.preview_pdf_url %}
-          <a class="link-button" id="preview-pdf-link" href="{{ task.preview_pdf_url }}" target="_blank" rel="noopener">Open Preview PDF</a>
+          <a class="link-button" id="preview-pdf-link" href="{{ task.preview_pdf_url }}" target="_blank" rel="noopener">Export PDF</a>
         {% endif %}
         {% if task.report_ready and task.preview_html_url %}
-          <a class="link-button secondary" id="preview-html-link" href="{{ task.preview_html_url }}" target="_blank" rel="noopener">Open HTML Preview</a>
+          <a class="link-button secondary" id="preview-html-link" href="{{ task.preview_html_url }}" target="_blank" rel="noopener">Open Report (HTML)</a>
         {% endif %}
         {% if task.output_folder and task.report_ready %}
           <button type="button" class="secondary" id="open-output-button" onclick="openOutputFolder()">Open Output Folder</button>
@@ -1150,7 +1183,7 @@ PAGE_TEMPLATE = """
         a.href = data.preview_pdf_url;
         a.target = '_blank';
         a.rel = 'noopener';
-        a.textContent = 'Open Preview PDF';
+        a.textContent = 'Export PDF';
         actions.appendChild(a);
       }
       if (data.report_ready && data.preview_html_url) {
@@ -1160,7 +1193,7 @@ PAGE_TEMPLATE = """
         a.href = data.preview_html_url;
         a.target = '_blank';
         a.rel = 'noopener';
-        a.textContent = 'Open HTML Preview';
+        a.textContent = 'Open Report (HTML)';
         actions.appendChild(a);
       }
       if (data.report_ready && data.output_folder) {
@@ -1196,7 +1229,7 @@ def build_review_web_command(repo_root: str, form: Dict[str, object]) -> List[st
     matching_domain_value = "perceptual"
     input_path = str(form["input_path"]) if source_mode == "local_folder" else str(Path(str(form["output_path"])).expanduser().resolve() / "ingest")
     args = [
-        "python3",
+        sys.executable or "python3",
         "-m",
         "r3dmatch.cli",
         "review-calibration",
@@ -1240,18 +1273,33 @@ def build_review_web_command(repo_root: str, form: Dict[str, object]) -> List[st
         args.extend(["--hero-clip-id", str(form["hero_clip_id"])])
     if form.get("preview_lut"):
         args.extend(["--preview-lut", str(form["preview_lut"])])
-    shell_command = (
-        f'cd "{repo_root}"; setenv PYTHONPATH "$PWD/src"; setenv R3DMATCH_INVOCATION_SOURCE web_ui; '
-        + " ".join(shlex.quote(item) for item in args)
+    shell_command = _build_tcsh_launch_prefix(repo_root, invocation_source="web_ui") + " ".join(
+        shlex.quote(item) for item in args
     )
     return ["/bin/tcsh", "-c", shell_command]
+
+
+def _build_tcsh_launch_prefix(repo_root: str, *, invocation_source: Optional[str] = None) -> str:
+    commands = [f'cd "{repo_root}"', 'setenv PYTHONPATH "$PWD/src"']
+    if invocation_source:
+        commands.append(f"setenv R3DMATCH_INVOCATION_SOURCE {shlex.quote(invocation_source)}")
+    dyld_fallback_library_path = str(os.environ.get("DYLD_FALLBACK_LIBRARY_PATH") or "").strip()
+    if dyld_fallback_library_path:
+        commands.append(f"setenv DYLD_FALLBACK_LIBRARY_PATH {shlex.quote(dyld_fallback_library_path)}")
+    red_sdk_root = str(os.environ.get("RED_SDK_ROOT") or "").strip()
+    if red_sdk_root:
+        commands.append(f"setenv RED_SDK_ROOT {shlex.quote(red_sdk_root)}")
+    red_sdk_redistributable_dir = str(os.environ.get("RED_SDK_REDISTRIBUTABLE_DIR") or "").strip()
+    if red_sdk_redistributable_dir:
+        commands.append(f"setenv RED_SDK_REDISTRIBUTABLE_DIR {shlex.quote(red_sdk_redistributable_dir)}")
+    return "; ".join(commands) + "; "
 
 
 def build_approve_web_command(repo_root: str, form: Dict[str, object]) -> List[str]:
     strategy = form["target_strategies"][0] if form["target_strategies"] else "median"
     output_path = str(form.get("resolved_output_path") or form["output_path"])
     args = [
-        "python3",
+        sys.executable or "python3",
         "-m",
         "r3dmatch.cli",
         "approve-master-rmd",
@@ -1263,14 +1311,14 @@ def build_approve_web_command(repo_root: str, form: Dict[str, object]) -> List[s
         args.extend(["--reference-clip-id", str(form["reference_clip_id"])])
     if form.get("hero_clip_id"):
         args.extend(["--hero-clip-id", str(form["hero_clip_id"])])
-    shell_command = f'cd "{repo_root}"; setenv PYTHONPATH "$PWD/src"; ' + " ".join(shlex.quote(item) for item in args)
+    shell_command = _build_tcsh_launch_prefix(repo_root) + " ".join(shlex.quote(item) for item in args)
     return ["/bin/tcsh", "-c", shell_command]
 
 
 def build_clear_cache_web_command(repo_root: str, form: Dict[str, object]) -> List[str]:
     output_path = str(form.get("resolved_output_path") or form["output_path"])
-    args = ["python3", "-m", "r3dmatch.cli", "clear-preview-cache", output_path]
-    shell_command = f'cd "{repo_root}"; setenv PYTHONPATH "$PWD/src"; ' + " ".join(shlex.quote(item) for item in args)
+    args = [sys.executable or "python3", "-m", "r3dmatch.cli", "clear-preview-cache", output_path]
+    shell_command = _build_tcsh_launch_prefix(repo_root) + " ".join(shlex.quote(item) for item in args)
     return ["/bin/tcsh", "-c", shell_command]
 
 
@@ -1444,11 +1492,31 @@ def _validate_form(form: Dict[str, object], *, require_output: bool = True, requ
     if require_output and not str(form["output_path"]).strip():
         return "Output folder path is required."
     try:
-        matching_domain_label(str(form.get("matching_domain", "scene")))
+        normalized_review_mode = normalize_review_mode(str(form.get("review_mode", "full_contact_sheet")))
     except ValueError as exc:
         return str(exc)
+    if str(form.get("backend", "mock")).strip().lower() == "red":
+        red_sdk_root = str(os.environ.get("RED_SDK_ROOT") or "").strip()
+        if not red_sdk_root:
+            return (
+                "RED backend requires RED_SDK_ROOT in the web app environment. "
+                "Set RED_SDK_ROOT to your external RED SDK install and relaunch the web UI."
+            )
+    if normalized_review_mode == "full_contact_sheet":
+        runtime_health = runtime_health_payload()
+        if not bool(runtime_health.get("html_pdf_ready")):
+            interpreter = str(runtime_health.get("interpreter") or sys.executable)
+            dyld = str(runtime_health.get("dyld_fallback_library_path") or "")
+            error_text = str(runtime_health.get("weasyprint_error") or "unknown import error")
+            return (
+                "Full Contact Sheet PDF export is unavailable in the current web UI runtime. "
+                f"Interpreter: {interpreter}. "
+                f"DYLD_FALLBACK_LIBRARY_PATH: {dyld or '<unset>'}. "
+                f"WeasyPrint import error: {error_text}. "
+                "Relaunch the web UI from the working venv/interpreter and ensure the native cairo/pango/glib libraries are reachable."
+            )
     try:
-        normalize_review_mode(str(form.get("review_mode", "full_contact_sheet")))
+        matching_domain_label(str(form.get("matching_domain", "scene")))
     except ValueError as exc:
         return str(exc)
     roi_mode = str(form.get("roi_mode", "sphere_auto"))
@@ -1642,6 +1710,95 @@ def _load_commit_payload(output_root: Optional[Path], *, started_at: Optional[fl
         return None
     path = review_commit_payload_path_for(output_root)
     if not _path_is_current(path, started_at=started_at):
+        return None
+    payload = _load_json_path(path)
+    if payload is not None:
+        payload["commit_payload_path"] = str(path)
+    return payload
+
+
+def _review_progress_reports_success(review_progress: Optional[Dict[str, object]]) -> bool:
+    if not isinstance(review_progress, dict):
+        return False
+    phase = str(review_progress.get("phase") or "").strip().lower()
+    extra = dict(review_progress.get("extra") or {})
+    validation_status = str(extra.get("validation_status") or "").strip().lower()
+    return phase == "review_complete" and validation_status == "success"
+
+
+def _artifact_path_from_review_validation(
+    review_validation: Optional[Dict[str, object]],
+    *,
+    required_key: Optional[str] = None,
+    commit_payload: bool = False,
+) -> Optional[Path]:
+    if not isinstance(review_validation, dict):
+        return None
+    candidate_text = ""
+    if commit_payload:
+        candidate_text = str(((review_validation.get("commit_payload") or {}).get("aggregate_path")) or "").strip()
+    elif required_key:
+        candidate_text = str(
+            (((review_validation.get("required_artifacts") or {}).get(required_key) or {}).get("path")) or ""
+        ).strip()
+    if not candidate_text:
+        return None
+    candidate = Path(candidate_text).expanduser().resolve()
+    if not candidate.exists():
+        return None
+    return candidate
+
+
+def _load_review_validation_with_completion_fallback(
+    output_root: Optional[Path],
+    *,
+    started_at: Optional[float] = None,
+    review_progress: Optional[Dict[str, object]] = None,
+) -> Optional[Dict[str, object]]:
+    payload = _load_review_validation(output_root, started_at=started_at)
+    if payload is not None:
+        return payload
+    if output_root is None:
+        return None
+    if not _review_progress_reports_success(review_progress):
+        return None
+    validation_path = review_validation_path_for(output_root)
+    fallback = _load_json_path(validation_path)
+    if fallback is None:
+        return None
+    fallback["validation_path"] = str(validation_path)
+    return fallback
+
+
+def _load_review_payload_from_validated_report(
+    output_root: Optional[Path],
+    *,
+    started_at: Optional[float] = None,
+    review_validation: Optional[Dict[str, object]] = None,
+) -> Optional[Dict[str, object]]:
+    payload = _load_review_payload(output_root, started_at=started_at)
+    if payload is not None:
+        return payload
+    path = _artifact_path_from_review_validation(review_validation, required_key="contact_sheet_json")
+    if path is None:
+        return None
+    payload = _load_json_path(path)
+    if payload is not None:
+        payload["report_json_path"] = str(path)
+    return payload
+
+
+def _load_commit_payload_from_validated_report(
+    output_root: Optional[Path],
+    *,
+    started_at: Optional[float] = None,
+    review_validation: Optional[Dict[str, object]] = None,
+) -> Optional[Dict[str, object]]:
+    payload = _load_commit_payload(output_root, started_at=started_at)
+    if payload is not None:
+        return payload
+    path = _artifact_path_from_review_validation(review_validation, commit_payload=True)
+    if path is None:
         return None
     payload = _load_json_path(path)
     if payload is not None:
@@ -2142,6 +2299,32 @@ def _calibration_overview_from_payload(
     readiness: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     rows = [dict(item) for item in list((review_payload or {}).get("per_camera_analysis") or [])]
+    if not rows:
+        for clip in list((review_payload or {}).get("clips") or []):
+            clip_dict = dict(clip)
+            ipp2_validation = dict(clip_dict.get("ipp2_validation") or {})
+            exposure_metrics = dict(((clip_dict.get("metrics") or {}).get("exposure") or {}))
+            row = {
+                "camera_label": str(ipp2_validation.get("camera_label") or clip_dict.get("camera_label") or clip_dict.get("clip_id") or ""),
+                "clip_id": str(clip_dict.get("clip_id") or ""),
+                "reference_use": str(ipp2_validation.get("reference_use") or clip_dict.get("reference_use") or "Included"),
+                "sample_2_ire": ipp2_validation.get("sample_2_ire", exposure_metrics.get("sample_2_ire")),
+                "camera_offset_from_anchor": ipp2_validation.get(
+                    "camera_offset_from_anchor",
+                    exposure_metrics.get("camera_offset_from_anchor", clip_dict.get("offset_to_anchor")),
+                ),
+                "final_offset_stops": exposure_metrics.get("final_offset_stops", clip_dict.get("final_offset_stops")),
+                "trust_score": clip_dict.get("trust_score", ipp2_validation.get("trust_score")),
+                "confidence": clip_dict.get("confidence", ((clip_dict.get("metrics") or {}).get("confidence"))),
+                "measured_gray_exposure_summary": str(
+                    ipp2_validation.get("ipp2_gray_exposure_summary")
+                    or ipp2_validation.get("ipp2_original_gray_exposure_summary")
+                    or exposure_metrics.get("gray_exposure_summary")
+                    or clip_dict.get("measured_gray_exposure_summary")
+                    or "n/a"
+                ),
+            }
+            rows.append(row)
     retained_rows = [row for row in rows if str(row.get("reference_use") or "").strip().lower() != "excluded"]
     sample_2_values = [
         float(row.get("sample_2_ire"))
@@ -3084,9 +3267,17 @@ def _infer_progress(task: TaskState) -> None:
     output_root = Path(resolved_output).expanduser().resolve() if resolved_output else None
     is_review = "review-calibration" in task.command
     is_approve = "approve-master-rmd" in task.command
-    review_validation = _load_review_validation(output_root, started_at=task.started_at) if is_review else None
-    review_manifest = _load_review_manifest(output_root, started_at=task.started_at) if is_review else None
     review_progress = _load_review_progress(output_root, started_at=task.started_at) if is_review else None
+    review_validation = (
+        _load_review_validation_with_completion_fallback(
+            output_root,
+            started_at=task.started_at,
+            review_progress=review_progress,
+        )
+        if is_review
+        else None
+    )
+    review_manifest = _load_review_manifest(output_root, started_at=task.started_at) if is_review else None
     resolved_review_mode = normalize_review_mode(
         str(
             task.review_mode
@@ -3270,8 +3461,16 @@ def _status_payload(task: TaskState) -> Dict[str, object]:
         _infer_progress(task)
         base = task.snapshot()
     output_root = _canonical_output_root_from_base(base)
-    review_validation = _load_review_validation(output_root, started_at=float(base.get("started_at") or 0.0)) if "review-calibration" in base["command"] else None
     review_progress = _load_review_progress(output_root, started_at=float(base.get("started_at") or 0.0)) if "review-calibration" in base["command"] else None
+    review_validation = (
+        _load_review_validation_with_completion_fallback(
+            output_root,
+            started_at=float(base.get("started_at") or 0.0),
+            review_progress=review_progress,
+        )
+        if "review-calibration" in base["command"]
+        else None
+    )
     canonical_output_root = _output_root_from_validation_payload(review_validation)
     if canonical_output_root is not None and canonical_output_root != output_root:
         output_root = canonical_output_root
@@ -3280,8 +3479,24 @@ def _status_payload(task: TaskState) -> Dict[str, object]:
         with task.lock:
             task.canonical_output_path = str(canonical_output_root)
             task.output_path = str(canonical_output_root)
-    review_payload = _load_review_payload(output_root, started_at=float(base.get("started_at") or 0.0)) if output_root else None
-    commit_payload = _load_commit_payload(output_root, started_at=float(base.get("started_at") or 0.0)) if output_root else None
+    review_payload = (
+        _load_review_payload_from_validated_report(
+            output_root,
+            started_at=float(base.get("started_at") or 0.0),
+            review_validation=review_validation,
+        )
+        if output_root
+        else None
+    )
+    commit_payload = (
+        _load_commit_payload_from_validated_report(
+            output_root,
+            started_at=float(base.get("started_at") or 0.0),
+            review_validation=review_validation,
+        )
+        if output_root
+        else None
+    )
     camera_state_report = _load_latest_camera_state_report(output_root) if output_root else None
     apply_report = _load_latest_apply_report(output_root) if output_root else None
     writeback_verification_report = _load_latest_writeback_verification_report(output_root) if output_root else None
@@ -3436,9 +3651,11 @@ def _start_command_task(
 
 
 def create_app() -> Flask:
+    ensure_runtime_environment()
     app = Flask(__name__)
     app.config["REPO_ROOT"] = str(Path(__file__).resolve().parents[2])
     app.config["UI_STATE"] = UiState()
+    app.config["RUNTIME_HEALTH"] = runtime_health_payload()
 
     def render_page() -> str:
         state: UiState = app.config["UI_STATE"]
@@ -3468,6 +3685,7 @@ def create_app() -> Flask:
             error=state.error,
             message=state.message,
             report_url=report_url,
+            runtime_health=app.config["RUNTIME_HEALTH"],
         )
 
     @app.get("/")

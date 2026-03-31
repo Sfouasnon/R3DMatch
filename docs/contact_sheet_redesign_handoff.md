@@ -1,145 +1,177 @@
-# Contact Sheet Diagnostic Redesign Handoff
+# Contact Sheet Finalization Handoff
 
-## Page 1 redesign
+## Final render path
 
-The old summary/dashboard surface was replaced with an adaptive contact-sheet page model.
+The contact sheet now has one authored layout path:
 
-New first-page behavior:
+1. `src/r3dmatch/report.py` → `build_contact_sheet_report(...)`
+2. `src/r3dmatch/report.py` → `render_contact_sheet_html(...)`
+3. `src/r3dmatch/report.py` → `render_contact_sheet_pdf_from_html(...)`
 
-- fixed 3-column camera grid
-- row count derived from camera count
-- up to 12 cameras per contact-sheet page before pagination
-- same structure repeated for larger sets across multiple pages
-- no oversized summary cards
-- no presentation-style hero blocks
-- tight header with logo, title, and compact metadata strip
+`contact_sheet.html` is the source of truth. `preview_contact_sheet.pdf` is generated only from that HTML.
 
-Each contact-sheet page now contains:
+There is no parallel custom contact-sheet PDF compositor path.
 
-1. original camera grid
-2. original array synopsis
-3. adjusted camera grid
-4. adjusted array synopsis
+## HTML / PDF layout contract
 
-This makes page 1 read like a calibration sheet instead of a dashboard.
+The final contact sheet uses a deterministic page system built for WeasyPrint:
 
-## Adaptive grid and pagination
+- one `.page` container per camera
+- block layout plus inline-block only for row composition
+- no CSS grid or flexbox in the authored contact-sheet page layout
+- fixed four-part page structure:
+  - `.header`
+  - `.image-row`
+  - `.metrics`
+  - `.footer`
 
-Grid logic:
+Each camera page renders exactly three report images:
 
-- columns = 3
-- max rows per contact-sheet page = 4
-- page size = 12 cameras
+- Original Frame
+- Corrected Frame
+- Sphere Mask Overlay
 
-Behavior:
+## Authoritative displayed values
 
-- `<= 12` cameras: all cameras on page 1
-- `13–24` cameras: two contact-sheet pages
-- `25–36+` cameras: additional contact-sheet pages, still 3-up
+The report now uses one authoritative source order for displayed sample values:
 
-Images are not shrunk further just to force more cameras onto a page. Readability stays ahead of single-page completeness.
+1. `ipp2_validation`
+2. strategy clip payload
+3. stored exposure metrics
+4. shared original payload
 
-## Graph scaling changes
+The report does not average or recompute sample values.
 
-The original and adjusted synopsis plots now derive Y ranges from actual persisted values with only small padding.
-
-This applies to:
-
-- exposure trace
-- kelvin trace
-- tint trace
-
-Result:
-
-- subtle differences remain visible
-- graphs no longer flatten small discrepancies with overly wide ranges
-- page-level synopsis is useful for anomaly detection instead of decorative summary
-
-## Metadata policy
-
-Original grid metadata line now uses stored metadata only:
-
-- ISO
-- shutter
-- kelvin
-- tint
-
-Rules enforced:
-
-- no T-stop
-- no placeholders
-- missing values omitted cleanly
-
-Adjusted grid line uses stored correction values only:
-
-- `exposureAdjust`
-- kelvin
-- tint
-
-## Sphere totals placement
-
-Original-grid cells now place the sphere totals directly under the original still:
+Displayed values are:
 
 - `S1`
 - `S2`
 - `S3`
+- `Target Sample`
 - `Scalar`
+- `exposureAdjust`
+- `kelvin`
+- `tint`
+- validation residual
 
-These are drawn from stored persisted values only:
+Important semantic rule:
 
-- `sample_1_ire`
-- `sample_2_ire`
-- `sample_3_ire`
-- stored display scalar
+- `S1` / `S2` / `S3` are monitoring-domain IRE values from stored payloads
+- `Scalar` is displayed as log2 and is not relabeled as IRE
 
-No report-side recomputation was added.
+## Fail-fast behavior
 
-## Per-camera alignment fixes
+The contact-sheet build now fails before emitting deliverables when required report truth is missing.
 
-Per-camera pages were tightened into a diagnostic verification layout:
+Validated before or during HTML emission:
 
-- top strip: camera, status, recommended action
-- locked original/corrected comparison
-- prominent stored solve overlay
-- sample values immediately adjacent to overlay
-- compressed metric strip
-- compressed flags strip
+- original still exists
+- corrected still exists
+- sphere mask overlay exists
+- generated `<img src>` references resolve relative to `contact_sheet.html`
+- required stored sample values exist in the authoritative payload chain
+- report image outputs are successfully written under `report/images/`
 
-This reduces mental joining between image evidence and numeric evidence.
+Missing assets or missing required sample truth now raise a hard error.
 
-## Persisted truth reused
+## Report-local image set
 
-The redesign still reuses stored truth only:
+The HTML no longer embeds full-resolution report stills directly.
 
-- original measured stills
-- corrected stills
-- exact stored solve overlays
-- `sample_1_ire`
-- `sample_2_ire`
-- `sample_3_ire`
-- stored display scalar values
-- stored correction values
-- stored validation residuals
-- stored notes / flags
+Per report build it writes:
 
-Confirmed:
+- `report/images/<camera>_original.jpg`
+- `report/images/<camera>_corrected.jpg`
+- `report/images/<camera>_mask.jpg`
+
+Rules enforced during generation:
+
+- resized before HTML emit
+- max width target: 800 px
+- JPEG quality: 82
+- RGB / 8-bit output
+- fail if a generated report image exceeds 1200 px width
+
+This keeps HTML/PDF output smaller and more stable.
+
+## Debug artifact
+
+Each report writes:
+
+- `report/contact_sheet_debug.json`
+
+It includes:
+
+- resolved asset paths per camera
+- measurement values per camera
+- validation status summary
+- fallback-used flags
+
+## Useful retained surfaces
+
+The report keeps only decision-useful surfaces:
+
+- Original Frame
+- Corrected Frame
+- Sphere Mask Overlay
+- key measurement values
+- correction values
+- validation residual
+- recommended action
+- one white-balance deviation chart when persisted values are available
+
+The first page/footer also carries:
+
+- `Original Array Synopsis`
+- `What To Look For`
+
+Low-value clutter was removed instead of preserved.
+
+## White-balance deviation chart
+
+The retained chart is based only on persisted values:
+
+- original path: `original_kelvin`, `original_tint`
+- target center: `5600K / Tint 0`
+
+It now uses:
+
+- larger target marker
+- larger camera dots
+- clearer warm/cool and green/magenta labeling
+- collision-reduced label placement
+
+If source values are unavailable, the chart is omitted and the footer notes that it is unavailable from the stored payload.
+
+## UI label cleanup
+
+The report actions now read:
+
+- `Open Report (HTML)`
+- `Export PDF`
+
+## Validation completed
+
+Code validation:
+
+- `py_compile src/r3dmatch/report.py tests/test_cli.py`
+- `221 passed` in `tests/test_cli.py`
+
+Real artifact probe:
+
+- rendered from existing real payload under `runs/final_display_scalar_lock/real_063_display_scalar_lock/report/contact_sheet.json`
+- output written to `/tmp/r3dmatch_final_contact_sheet_probe/`
+- validates asset references relative to the emitted HTML
+- uses the same HTML artifact for PDF export
+
+## Integrity guarantees preserved
+
+This pass did not change calibration science.
+
+Still true:
 
 - no report-side remeasurement
 - no new sphere detection
 - no new sample computation
 - no duplicate baseline REDLine render
-
-## Validation
-
-Validated in this pass:
-
-- `py_compile src/r3dmatch/report.py tests/test_cli.py`
-- `PYTHONPATH=src PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /Users/sfouasnon/Desktop/R3DSplat/.venv39validate/bin/pytest -q tests/test_cli.py`
-
-Result:
-
-- `203 passed`
-
-## Known limitation
-
-A fresh artifact generation attempt from this session depends on shell sandbox write permissions for the chosen output location inside the project. If that path is blocked, code and test validation remain the source of truth for this pass.
+- HTML remains the report source of truth

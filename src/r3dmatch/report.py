@@ -9,8 +9,10 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 import textwrap
+from urllib.parse import unquote, urlparse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -112,6 +114,7 @@ PROFILE_AUDIT_CONSISTENT_STOPS = 0.10
 PROFILE_AUDIT_REVIEW_STOPS = 0.25
 PROFILE_AUDIT_CONSISTENT_SPREAD_IRE = 1.5
 PROFILE_AUDIT_REVIEW_SPREAD_IRE = 3.0
+CONTACT_SHEET_TARGET_SAMPLE_LABEL = SPHERE_PROFILE_ZONE_DISPLAY["center"]
 SPHERE_PROFILE_SAMPLE_FIELD_MAP = {
     "bright_side": "sample_1_ire",
     "center": "sample_2_ire",
@@ -7562,15 +7565,23 @@ def build_contact_sheet_report(
     ) if strategy_payloads else ""
     json_path = out_root / "contact_sheet.json"
     html_path = out_root / "contact_sheet.html"
+    debug_json_path = out_root / "contact_sheet_debug.json"
     pdf_path = out_root / "preview_contact_sheet.pdf"
     review_manifest_path = out_root / "review_manifest.json"
     try:
         raise_if_cancelled("Run cancelled before writing review report artifacts.")
         json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        payload["report_json"] = str(json_path)
+        payload["report_html"] = str(html_path)
+        payload["preview_report_pdf"] = str(pdf_path)
         raise_if_cancelled("Run cancelled before writing review HTML.")
-        html_path.write_text(render_contact_sheet_html(payload), encoding="utf-8")
+        html_path.write_text(render_contact_sheet_html(payload, html_path=str(html_path)), encoding="utf-8")
+        payload["contact_sheet_debug"] = str(debug_json_path)
+        payload["html_asset_validation"] = _assert_contact_sheet_html_assets(str(html_path))
+        payload["pdf_export_preflight"] = contact_sheet_pdf_export_preflight(str(html_path))
+        json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         raise_if_cancelled("Run cancelled before rendering review PDF.")
-        render_contact_sheet_pdf(payload, output_path=str(pdf_path), title="R3DMatch Review Contact Sheet")
+        render_contact_sheet_pdf_from_html(str(html_path), output_path=str(pdf_path))
         raise_if_cancelled("Run cancelled before writing review manifest.")
         review_manifest_path.write_text(
             json.dumps(
@@ -7607,6 +7618,7 @@ def build_contact_sheet_report(
                     "sphere_detection_overlay_root": payload["sphere_detection_overlay_root"],
                     "report_json": str(json_path),
                     "report_html": str(html_path),
+                    "contact_sheet_debug": str(debug_json_path),
                     "preview_report_pdf": str(pdf_path),
                     "previews_dir": payload["previews_dir"],
                 },
@@ -7819,11 +7831,17 @@ def build_review_package(
     return package_manifest
 
 
-def _contact_sheet_image_src(path: object) -> str:
+def _contact_sheet_image_src(path: object, *, html_path: Optional[object] = None) -> str:
     path_text = str(path or "").strip()
     if not path_text:
         return ""
     path_obj = Path(path_text)
+    if html_path:
+        html_dir = Path(html_path).expanduser().resolve().parent
+        try:
+            return Path(os.path.relpath(path_obj.expanduser().resolve(), start=html_dir)).as_posix()
+        except (OSError, ValueError):
+            return path_obj.expanduser().resolve().as_uri()
     if "review_detection_overlays" in path_obj.parts:
         return f"./review_detection_overlays/{path_obj.name}"
     if "_measurement" in path_obj.parts:
@@ -7831,6 +7849,253 @@ def _contact_sheet_image_src(path: object) -> str:
     if "_ipp2_closed_loop" in path_obj.parts:
         return f"../previews/_ipp2_closed_loop/{path_obj.name}"
     return f"../previews/{path_obj.name}"
+
+
+_CONTACT_SHEET_IMG_SRC_RE = re.compile(r"<img\b[^>]*\bsrc=(['\"])(.*?)\1", re.IGNORECASE)
+
+
+def _validate_contact_sheet_html_assets_markup(html_text: str, *, html_path: str) -> Dict[str, object]:
+    html_file = Path(html_path).expanduser().resolve()
+    resolved_assets: List[str] = []
+    missing_assets: List[str] = []
+    sources = [match[1] for match in _CONTACT_SHEET_IMG_SRC_RE.findall(html_text)]
+    for src in sources:
+        asset_path = _resolve_contact_sheet_html_asset(src, html_path=str(html_file))
+        if asset_path is None:
+            continue
+        resolved_assets.append(str(asset_path))
+        if not asset_path.exists():
+            missing_assets.append(f"{src} -> {asset_path}")
+    return {
+        "html_path": str(html_file),
+        "image_count": len(sources),
+        "resolved_asset_count": len(resolved_assets),
+        "resolved_assets": resolved_assets,
+        "missing_assets": missing_assets,
+        "all_assets_exist": not missing_assets,
+    }
+
+
+def _resolve_contact_sheet_html_asset(src: str, *, html_path: str) -> Optional[Path]:
+    source = str(src or "").strip()
+    if not source or source.startswith(("http://", "https://", "data:", "about:", "#")):
+        return None
+    if source.startswith("file://"):
+        parsed = urlparse(source)
+        return Path(unquote(parsed.path))
+    source_path = Path(source)
+    if source_path.is_absolute():
+        return source_path
+    return Path(html_path).expanduser().resolve().parent / source_path
+
+
+def validate_contact_sheet_html_assets(html_path: str) -> Dict[str, object]:
+    html_file = Path(html_path).expanduser().resolve()
+    html_text = html_file.read_text(encoding="utf-8")
+    return _validate_contact_sheet_html_assets_markup(html_text, html_path=str(html_file))
+
+
+def _assert_contact_sheet_html_assets(html_path: str) -> Dict[str, object]:
+    validation = validate_contact_sheet_html_assets(html_path)
+    missing_assets = list(validation.get("missing_assets") or [])
+    if missing_assets:
+        preview = "; ".join(missing_assets[:6])
+        if len(missing_assets) > 6:
+            preview += f"; ... and {len(missing_assets) - 6} more"
+        raise RuntimeError(
+            "Generated contact_sheet.html references missing image assets. "
+            f"HTML: {html_path}. Missing: {preview}"
+        )
+    return validation
+
+
+def _contact_sheet_sanitized_stem(value: object) -> str:
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip()).strip("._")
+    return text or "camera"
+
+
+def _contact_sheet_resample_filter() -> int:
+    resampling = getattr(Image, "Resampling", Image)
+    return int(getattr(resampling, "LANCZOS"))
+
+
+def _contact_sheet_write_report_image(source_path: str, *, output_path: Path) -> Dict[str, object]:
+    source = Path(source_path).expanduser().resolve()
+    if not source.exists():
+        raise RuntimeError(f"Contact-sheet asset is missing: {source}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(source) as image:
+        converted = image.convert("RGB")
+        width, height = converted.size
+        if width <= 0 or height <= 0:
+            raise RuntimeError(f"Contact-sheet asset has invalid size: {source}")
+        target_width = min(width, 800)
+        if width != target_width:
+            target_height = max(1, int(round(height * (target_width / width))))
+            converted = converted.resize((target_width, target_height), _contact_sheet_resample_filter())
+        if converted.size[0] > 1200:
+            raise RuntimeError(
+                f"Contact-sheet report image exceeds the 1200px width limit after resize: {output_path} ({converted.size[0]}px)"
+            )
+        converted.save(output_path, format="JPEG", quality=82, optimize=True, progressive=True)
+    return {
+        "source_path": str(source),
+        "output_path": str(output_path.resolve()),
+        "width": int(converted.size[0]),
+        "height": int(converted.size[1]),
+    }
+
+
+def _contact_sheet_collect_consistent_numeric(
+    field_name: str,
+    *,
+    required: bool = False,
+    tolerance: float = 1e-4,
+    treat_zero_as_missing: bool = False,
+    sources: List[Tuple[str, Dict[str, object]]],
+) -> Tuple[Optional[float], str]:
+    found: List[Tuple[str, float]] = []
+    for source_name, source in sources:
+        raw_value = source.get(field_name)
+        if raw_value in (None, ""):
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Contact-sheet field {field_name} is not numeric in {source_name}: {raw_value!r}") from exc
+        if treat_zero_as_missing and math.isclose(value, 0.0, abs_tol=tolerance):
+            continue
+        found.append((source_name, value))
+    if required and not found:
+        raise RuntimeError(f"Contact-sheet field {field_name} is missing from the stored measurement payload.")
+    if len(found) > 1:
+        baseline = found[0][1]
+        for source_name, value in found[1:]:
+            if not math.isclose(value, baseline, abs_tol=tolerance):
+                source_summary = ", ".join(f"{name}={val:.6f}" for name, val in found)
+                raise RuntimeError(
+                    f"Stored measurement payload disagrees for {field_name}: {source_summary}. "
+                    "Contact-sheet build stopped to avoid displaying inconsistent values."
+                )
+    return (found[0][1], found[0][0]) if found else (None, "")
+
+
+def _contact_sheet_collect_sample_numeric(
+    sample_field: str,
+    *,
+    required: bool = False,
+    tolerance: float = 1e-4,
+    sources: List[Tuple[str, Dict[str, object]]],
+) -> Tuple[Optional[float], str]:
+    alias_map = {
+        "sample_1_ire": ("sample_1_ire", "bright_ire"),
+        "sample_2_ire": ("sample_2_ire", "center_ire"),
+        "sample_3_ire": ("sample_3_ire", "dark_ire"),
+    }
+    aliases = alias_map.get(sample_field, (sample_field,))
+    for source_name, source in sources:
+        for alias in aliases:
+            raw_value = source.get(alias)
+            if raw_value in (None, ""):
+                continue
+            try:
+                candidate = float(raw_value)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"Contact-sheet field {alias} is not numeric in {source_name}: {raw_value!r}") from exc
+            if math.isclose(candidate, 0.0, abs_tol=tolerance):
+                continue
+            return candidate, f"{source_name}.{alias}"
+    if required:
+        raise RuntimeError(f"Contact-sheet field {sample_field} is missing from the stored measurement payload.")
+    return None, ""
+
+
+def _contact_sheet_resolve_measurement_fields(
+    *,
+    clip_id: str,
+    clip_row: Dict[str, object],
+    shared: Dict[str, object],
+    exposure_metrics: Dict[str, object],
+    ipp2_row: Dict[str, object],
+) -> Dict[str, object]:
+    sample_sources = [
+        ("ipp2_validation", ipp2_row),
+        ("strategy_clip", clip_row),
+        ("exposure_metrics", exposure_metrics),
+        ("shared_original", shared),
+    ]
+    sample_1_ire, sample_1_source = _contact_sheet_collect_sample_numeric("sample_1_ire", required=True, sources=sample_sources)
+    sample_2_ire, sample_2_source = _contact_sheet_collect_sample_numeric("sample_2_ire", required=True, sources=sample_sources)
+    sample_3_ire, sample_3_source = _contact_sheet_collect_sample_numeric("sample_3_ire", required=True, sources=sample_sources)
+    scalar_sources = [
+        ("strategy_clip.display_scalar_log2", {"value": clip_row.get("display_scalar_log2")}),
+        ("shared_original.display_scalar_log2", {"value": shared.get("display_scalar_log2")}),
+        ("exposure_metrics.display_scalar_log2", {"value": exposure_metrics.get("display_scalar_log2")}),
+        ("strategy_clip.measured_log2_luminance_monitoring", {"value": clip_row.get("measured_log2_luminance_monitoring")}),
+        ("shared_original.measured_log2_luminance_monitoring", {"value": shared.get("measured_log2_luminance_monitoring")}),
+        ("exposure_metrics.measured_log2_luminance_monitoring", {"value": exposure_metrics.get("measured_log2_luminance_monitoring")}),
+        ("strategy_clip.measured_log2_luminance", {"value": clip_row.get("measured_log2_luminance")}),
+    ]
+    scalar_value = None
+    scalar_source = ""
+    for source_name, source in scalar_sources:
+        raw_value = source.get("value")
+        if raw_value in (None, ""):
+            continue
+        try:
+            scalar_value = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Contact-sheet scalar is not numeric for {clip_id} in {source_name}: {raw_value!r}"
+            ) from exc
+        scalar_source = source_name
+        break
+    if scalar_value is None:
+        raise RuntimeError(f"Contact-sheet scalar is missing from the stored measurement payload for {clip_id}.")
+    return {
+        "sample_1_ire": float(sample_1_ire or 0.0),
+        "sample_2_ire": float(sample_2_ire or 0.0),
+        "sample_3_ire": float(sample_3_ire or 0.0),
+        "sample_sources": {
+            "sample_1_ire": sample_1_source,
+            "sample_2_ire": sample_2_source,
+            "sample_3_ire": sample_3_source,
+        },
+        "target_sample_label": CONTACT_SHEET_TARGET_SAMPLE_LABEL,
+        "display_scalar_log2": float(scalar_value),
+        "display_scalar_source": scalar_source,
+    }
+
+
+def _contact_sheet_required_asset(path_value: object, *, label: str, clip_id: str) -> str:
+    path_text = str(path_value or "").strip()
+    if not path_text:
+        raise RuntimeError(f"Contact-sheet build requires {label} for {clip_id}, but no stored asset path was present.")
+    resolved = Path(path_text).expanduser().resolve()
+    if not resolved.exists():
+        raise RuntimeError(f"Contact-sheet build requires {label} for {clip_id}, but the stored asset is missing: {resolved}")
+    return str(resolved)
+
+
+def contact_sheet_pdf_export_preflight(html_path: Optional[str] = None) -> Dict[str, object]:
+    preflight: Dict[str, object] = {
+        "interpreter": sys.executable,
+        "dyld_fallback_library_path": str(os.environ.get("DYLD_FALLBACK_LIBRARY_PATH") or ""),
+        "red_sdk_root": str(os.environ.get("RED_SDK_ROOT") or ""),
+        "red_sdk_redistributable_dir": str(os.environ.get("RED_SDK_REDISTRIBUTABLE_DIR") or ""),
+        "weasyprint_importable": False,
+        "weasyprint_error": "",
+        "asset_validation": None,
+    }
+    try:
+        from weasyprint import HTML  # noqa: F401
+    except Exception as exc:  # pragma: no cover - host dependency boundary
+        preflight["weasyprint_error"] = str(exc)
+        return preflight
+    preflight["weasyprint_importable"] = True
+    if html_path:
+        preflight["asset_validation"] = validate_contact_sheet_html_assets(html_path)
+    return preflight
 
 
 def _contact_sheet_display_scalar_ire(log2_value: object, fallback_ire: object = None) -> float:
@@ -7871,7 +8136,7 @@ def _contact_sheet_goal_achieved(entries: List[Dict[str, object]], goal_stops: f
     return all(float(item.get("residual_abs_stops", 0.0) or 0.0) <= goal_stops for item in entries)
 
 
-def _contact_sheet_chunks(entries: List[Dict[str, object]], *, columns: int = 3, max_rows: int = 4) -> List[List[Dict[str, object]]]:
+def _contact_sheet_chunks(entries: List[Dict[str, object]], *, columns: int = 2, max_rows: int = 2) -> List[List[Dict[str, object]]]:
     page_size = max(1, int(columns) * int(max_rows))
     if not entries:
         return [[]]
@@ -7951,12 +8216,12 @@ def _contact_sheet_svg_single_series(
 ) -> str:
     if not labels or not values:
         return ""
-    width = 880
-    height = 180
-    margin_left = 58
-    margin_right = 18
-    margin_top = 18
-    margin_bottom = 36
+    width = 1040
+    height = 268
+    margin_left = 64
+    margin_right = 22
+    margin_top = 22
+    margin_bottom = 46
     plot_width = width - margin_left - margin_right
     plot_height = height - margin_top - margin_bottom
     y_min, y_max = _contact_sheet_metric_range(values, fallback_span=0.5)
@@ -7978,98 +8243,128 @@ def _contact_sheet_svg_single_series(
         goal_y = y_for(goal)
         goal_markup = (
             f"<line x1='{margin_left:.1f}' y1='{goal_y:.1f}' x2='{width - margin_right:.1f}' y2='{goal_y:.1f}' "
-            "stroke='#9ca3af' stroke-width='1.5' stroke-dasharray='6 5' />"
-            f"<text x='{width - margin_right:.1f}' y='{goal_y - 6:.1f}' text-anchor='end' fill='#6b7280' font-size='12'>goal {goal:+.2f}</text>"
+            "stroke='#9ca3af' stroke-width='2' stroke-dasharray='8 6' />"
+            f"<text x='{width - margin_right:.1f}' y='{goal_y - 8:.1f}' text-anchor='end' fill='#6b7280' font-size='14'>goal {goal:+.2f}</text>"
         )
 
     x_labels = []
     for index, label in enumerate(labels):
         x = x_for(index)
         x_labels.append(
-            f"<text x='{x:.1f}' y='{height - 10:.1f}' text-anchor='middle' fill='#64748b' font-size='11'>{html.escape(label)}</text>"
+            f"<text x='{x:.1f}' y='{height - 12:.1f}' text-anchor='middle' fill='#64748b' font-size='14' font-weight='700'>{html.escape(label)}</text>"
         )
     y_labels = []
     for tick in y_ticks:
         y = y_for(tick)
         y_labels.append(
-            f"<line x1='{margin_left:.1f}' y1='{y:.1f}' x2='{width - margin_right:.1f}' y2='{y:.1f}' stroke='#e2e8f0' stroke-width='1' />"
-            f"<text x='{margin_left - 8:.1f}' y='{y + 4:.1f}' text-anchor='end' fill='#64748b' font-size='11'>{tick:.2f}{html.escape(units)}</text>"
+            f"<line x1='{margin_left:.1f}' y1='{y:.1f}' x2='{width - margin_right:.1f}' y2='{y:.1f}' stroke='#d6dee8' stroke-width='1.5' />"
+            f"<text x='{margin_left - 10:.1f}' y='{y + 5:.1f}' text-anchor='end' fill='#64748b' font-size='13'>{tick:.2f}{html.escape(units)}</text>"
         )
     point_markup = "".join(
-        f"<circle cx='{x_for(index):.1f}' cy='{y_for(value):.1f}' r='4.5' fill='{stroke}' />"
+        f"<circle cx='{x_for(index):.1f}' cy='{y_for(value):.1f}' r='6' fill='{stroke}' />"
         for index, value in enumerate(values)
     )
     return (
         f"<svg viewBox='0 0 {width} {height}' role='img' aria-label='{html.escape(title)}'>"
         f"<rect x='0' y='0' width='{width}' height='{height}' fill='white' />"
-        f"<text x='0' y='14' fill='#0f172a' font-size='14' font-weight='700'>{html.escape(title)}</text>"
+        f"<text x='0' y='18' fill='#0f172a' font-size='18' font-weight='700'>{html.escape(title)}</text>"
         + "".join(y_labels)
         + goal_markup
-        + f"<polyline fill='none' stroke='{stroke}' stroke-width='3' points='{points}' />"
+        + f"<polyline fill='none' stroke='{stroke}' stroke-width='4.5' points='{points}' />"
         + point_markup
         + "".join(x_labels)
         + "</svg>"
     )
 
 
-def _contact_sheet_svg_color_chart(title: str, labels: List[str], kelvin_values: List[float], tint_values: List[float]) -> str:
+def _contact_sheet_svg_color_deviation_chart(
+    title: str,
+    labels: List[str],
+    kelvin_values: List[float],
+    tint_values: List[float],
+    *,
+    target_kelvin: float = 5600.0,
+    target_tint: float = 0.0,
+    stroke: str = "#0f766e",
+) -> str:
     if not labels:
         return ""
-    width = 880
-    height = 220
-    margin_left = 58
-    margin_right = 18
-    margin_top = 18
-    margin_bottom = 36
-    track_gap = 20
-    track_height = (height - margin_top - margin_bottom - track_gap) / 2.0
+    width = 1080
+    height = 396
+    margin_left = 94
+    margin_right = 34
+    margin_top = 44
+    margin_bottom = 72
     plot_width = width - margin_left - margin_right
-    kelvin_min, kelvin_max = _contact_sheet_metric_range(kelvin_values, fallback_span=100.0)
-    tint_min, tint_max = _contact_sheet_metric_range(tint_values, fallback_span=1.0)
+    plot_height = height - margin_top - margin_bottom
+    kelvin_deltas = [float(value or 0.0) - target_kelvin for value in kelvin_values]
+    tint_deltas = [float(value or 0.0) - target_tint for value in tint_values]
+    tint_min, tint_max = _contact_sheet_metric_range(tint_deltas + [0.0], fallback_span=2.0)
+    kelvin_min, kelvin_max = _contact_sheet_metric_range(kelvin_deltas + [0.0], fallback_span=300.0)
 
-    def x_for(index: int) -> float:
-        if len(labels) == 1:
+    def x_for(delta_tint: float) -> float:
+        if math.isclose(tint_min, tint_max, abs_tol=1e-9):
             return margin_left + plot_width / 2
-        return margin_left + (index / max(len(labels) - 1, 1)) * plot_width
+        return margin_left + ((delta_tint - tint_min) / (tint_max - tint_min)) * plot_width
 
-    def track_y_for(value: float, low: float, high: float, top: float) -> float:
-        if math.isclose(low, high, abs_tol=1e-9):
-            return top + track_height / 2
-        return top + (1.0 - ((value - low) / (high - low))) * track_height
+    def y_for(delta_kelvin: float) -> float:
+        if math.isclose(kelvin_min, kelvin_max, abs_tol=1e-9):
+            return margin_top + plot_height / 2
+        return margin_top + (1.0 - ((delta_kelvin - kelvin_min) / (kelvin_max - kelvin_min))) * plot_height
 
-    def series_markup(values: List[float], low: float, high: float, top: float, stroke: str, unit_label: str) -> str:
-        if not values:
-            return ""
-        points = " ".join(
-            f"{x_for(index):.1f},{track_y_for(value, low, high, top):.1f}"
-            for index, value in enumerate(values)
-        )
-        ticks = [low, (low + high) / 2.0, high]
-        markup = "".join(
-            f"<line x1='{margin_left:.1f}' y1='{track_y_for(tick, low, high, top):.1f}' x2='{width - margin_right:.1f}' y2='{track_y_for(tick, low, high, top):.1f}' stroke='#e2e8f0' stroke-width='1' />"
-            f"<text x='{margin_left - 8:.1f}' y='{track_y_for(tick, low, high, top) + 4:.1f}' text-anchor='end' fill='#64748b' font-size='11'>{tick:.1f}{html.escape(unit_label)}</text>"
-            for tick in ticks
-        )
-        markup += f"<polyline fill='none' stroke='{stroke}' stroke-width='3' points='{points}' />"
-        markup += "".join(
-            f"<circle cx='{x_for(index):.1f}' cy='{track_y_for(value, low, high, top):.1f}' r='4.5' fill='{stroke}' />"
-            for index, value in enumerate(values)
-        )
-        return markup
-
-    x_labels = "".join(
-        f"<text x='{x_for(index):.1f}' y='{height - 10:.1f}' text-anchor='middle' fill='#64748b' font-size='11'>{html.escape(label)}</text>"
-        for index, label in enumerate(labels)
+    zero_x = x_for(0.0)
+    zero_y = y_for(0.0)
+    x_ticks = [tint_min, 0.0, tint_max]
+    y_ticks = [kelvin_min, 0.0, kelvin_max]
+    guides = "".join(
+        f"<line x1='{margin_left:.1f}' y1='{y_for(tick):.1f}' x2='{width - margin_right:.1f}' y2='{y_for(tick):.1f}' stroke='#d6dee8' stroke-width='2.5' />"
+        f"<text x='{margin_left - 14:.1f}' y='{y_for(tick) + 7:.1f}' text-anchor='end' fill='#64748b' font-size='18'>{tick:+.0f}K</text>"
+        for tick in y_ticks
     )
+    guides += "".join(
+        f"<line x1='{x_for(tick):.1f}' y1='{margin_top:.1f}' x2='{x_for(tick):.1f}' y2='{height - margin_bottom:.1f}' stroke='#e2e8f0' stroke-width='2.5' />"
+        f"<text x='{x_for(tick):.1f}' y='{height - 18:.1f}' text-anchor='middle' fill='#64748b' font-size='18'>{tick:+.1f}</text>"
+        for tick in x_ticks
+    )
+    target_markup = (
+        f"<line x1='{margin_left:.1f}' y1='{zero_y:.1f}' x2='{width - margin_right:.1f}' y2='{zero_y:.1f}' stroke='#94a3b8' stroke-width='3' />"
+        f"<line x1='{zero_x:.1f}' y1='{margin_top:.1f}' x2='{zero_x:.1f}' y2='{height - margin_bottom:.1f}' stroke='#94a3b8' stroke-width='3' />"
+        f"<circle cx='{zero_x:.1f}' cy='{zero_y:.1f}' r='11' fill='white' stroke='#0f172a' stroke-width='3.5' />"
+        f"<text x='{zero_x + 18:.1f}' y='{zero_y - 18:.1f}' fill='#475569' font-size='18' font-weight='700'>Target 5600K / Tint 0</text>"
+    )
+    axis_notes = [
+        f"<text x='{margin_left + 10:.1f}' y='{margin_top + 18:.1f}' fill='#64748b' font-size='17' font-weight='700'>Cooler</text>",
+        f"<text x='{margin_left + 10:.1f}' y='{height - margin_bottom - 10:.1f}' fill='#64748b' font-size='17' font-weight='700'>Warmer</text>",
+        f"<text x='{margin_left + 6:.1f}' y='{zero_y - 14:.1f}' fill='#64748b' font-size='17' font-weight='700'>Green</text>",
+        f"<text x='{width - margin_right - 6:.1f}' y='{zero_y - 14:.1f}' text-anchor='end' fill='#64748b' font-size='17' font-weight='700'>Magenta</text>",
+    ]
+    placed_labels: List[Tuple[float, float]] = []
+    points = []
+    for index, label in enumerate(labels):
+        x = x_for(tint_deltas[index])
+        y = y_for(kelvin_deltas[index])
+        text_anchor = "start" if x < (margin_left + plot_width * 0.75) else "end"
+        label_x = x + 16 if text_anchor == "start" else x - 16
+        label_y = y - 16 if index % 2 == 0 else y + 28
+        for placed_x, placed_y in placed_labels:
+            if abs(label_y - placed_y) < 20 and abs(label_x - placed_x) < 72:
+                label_y += 20 if label_y <= y else -20
+        placed_labels.append((label_x, label_y))
+        points.append(
+            f"<circle cx='{x:.1f}' cy='{y:.1f}' r='11' fill='{stroke}' stroke='white' stroke-width='3' />"
+            f"<line x1='{x:.1f}' y1='{y:.1f}' x2='{label_x:.1f}' y2='{label_y - 6:.1f}' stroke='{stroke}' stroke-width='2.25' stroke-opacity='0.7' />"
+            f"<text x='{label_x:.1f}' y='{label_y:.1f}' text-anchor='{text_anchor}' fill='#0f172a' font-size='18' font-weight='700'>{html.escape(label)}</text>"
+        )
     return (
         f"<svg viewBox='0 0 {width} {height}' role='img' aria-label='{html.escape(title)}'>"
         f"<rect x='0' y='0' width='{width}' height='{height}' fill='white' />"
-        f"<text x='0' y='14' fill='#0f172a' font-size='14' font-weight='700'>{html.escape(title)}</text>"
-        f"<text x='{margin_left:.1f}' y='{margin_top - 4:.1f}' fill='#64748b' font-size='11' font-weight='700'>Kelvin</text>"
-        + series_markup(kelvin_values, kelvin_min, kelvin_max, margin_top, "#0f766e", "K")
-        + f"<text x='{margin_left:.1f}' y='{margin_top + track_height + track_gap - 4:.1f}' fill='#64748b' font-size='11' font-weight='700'>Tint</text>"
-        + series_markup(tint_values, tint_min, tint_max, margin_top + track_height + track_gap, "#7c3aed", "")
-        + x_labels
+        f"<text x='0' y='26' fill='#0f172a' font-size='24' font-weight='700'>{html.escape(title)}</text>"
+        f"<text x='{margin_left:.1f}' y='{height - 22:.1f}' fill='#64748b' font-size='18' font-weight='700'>Tint delta from target</text>"
+        f"<text x='{margin_left - 2:.1f}' y='{margin_top - 14:.1f}' fill='#64748b' font-size='18' font-weight='700'>Kelvin delta from target</text>"
+        + guides
+        + target_markup
+        + "".join(axis_notes)
+        + "".join(points)
         + "</svg>"
     )
 
@@ -8132,25 +8427,17 @@ def _contact_sheet_view_model(payload: Dict[str, object]) -> Dict[str, object]:
             or original_image
         )
         corrected_overlay_image = str(overlay.get("corrected_overlay_path") or "")
-        sample_1_ire = float(
-            ipp2_row.get("sample_1_ire", exposure_metrics.get("sample_1_ire", shared.get("sample_1_ire", 0.0))) or 0.0
+        resolved_measurements = _contact_sheet_resolve_measurement_fields(
+            clip_id=clip_id,
+            clip_row=dict(clip),
+            shared=shared,
+            exposure_metrics=exposure_metrics,
+            ipp2_row=ipp2_row,
         )
-        sample_2_ire = float(
-            ipp2_row.get("sample_2_ire", exposure_metrics.get("sample_2_ire", shared.get("sample_2_ire", 0.0))) or 0.0
-        )
-        sample_3_ire = float(
-            ipp2_row.get("sample_3_ire", exposure_metrics.get("sample_3_ire", shared.get("sample_3_ire", 0.0))) or 0.0
-        )
-        display_scalar_log2 = float(
-            shared.get(
-                "display_scalar_log2",
-                exposure_metrics.get(
-                    "display_scalar_log2",
-                    exposure_metrics.get("measured_log2_luminance_monitoring", 0.0),
-                ),
-            )
-            or 0.0
-        )
+        sample_1_ire = float(resolved_measurements["sample_1_ire"])
+        sample_2_ire = float(resolved_measurements["sample_2_ire"])
+        sample_3_ire = float(resolved_measurements["sample_3_ire"])
+        display_scalar_log2 = float(resolved_measurements["display_scalar_log2"])
         display_scalar_ire = _contact_sheet_display_scalar_ire(
             display_scalar_log2,
             shared.get("display_scalar_ire", exposure_metrics.get("display_scalar_ire")),
@@ -8220,8 +8507,11 @@ def _contact_sheet_view_model(payload: Dict[str, object]) -> Dict[str, object]:
                 "sample_1_ire": sample_1_ire,
                 "sample_2_ire": sample_2_ire,
                 "sample_3_ire": sample_3_ire,
+                "target_sample_label": str(resolved_measurements.get("target_sample_label") or CONTACT_SHEET_TARGET_SAMPLE_LABEL),
+                "sample_sources": dict(resolved_measurements.get("sample_sources") or {}),
                 "display_scalar_log2": display_scalar_log2,
                 "display_scalar_ire": display_scalar_ire,
+                "display_scalar_source": str(resolved_measurements.get("display_scalar_source") or ""),
                 "adjusted_display_scalar_log2": adjusted_display_scalar_log2,
                 "adjusted_display_scalar_ire": adjusted_display_scalar_ire,
                 "exposure_adjust_stops": exposure_adjust_stops,
@@ -8241,6 +8531,7 @@ def _contact_sheet_view_model(payload: Dict[str, object]) -> Dict[str, object]:
                 "trust_class": str(clip.get("trust_class") or ipp2_row.get("trust_class") or "TRUSTED"),
                 "sphere_detection_note": str(ipp2_row.get("sphere_detection_note") or "Sphere detection: verified"),
                 "profile_note": str(ipp2_row.get("profile_note") or "Profile consistent with stored solve."),
+                "fallback_used": "fallback" in str(ipp2_row.get("sphere_detection_note") or "").lower(),
                 "measurement_domain": str(payload.get("measurement_preview_transform") or REVIEW_PREVIEW_TRANSFORM),
             }
         )
@@ -8256,14 +8547,15 @@ def _contact_sheet_view_model(payload: Dict[str, object]) -> Dict[str, object]:
     center_values = [float(item.get("sample_2_ire", 0.0) or 0.0) for item in entries if float(item.get("sample_2_ire", 0.0) or 0.0) > 0.0]
     reference_candidate = _contact_sheet_reference_candidate(entries)
     contact_pages = []
-    for page_index, page_entries in enumerate(_contact_sheet_chunks(entries), start=1):
+    for page_index, page_entries in enumerate(_contact_sheet_chunks(entries, columns=2, max_rows=2), start=1):
         labels = [str(item.get("camera_label") or item.get("clip_id") or "") for item in page_entries]
         original_exposure_values = [float(item.get("display_scalar_ire", 0.0) or 0.0) for item in page_entries]
         adjusted_exposure_values = [float(item.get("adjusted_display_scalar_ire", item.get("display_scalar_ire", 0.0)) or 0.0) for item in page_entries]
-        original_kelvin_values = [float(item.get("original_kelvin", 0.0) or 0.0) for item in page_entries]
-        original_tint_values = [float(item.get("original_tint", 0.0) or 0.0) for item in page_entries]
         adjusted_kelvin_values = [float(item.get("kelvin", 0.0) or 0.0) for item in page_entries]
         adjusted_tint_values = [float(item.get("tint", 0.0) or 0.0) for item in page_entries]
+        original_kelvin_values = [float(item.get("original_kelvin", 0.0) or 0.0) for item in page_entries]
+        original_tint_values = [float(item.get("original_tint", 0.0) or 0.0) for item in page_entries]
+        residual_values = [float(item.get("residual_stops", 0.0) or 0.0) for item in page_entries]
         contact_pages.append(
             {
                 "page_index": page_index,
@@ -8283,17 +8575,27 @@ def _contact_sheet_view_model(payload: Dict[str, object]) -> Dict[str, object]:
                     units="",
                     goal=None,
                 ),
-                "original_color_chart_svg": _contact_sheet_svg_color_chart(
-                    "Original white balance trace",
+                "original_color_deviation_chart_svg": _contact_sheet_svg_color_deviation_chart(
+                    "Original white-balance deviation",
                     labels,
                     original_kelvin_values,
                     original_tint_values,
+                    stroke="#0f766e",
                 ),
-                "adjusted_color_chart_svg": _contact_sheet_svg_color_chart(
-                    "Adjusted white balance trace",
+                "adjusted_color_deviation_chart_svg": _contact_sheet_svg_color_deviation_chart(
+                    "Adjusted white-balance deviation",
                     labels,
                     adjusted_kelvin_values,
                     adjusted_tint_values,
+                    stroke="#7c3aed",
+                ),
+                "adjusted_residual_chart_svg": _contact_sheet_svg_single_series(
+                    "Validation residual (stops)",
+                    labels,
+                    residual_values,
+                    stroke="#991b1b",
+                    units="",
+                    goal=0.0,
                 ),
             }
         )
@@ -8330,6 +8632,42 @@ def _contact_sheet_view_model(payload: Dict[str, object]) -> Dict[str, object]:
     }
 
 
+def render_contact_sheet_pdf_from_html(html_path: str, *, output_path: str) -> str:
+    raise_if_cancelled("Run cancelled before PDF rendering.")
+    preflight = contact_sheet_pdf_export_preflight(html_path)
+    asset_validation = dict(preflight.get("asset_validation") or {})
+    missing_assets = list(asset_validation.get("missing_assets") or [])
+    if missing_assets:
+        missing_preview = "; ".join(missing_assets[:6])
+        if len(missing_assets) > 6:
+            missing_preview += f"; ... and {len(missing_assets) - 6} more"
+        raise RuntimeError(
+            "Contact-sheet HTML references missing image assets. "
+            f"HTML: {html_path}. Missing: {missing_preview}"
+        )
+    if not bool(preflight.get("weasyprint_importable")):
+        dyld = str(preflight.get("dyld_fallback_library_path") or "")
+        interpreter = str(preflight.get("interpreter") or sys.executable)
+        error_text = str(preflight.get("weasyprint_error") or "unknown import error")
+        raise RuntimeError(
+            "HTML-to-PDF rendering requires WeasyPrint plus its native cairo/pango/glib libraries. "
+            f"Interpreter: {interpreter}. "
+            f"DYLD_FALLBACK_LIBRARY_PATH: {dyld or '<unset>'}. "
+            f"Import error: {error_text}. "
+            "Install the missing system libraries for WeasyPrint and re-run the report export."
+        )
+    try:
+        from weasyprint import HTML
+    except Exception as exc:  # pragma: no cover - preflight should already catch this
+        raise RuntimeError(str(exc)) from exc
+
+    source_html = Path(html_path).expanduser().resolve()
+    output = Path(output_path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    HTML(filename=str(source_html), base_url=str(source_html.parent)).write_pdf(str(output))
+    return str(output)
+
+
 def render_contact_sheet_pdf(
     payload: Dict[str, object],
     *,
@@ -8337,280 +8675,17 @@ def render_contact_sheet_pdf(
     title: str,
     timestamp_label: Optional[str] = None,
 ) -> str:
-    raise_if_cancelled("Run cancelled before PDF rendering.")
-    from PIL import Image, ImageDraw, ImageFont
-
-    view_model = _contact_sheet_view_model(payload)
-
-    def load_font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
-        preferred = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
-        try:
-            return ImageFont.truetype(preferred, size=size)
-        except OSError:
-            return ImageFont.load_default()
-
-    def wrapped(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, width: int) -> List[str]:
-        words = str(text or "").split()
-        if not words:
-            return [""]
-        lines: List[str] = []
-        current = words[0]
-        for word in words[1:]:
-            trial = f"{current} {word}"
-            if draw.textlength(trial, font=font) <= width:
-                current = trial
-            else:
-                lines.append(current)
-                current = word
-        lines.append(current)
-        return lines
-
-    def fit_image(path: str, width: int, height: int) -> Image.Image:
-        canvas = Image.new("RGB", (width, height), "#f4f7fb")
-        if path and Path(path).exists():
-            preview = Image.open(path).convert("RGB")
-            preview.thumbnail((width, height))
-            canvas.paste(preview, ((width - preview.width) // 2, (height - preview.height) // 2))
-        return canvas
-
-    page_width = 1700
-    page_height = 2520
-    margin = 56
-    title_font = load_font(42, bold=True)
-    subtitle_font = load_font(20, bold=False)
-    h2_font = load_font(24, bold=True)
-    h3_font = load_font(20, bold=True)
-    body_font = load_font(16)
-    small_font = load_font(13)
-    small_bold = load_font(13, bold=True)
-    metric_font = load_font(24, bold=True)
-    logo_image = None
-    if LOGO_PATH.exists():
-        try:
-            logo_image = Image.open(LOGO_PATH).convert("RGBA")
-            logo_image.thumbnail((170, 80))
-        except OSError:
-            logo_image = None
-
-    def draw_header(page: Image.Image, *, first_page: bool, page_label: str) -> int:
-        draw = ImageDraw.Draw(page)
-        header_x = margin
-        if first_page and logo_image is not None:
-            page.paste(logo_image, (margin, margin), logo_image)
-            header_x += logo_image.width + 18
-        draw.text((header_x, margin), title, fill="#0f172a", font=title_font)
-        draw.text((header_x, margin + 48), page_label, fill="#475569", font=subtitle_font)
-        if timestamp_label:
-            draw.text((page_width - margin - 300, margin + 6), timestamp_label, fill="#64748b", font=small_font)
-        draw.line((margin, margin + 104, page_width - margin, margin + 104), fill="#0f172a", width=3)
-        return margin + 116
-
-    def draw_meta_line(draw: ImageDraw.ImageDraw, y: int, items: List[str]) -> int:
-        x = margin
-        line_y = y
-        for item in items:
-            text = str(item)
-            width = int(draw.textlength(text, font=small_font))
-            if x + width > page_width - margin:
-                x = margin
-                line_y += 22
-            draw.text((x, line_y), text, fill="#475569", font=small_font)
-            x += width + 20
-        return line_y + 20
-
-    def draw_chart(draw: ImageDraw.ImageDraw, rect: Tuple[int, int, int, int], labels: List[str], values: List[float], *, stroke: str) -> None:
-        x0, y0, x1, y1 = rect
-        draw.rectangle(rect, outline="#d7dee8", width=1)
-        chart_left = x0 + 48
-        chart_right = x1 - 14
-        chart_top = y0 + 18
-        chart_bottom = y1 - 26
-        y_min, y_max = _contact_sheet_metric_range(values, fallback_span=0.5)
-        if not values:
-            return
-        draw.line((chart_left, chart_bottom, chart_right, chart_bottom), fill="#94a3b8", width=1)
-        draw.line((chart_left, chart_top, chart_left, chart_bottom), fill="#94a3b8", width=1)
-        ticks = [y_min, (y_min + y_max) / 2.0, y_max]
-        for tick in ticks:
-            y = chart_bottom if math.isclose(y_min, y_max, abs_tol=1e-9) else chart_top + (1.0 - ((tick - y_min) / (y_max - y_min))) * (chart_bottom - chart_top)
-            draw.line((chart_left, int(y), chart_right, int(y)), fill="#e7edf4", width=1)
-            draw.text((x0 + 4, int(y) - 7), f"{tick:.2f}", fill="#64748b", font=small_font)
-        points = []
-        for index, value in enumerate(values):
-            x = chart_left + ((chart_right - chart_left) / max(len(values) - 1, 1)) * index if len(values) > 1 else (chart_left + chart_right) / 2
-            y = chart_bottom if math.isclose(y_min, y_max, abs_tol=1e-9) else chart_top + (1.0 - ((value - y_min) / (y_max - y_min))) * (chart_bottom - chart_top)
-            points.append((int(x), int(y)))
-            draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=stroke)
-            draw.text((x - 18, chart_bottom + 6), labels[index], fill="#64748b", font=small_font)
-        if len(points) > 1:
-            draw.line(points, fill=stroke, width=3)
-
-    def draw_color_chart(draw: ImageDraw.ImageDraw, rect: Tuple[int, int, int, int], labels: List[str], kelvin_values: List[float], tint_values: List[float]) -> None:
-        x0, y0, x1, y1 = rect
-        draw.rectangle(rect, outline="#d7dee8", width=1)
-        mid = y0 + (y1 - y0) // 2
-        draw.text((x0 + 12, y0 + 8), "Kelvin", fill="#475569", font=small_bold)
-        draw_chart(draw, (x0, y0 + 18, x1, mid - 4), labels, kelvin_values, stroke="#0f766e")
-        draw.text((x0 + 12, mid + 8), "Tint", fill="#475569", font=small_bold)
-        draw_chart(draw, (x0, mid + 18, x1, y1), labels, tint_values, stroke="#7c3aed")
-
-    def draw_contact_cell(page: Image.Image, draw: ImageDraw.ImageDraw, entry: Dict[str, object], *, x: int, y: int, width: int, adjusted: bool, image_height: int) -> None:
-        image_path = str(entry["corrected_image"] if adjusted else entry["original_image"])
-        preview = fit_image(image_path, width, image_height)
-        page.paste(preview, (x, y))
-        line_y = y + image_height + 8
-        draw.text((x, line_y), f"{entry['camera_label']} / {entry['clip_id']}", fill="#0f172a", font=small_bold)
-        line_y += 20
-        meta_line = str(entry["adjusted_metadata_line"] if adjusted else entry["original_metadata_line"])
-        if meta_line:
-            draw.text((x, line_y), meta_line, fill="#475569", font=small_font)
-            line_y += 18
-        if not adjusted:
-            draw.text((x, line_y), "Gray Sphere Totals", fill="#64748b", font=small_bold)
-            line_y += 16
-            totals_line = (
-                f"S1 {float(entry['sample_1_ire']):.1f}   "
-                f"S2 {float(entry['sample_2_ire']):.1f}   "
-                f"S3 {float(entry['sample_3_ire']):.1f}   "
-                f"Scalar {float(entry['display_scalar_ire']):.1f}"
-            )
-            draw.text((x, line_y), totals_line, fill="#0f172a", font=small_font)
-
-    pages: List[Image.Image] = []
-    snapshot_items = [
-        f"Batch {view_model['batch_label']}",
-        f"Cameras {int(view_model['camera_count'])}",
-        f"Strategy {view_model['strategy_label']}",
-        f"Domain {view_model['domain_label']}",
-        f"Exposure Anchor {view_model['anchor_summary']}",
-        f"Hero clip {payload.get('hero_clip_id') or 'None selected'}",
-        f"PASS / REVIEW / FAIL {view_model['status_counts']['PASS']} / {view_model['status_counts']['REVIEW']} / {view_model['status_counts']['FAIL']}",
-        f"Spread {float(view_model['before_spread_stops']):.2f} → {float(view_model['after_spread_stops']):.2f} stops",
-        f"Residual median {float(view_model['median_residual']):.3f} | worst {float(view_model['worst_residual']):.3f}",
-        f"±0.02 goal {'met' if view_model['goal_achieved'] else 'open'}",
-    ]
-
-    contact_pages = list(view_model.get("contact_pages") or [])
-    for contact_page in contact_pages:
-        raise_if_cancelled("Run cancelled during contact sheet PDF rendering.")
-        page = Image.new("RGB", (page_width, page_height), "white")
-        draw = ImageDraw.Draw(page)
-        page_index = int(contact_page.get("page_index", 1) or 1)
-        y = draw_header(page, first_page=page_index == 1, page_label=f"Calibration Contact Sheet · Page {page_index}")
-        y = draw_meta_line(draw, y, snapshot_items)
-        y += 10
-        entries = list(contact_page.get("entries") or [])
-        draw.text((margin, y), "Original Camera Grid", fill="#0f172a", font=h2_font)
-        y += 26
-        gutter = 16
-        cell_width = int((page_width - (2 * margin) - (2 * gutter)) / 3)
-        rows = max(1, math.ceil(len(entries) / 3))
-        original_image_height = 138 if rows >= 4 else 156
-        original_cell_height = original_image_height + 78
-        for index, entry in enumerate(entries):
-            row = index // 3
-            col = index % 3
-            x = margin + col * (cell_width + gutter)
-            cell_y = y + row * original_cell_height
-            draw_contact_cell(page, draw, entry, x=x, y=cell_y, width=cell_width, adjusted=False, image_height=original_image_height)
-        y += rows * original_cell_height + 18
-        draw.line((margin, y, page_width - margin, y), fill="#d7dee8", width=1)
-        y += 10
-        draw.text((margin, y), "Original Array Synopsis", fill="#0f172a", font=h2_font)
-        y += 28
-        chart_height = 208
-        chart_width = int((page_width - (2 * margin) - gutter) / 2)
-        labels = [str(item.get("camera_label") or item.get("clip_id") or "") for item in entries]
-        draw_chart(draw, (margin, y, margin + chart_width, y + chart_height), labels, [float(item.get("display_scalar_ire", 0.0) or 0.0) for item in entries], stroke="#0f172a")
-        draw_color_chart(draw, (margin + chart_width + gutter, y, page_width - margin, y + chart_height), labels, [float(item.get("original_kelvin", 0.0) or 0.0) for item in entries], [float(item.get("original_tint", 0.0) or 0.0) for item in entries])
-        y += chart_height + 18
-        draw.text((margin, y), "Adjusted Camera Grid", fill="#0f172a", font=h2_font)
-        y += 26
-        adjusted_image_height = 138 if rows >= 4 else 156
-        adjusted_cell_height = adjusted_image_height + 52
-        for index, entry in enumerate(entries):
-            row = index // 3
-            col = index % 3
-            x = margin + col * (cell_width + gutter)
-            cell_y = y + row * adjusted_cell_height
-            draw_contact_cell(page, draw, entry, x=x, y=cell_y, width=cell_width, adjusted=True, image_height=adjusted_image_height)
-        y += rows * adjusted_cell_height + 18
-        draw.line((margin, y, page_width - margin, y), fill="#d7dee8", width=1)
-        y += 10
-        draw.text((margin, y), "Adjusted Array Synopsis", fill="#0f172a", font=h2_font)
-        y += 28
-        draw_chart(draw, (margin, y, margin + chart_width, y + chart_height), labels, [float(item.get("adjusted_display_scalar_ire", item.get("display_scalar_ire", 0.0)) or 0.0) for item in entries], stroke="#15803d")
-        draw_color_chart(draw, (margin + chart_width + gutter, y, page_width - margin, y + chart_height), labels, [float(item.get("kelvin", 0.0) or 0.0) for item in entries], [float(item.get("tint", 0.0) or 0.0) for item in entries])
-        pages.append(page)
-
-    for entry in view_model["entries"]:
-        raise_if_cancelled("Run cancelled during contact sheet PDF rendering.")
-        page = Image.new("RGB", (page_width, page_height), "white")
-        draw = ImageDraw.Draw(page)
-        y = draw_header(page, first_page=False, page_label=f"{entry['camera_label']} · {entry['clip_id']}")
-        tone = str(entry["tone"])
-        status_color = {"good": "#166534", "warning": "#92400e", "danger": "#991b1b"}[tone]
-        draw.text((page_width - margin - 170, margin + 8), str(entry["result_label"]), fill=status_color, font=h2_font)
-        draw.text((margin, y), "Recommended Action", fill="#64748b", font=small_bold)
-        draw.text((margin, y + 18), str(entry["recommended_action"]), fill="#0f172a", font=h2_font)
-        y += 64
-        draw.line((margin, y, page_width - margin, y), fill="#d7dee8", width=1)
-        y += 14
-        gutter = 16
-        comparison_width = 420
-        overlay_width = page_width - (2 * margin) - (2 * comparison_width) - (2 * gutter)
-        image_height = 300
-        original = fit_image(str(entry["original_image"]), comparison_width, image_height)
-        corrected = fit_image(str(entry["corrected_image"]), comparison_width, image_height)
-        overlay = fit_image(str(entry["overlay_image"]), overlay_width, image_height)
-        page.paste(original, (margin, y))
-        page.paste(corrected, (margin + comparison_width + gutter, y))
-        page.paste(overlay, (margin + (2 * (comparison_width + gutter)), y))
-        draw.text((margin, y - 20), "Original", fill="#64748b", font=small_bold)
-        draw.text((margin + comparison_width + gutter, y - 20), "Corrected", fill="#64748b", font=small_bold)
-        draw.text((margin + (2 * (comparison_width + gutter)), y - 20), "Solve Overlay", fill="#64748b", font=small_bold)
-        y += image_height + 18
-        sample_lines = [
-            f"Sample 1 {float(entry['sample_1_ire']):.1f} IRE",
-            f"Sample 2 {float(entry['sample_2_ire']):.1f} IRE",
-            f"Sample 3 {float(entry['sample_3_ire']):.1f} IRE",
-        ]
-        for index, line in enumerate(sample_lines):
-            draw.text((margin + (2 * (comparison_width + gutter)), y + (index * 18)), line, fill="#0f172a", font=body_font)
-        metric_y = y + 70
-        draw.line((margin, metric_y - 10, page_width - margin, metric_y - 10), fill="#d7dee8", width=1)
-        metrics = [
-            ("Samples", f"S1 {float(entry['sample_1_ire']):.1f} | S2 {float(entry['sample_2_ire']):.1f} | S3 {float(entry['sample_3_ire']):.1f}"),
-            ("Scalar", f"{float(entry['display_scalar_ire']):.1f} IRE"),
-            ("Correction", f"{float(entry['exposure_adjust_stops']):+.2f} exp | {int(round(float(entry['kelvin']) or 0.0))}K | {float(entry['tint']):+.1f} tint"),
-            ("Residual", f"{float(entry['residual_abs_stops']):.3f} stops"),
-        ]
-        col_width = int((page_width - (2 * margin) - (3 * gutter)) / 4)
-        metric_block_height = 0
-        for index, (label, value) in enumerate(metrics):
-            x = margin + index * (col_width + gutter)
-            draw.text((x, metric_y), label, fill="#64748b", font=small_bold)
-            wrapped_lines = wrapped(draw, value, body_font, col_width)
-            for line_index, line in enumerate(wrapped_lines):
-                draw.text((x, metric_y + 18 + (line_index * 18)), line, fill="#0f172a", font=body_font)
-            metric_block_height = max(metric_block_height, 18 + (len(wrapped_lines) * 18))
-        flags_y = metric_y + metric_block_height + 24
-        draw.line((margin, flags_y - 12, page_width - margin, flags_y - 12), fill="#d7dee8", width=1)
-        flag_texts = [
-            f"Reference use: {entry['reference_use']}",
-            str(entry["sphere_detection_note"]),
-            str(entry["profile_note"]),
-            f"Offset to anchor {float(entry['offset_to_anchor']):+.3f} stops",
-        ]
-        for index, text in enumerate(flag_texts):
-            draw.text((margin, flags_y + (index * 20)), text, fill="#334155", font=body_font)
-        pages.append(page)
-
     output = Path(output_path).expanduser().resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    raise_if_cancelled("Run cancelled before final PDF write.")
-    pages[0].save(output, format="PDF", save_all=True, append_images=pages[1:])
-    return str(output)
+    html_path = output.with_suffix(".html")
+    html_markup = render_contact_sheet_html(
+        payload,
+        html_path=str(html_path),
+        title_override=title,
+        timestamp_label=timestamp_label,
+    )
+    html_path.parent.mkdir(parents=True, exist_ok=True)
+    html_path.write_text(html_markup, encoding="utf-8")
+    return render_contact_sheet_pdf_from_html(str(html_path), output_path=str(output))
 
 
 def build_ui_calibration_table(input_path: str, *, out_dir: str) -> Dict[str, object]:
@@ -8773,265 +8848,262 @@ def _ipp2_validation_presentation(validation: Dict[str, object]) -> Dict[str, st
     }
 
 
-def render_contact_sheet_html(payload: Dict[str, object]) -> str:
+def render_contact_sheet_html(
+    payload: Dict[str, object],
+    *,
+    html_path: Optional[str] = None,
+    title_override: Optional[str] = None,
+    timestamp_label: Optional[str] = None,
+) -> str:
     view_model = _contact_sheet_view_model(payload)
+    final_title = str(title_override or view_model.get("title") or "R3DMatch Calibration Assessment")
+    html_file = Path(html_path).expanduser().resolve() if html_path else None
+    report_dir = html_file.parent if html_file else None
+    images_dir = report_dir / "images" if report_dir else None
     logo_markup = (
         f"<img class='brand-logo' src='{LOGO_PATH.as_posix()}' alt='R3DMatch logo' />"
         if LOGO_PATH.exists()
         else "<div class='brand-logo-text'>R3DMatch</div>"
     )
-    reference_candidate = dict(view_model.get("reference_candidate") or {})
-    snapshot_bits = [
-        f"Batch {html.escape(str(view_model['batch_label']))}",
-        f"Cameras {int(view_model['camera_count'])}",
-        f"Strategy {html.escape(str(view_model['strategy_label']))}",
-        f"Domain {html.escape(str(view_model['domain_label']))}",
-        f"Color preview: {html.escape(str(payload.get('color_preview_status') or 'unknown'))}",
-        f"Exposure Anchor {html.escape(str(view_model['anchor_summary']))}",
-        f"Hero clip: {html.escape(str(payload.get('hero_clip_id') or 'None selected'))}",
-        f"PASS / REVIEW / FAIL {view_model['status_counts']['PASS']} / {view_model['status_counts']['REVIEW']} / {view_model['status_counts']['FAIL']}",
-        f"Spread {float(view_model['before_spread_stops']):.2f} → {float(view_model['after_spread_stops']):.2f} stops",
-        f"Residual median {float(view_model['median_residual']):.3f} | worst {float(view_model['worst_residual']):.3f}",
-        f"Reference {html.escape(str(reference_candidate.get('camera_label') or 'n/a'))}",
-        f"±0.02 goal {'met' if view_model['goal_achieved'] else 'open'}",
+    chart_entries = [
+        entry for entry in list(view_model.get("entries") or [])
+        if entry.get("original_kelvin") not in (None, 0.0) or entry.get("original_tint") not in (None, 0.0)
     ]
-
-    def render_grid_cell(entry: Dict[str, object], *, adjusted: bool) -> str:
-        image_path = _contact_sheet_image_src(entry.get("corrected_image" if adjusted else "original_image"))
-        meta_line = str(entry.get("adjusted_metadata_line" if adjusted else "original_metadata_line") or "")
-        header_line = f"{html.escape(str(entry.get('camera_label') or ''))} / {html.escape(str(entry.get('clip_id') or ''))}"
-        totals_line = (
-            f"S1 {float(entry.get('sample_1_ire', 0.0) or 0.0):.1f}   "
-            f"S2 {float(entry.get('sample_2_ire', 0.0) or 0.0):.1f}   "
-            f"S3 {float(entry.get('sample_3_ire', 0.0) or 0.0):.1f}   "
-            f"Scalar {float(entry.get('display_scalar_ire', 0.0) or 0.0):.1f}"
+    chart_svg = ""
+    if chart_entries:
+        chart_svg = _contact_sheet_svg_color_deviation_chart(
+            "White-balance deviation (ΔK / ΔTint from 5600K / Tint 0)",
+            [str(item.get("camera_label") or item.get("clip_id") or "") for item in chart_entries],
+            [float(item.get("original_kelvin", 0.0) or 0.0) for item in chart_entries],
+            [float(item.get("original_tint", 0.0) or 0.0) for item in chart_entries],
+            stroke="#0f766e",
         )
-        footer = (
-            f"<div class='cell-totals-label'>Gray Sphere Totals</div><div class='cell-totals'>{html.escape(totals_line)}</div>"
-            if not adjusted
-            else ""
-        )
-        return (
-            "<article class='camera-cell'>"
-            + (f"<img class='cell-image' src='{image_path}' alt='{html.escape(str(entry.get('clip_id') or ''))} {'adjusted' if adjusted else 'original'}' />" if image_path else "<div class='cell-image missing-image'>Image unavailable</div>")
-            + f"<div class='cell-line cell-clip'>{header_line}</div>"
-            + (f"<div class='cell-line cell-meta'>{html.escape(meta_line)}</div>" if meta_line else "")
-            + footer
-            + "</article>"
-        )
-
-    contact_pages_markup = []
-    for page in list(view_model.get("contact_pages") or []):
-        page_entries = list(page.get("entries") or [])
-        first_page = int(page.get("page_index", 1) or 1) == 1
-        contact_pages_markup.append(
-            "<section class='contact-page'>"
-            "<header class='sheet-header'>"
-            + (f"<div class='sheet-brand'>{logo_markup}</div>" if first_page else "<div class='sheet-brand sheet-brand-placeholder'></div>")
-            + "<div class='sheet-head-block'>"
-            + (f"<div class='sheet-kicker'>Calibration Contact Sheet</div><h1>{html.escape(str(view_model.get('title') or 'R3DMatch Calibration Assessment'))}</h1>" if first_page else f"<div class='sheet-kicker'>Contact Sheet Page {int(page.get('page_index', 1) or 1)}</div><h1>{html.escape(str(view_model.get('batch_label') or 'Calibration run'))}</h1>")
-            + f"<div class='sheet-meta'>{''.join(f'<span>{item}</span>' for item in snapshot_bits)}</div>"
-            + (
-                "<div class='sheet-guide'>What To Look For: Original / Corrected / Solve Overlay / Sample 1 / Sample 2 / Sample 3 / Validation Residual</div>"
-                "<div class='sheet-guide'>Exposure Summary: original grid, adjusted grid, exposure trace, white-balance trace.</div>"
-                if first_page
-                else ""
-            )
-            + "</div>"
-            "</header>"
-            "<section class='grid-section'>"
-            "<div class='section-strip'><h2>Original Camera Grid</h2><div class='section-note'>Stored measurement stills</div></div>"
-            f"<div class='camera-grid'>{''.join(render_grid_cell(entry, adjusted=False) for entry in page_entries)}</div>"
-            "</section>"
-            "<section class='synopsis-section'>"
-            "<div class='section-strip'><h2>Original Array Synopsis</h2><div class='section-note'>Camera order left to right</div></div>"
-            "<div class='synopsis-grid'>"
-            + (
-                f"<article class='chart-panel'><div class='chart-frame'>{page.get('original_exposure_chart_svg') or ''}</div></article>"
-                if str(page.get("original_exposure_chart_svg") or "").strip() else ""
-            )
-            + (
-                f"<article class='chart-panel'><div class='chart-frame'>{page.get('original_color_chart_svg') or ''}</div></article>"
-                if str(page.get("original_color_chart_svg") or "").strip() else ""
-            )
-            + "</div>"
-            "</section>"
-            "<section class='grid-section'>"
-            "<div class='section-strip'><h2>Adjusted Camera Grid</h2><div class='section-note'>Stored corrected stills</div></div>"
-            f"<div class='camera-grid'>{''.join(render_grid_cell(entry, adjusted=True) for entry in page_entries)}</div>"
-            "</section>"
-            "<section class='synopsis-section'>"
-            "<div class='section-strip'><h2>Adjusted Array Synopsis</h2><div class='section-note'>Convergence check</div></div>"
-            "<div class='synopsis-grid'>"
-            + (
-                f"<article class='chart-panel'><div class='chart-frame'>{page.get('adjusted_exposure_chart_svg') or ''}</div></article>"
-                if str(page.get("adjusted_exposure_chart_svg") or "").strip() else ""
-            )
-            + (
-                f"<article class='chart-panel'><div class='chart-frame'>{page.get('adjusted_color_chart_svg') or ''}</div></article>"
-                if str(page.get("adjusted_color_chart_svg") or "").strip() else ""
-            )
-            + "</div>"
-            "</section>"
-            "</section>"
-        )
-
-    camera_sections = []
-    for entry in list(view_model.get("entries") or []):
-        original_image = _contact_sheet_image_src(entry.get("original_image"))
-        corrected_image = _contact_sheet_image_src(entry.get("corrected_image"))
-        overlay_image = _contact_sheet_image_src(entry.get("overlay_image"))
-        corrected_overlay_image = _contact_sheet_image_src(entry.get("corrected_overlay_image"))
-        flags = []
-        if str(entry.get("reference_use") or "Included") != "Included":
-            flags.append(str(entry.get("reference_use")))
-        if "fallback" in str(entry.get("sphere_detection_note") or "").lower():
+    page_markup: List[str] = []
+    debug_rows: List[Dict[str, object]] = []
+    for index, entry in enumerate(list(view_model.get("entries") or []), start=1):
+        clip_id = str(entry.get("clip_id") or "")
+        camera_label = str(entry.get("camera_label") or clip_id or f"Camera {index}")
+        original_source = _contact_sheet_required_asset(entry.get("original_image"), label="original frame", clip_id=clip_id)
+        corrected_source = _contact_sheet_required_asset(entry.get("corrected_image"), label="corrected frame", clip_id=clip_id)
+        overlay_source = _contact_sheet_required_asset(entry.get("overlay_image"), label="sphere mask overlay", clip_id=clip_id)
+        original_src = _contact_sheet_image_src(original_source, html_path=html_path)
+        corrected_src = _contact_sheet_image_src(corrected_source, html_path=html_path)
+        overlay_src = _contact_sheet_image_src(overlay_source, html_path=html_path)
+        if images_dir is not None:
+            asset_stem = _contact_sheet_sanitized_stem(camera_label or clip_id or f"camera_{index}")
+            original_info = _contact_sheet_write_report_image(original_source, output_path=images_dir / f"{asset_stem}_original.jpg")
+            corrected_info = _contact_sheet_write_report_image(corrected_source, output_path=images_dir / f"{asset_stem}_corrected.jpg")
+            overlay_info = _contact_sheet_write_report_image(overlay_source, output_path=images_dir / f"{asset_stem}_mask.jpg")
+            original_src = _contact_sheet_image_src(original_info["output_path"], html_path=str(html_file))
+            corrected_src = _contact_sheet_image_src(corrected_info["output_path"], html_path=str(html_file))
+            overlay_src = _contact_sheet_image_src(overlay_info["output_path"], html_path=str(html_file))
+        else:
+            original_info = {"source_path": original_source, "output_path": original_source}
+            corrected_info = {"source_path": corrected_source, "output_path": corrected_source}
+            overlay_info = {"source_path": overlay_source, "output_path": overlay_source}
+        sample_1_ire = float(entry.get("sample_1_ire", 0.0) or 0.0)
+        sample_2_ire = float(entry.get("sample_2_ire", 0.0) or 0.0)
+        sample_3_ire = float(entry.get("sample_3_ire", 0.0) or 0.0)
+        scalar_log2 = float(entry.get("display_scalar_log2", 0.0) or 0.0)
+        if not math.isclose(sample_1_ire, float(entry.get("sample_1_ire", 0.0) or 0.0), abs_tol=1e-6):
+            raise RuntimeError(f"Contact-sheet displayed S1 IRE diverged from stored payload for {clip_id}.")
+        if not math.isclose(sample_2_ire, float(entry.get("sample_2_ire", 0.0) or 0.0), abs_tol=1e-6):
+            raise RuntimeError(f"Contact-sheet displayed S2 IRE diverged from stored payload for {clip_id}.")
+        if not math.isclose(sample_3_ire, float(entry.get("sample_3_ire", 0.0) or 0.0), abs_tol=1e-6):
+            raise RuntimeError(f"Contact-sheet displayed S3 IRE diverged from stored payload for {clip_id}.")
+        flags: List[str] = []
+        if bool(entry.get("fallback_used")):
             flags.append("Fallback used")
+        if str(entry.get("reference_use") or "Included") != "Included":
+            flags.append(str(entry.get("reference_use") or "Excluded"))
         if float(entry.get("residual_abs_stops", 0.0) or 0.0) > 0.02:
-            flags.append("Residual > ±0.02 goal")
-        if str(entry.get("status") or "PASS") != "PASS":
-            flags.append(str(entry.get("operator_result_label") or entry.get("status") or "Review"))
-        sample_range = max(
-            float(entry.get("sample_1_ire", 0.0) or 0.0),
-            float(entry.get("sample_2_ire", 0.0) or 0.0),
-            float(entry.get("sample_3_ire", 0.0) or 0.0),
-        ) - min(
-            float(entry.get("sample_1_ire", 0.0) or 0.0),
-            float(entry.get("sample_2_ire", 0.0) or 0.0),
-            float(entry.get("sample_3_ire", 0.0) or 0.0),
-        )
+            flags.append("Residual > ±0.02")
+        sample_range = max(sample_1_ire, sample_2_ire, sample_3_ire) - min(sample_1_ire, sample_2_ire, sample_3_ire)
         if sample_range > 3.0:
             flags.append("Uneven sample profile")
         if not flags:
             flags.append("No anomaly flags")
-        hero_badge_html = "<div class='hero-badge hero-tag'>Hero Camera</div>" if entry.get("is_hero_camera") else ""
-        comparison_figures = []
-        for label, src in [
-            ("Original", original_image),
-            ("Corrected", corrected_image),
-        ]:
-            comparison_figures.append(
-                "<figure class='comparison-figure'>"
-                f"<div class='figure-label'>{html.escape(label)}</div>"
-                + (f"<img src='{src}' alt='{html.escape(str(entry.get('clip_id') or 'camera'))} {html.escape(label)}' />" if src else "<div class='missing-image'>Image unavailable</div>")
-                + 
-                "</figure>"
+        header_right = _contact_sheet_join_bits(
+            [
+                str(entry.get("status") or "REVIEW"),
+                str(entry.get("operator_result_label") or ""),
+                f"Residual {float(entry.get('residual_abs_stops', 0.0) or 0.0):.3f} stops",
+            ]
+        )
+        footer_markup = ""
+        if index == 1:
+            footer_markup = (
+                "<div class='footer'>"
+                "<div class='footer-title'>Original Array Synopsis</div>"
+                "<div class='footer-line'><strong>What To Look For:</strong> Original / Corrected / Sphere Mask Overlay / Samples / Residual</div>"
             )
-        overlay_markup = (
-            "<figure class='overlay-figure'>"
-            "<div class='figure-label'>Solve Overlay</div>"
-            + (f"<img src='{overlay_image}' alt='{html.escape(str(entry.get('clip_id') or 'camera'))} Solve Overlay' />" if overlay_image else "<div class='missing-image'>Image unavailable</div>")
-            + "</figure>"
+            if chart_svg:
+                footer_markup += (
+                    "<div class='footer-title'>White-balance deviation</div>"
+                    "<div class='footer-chart'>"
+                    f"{chart_svg}"
+                    "</div>"
+                )
+            else:
+                footer_markup += "<div class='footer-line'>White-balance deviation unavailable from stored payload.</div>"
+            footer_markup += "</div>"
+        else:
+            footer_markup = (
+                "<div class='footer'>"
+                f"<div class='footer-line'>Measurement domain: {html.escape(str(entry.get('measurement_domain') or REVIEW_PREVIEW_TRANSFORM))}</div>"
+                f"<div class='footer-line'>Sphere detection: {html.escape(str(entry.get('sphere_detection_note') or 'Sphere detection: verified'))}</div>"
+                "</div>"
+            )
+        page_markup.append(
+            "<div class='page'>"
+            "<div class='header'>"
+            "<div class='header-left'>"
+            f"{logo_markup if index == 1 else ''}"
+            f"<div class='title-block'><div class='report-title'>{html.escape(final_title)}</div><div class='report-subtitle'>{html.escape(str(view_model.get('batch_label') or 'Calibration run'))}</div><div class='report-subtitle'>Exposure Anchor: {html.escape(str(view_model.get('anchor_summary') or 'Derived from retained cluster'))}</div><div class='report-subtitle'>Color preview: {html.escape(str(payload.get('color_preview_status') or 'unknown'))}</div>"
+            + (
+                f"<div class='report-subtitle'>Hero clip: {html.escape(str(payload.get('hero_clip_id') or 'None selected'))}</div>"
+                if index == 1 and str(payload.get("hero_clip_id") or "").strip()
+                else ""
+            )
+            + "</div>"
+            "</div>"
+            "<div class='header-right'>"
+            f"<div class='camera-id'>{html.escape(camera_label)}</div>"
+            f"<div class='camera-clip'>{html.escape(clip_id)}</div>"
+            + ("<div class='camera-clip hero-badge'>Hero Camera</div>" if bool(entry.get("is_hero_camera")) else "")
+            + f"<div class='camera-status'>{html.escape(header_right)}</div>"
+            + f"<div class='camera-action'>Recommended Action: {html.escape(str(entry.get('recommended_action') or 'Review'))}</div>"
+            + (f"<div class='camera-stamp'>{html.escape(str(timestamp_label))}</div>" if timestamp_label and index == 1 else "")
+            + "</div>"
+            "</div>"
+            "<div class='image-row'>"
+            f"<div class='image-panel'><div class='image-label'>Original Frame</div><img src='{html.escape(original_src)}' alt='{html.escape(clip_id)} original'></div>"
+            f"<div class='image-panel'><div class='image-label'>Corrected Frame</div><img src='{html.escape(corrected_src)}' alt='{html.escape(clip_id)} corrected'></div>"
+            f"<div class='image-panel'><div class='image-label'>Sphere Mask Overlay</div><img src='{html.escape(overlay_src)}' alt='{html.escape(clip_id)} sphere mask overlay'></div>"
+            "</div>"
+            "<div class='metrics'>"
+            "<div class='metric-column'>"
+            "<div class='metric-title'>Gray Exposure</div>"
+            f"<div class='metric-line'><span>S1:</span> <strong>{sample_1_ire:.1f} IRE</strong></div>"
+            f"<div class='metric-line'><span>S2:</span> <strong>{sample_2_ire:.1f} IRE</strong></div>"
+            f"<div class='metric-line'><span>S3:</span> <strong>{sample_3_ire:.1f} IRE</strong></div>"
+            f"<div class='metric-line'><span>Target Sample:</span> <strong>{html.escape(str(entry.get('target_sample_label') or CONTACT_SHEET_TARGET_SAMPLE_LABEL))}</strong></div>"
+            f"<div class='metric-line'><span>Scalar:</span> <strong>{scalar_log2:+.3f} log2</strong></div>"
+            "</div>"
+            "<div class='metric-column'>"
+            "<div class='metric-title'>Correction</div>"
+            f"<div class='metric-line'><span>Digital correction applied:</span> <strong>{float(entry.get('exposure_adjust_stops', 0.0) or 0.0):+.2f} stops</strong></div>"
+            f"<div class='metric-line'><span>Kelvin:</span> <strong>{int(round(float(entry.get('kelvin', 0.0) or 0.0)))}K</strong></div>"
+            f"<div class='metric-line'><span>Tint:</span> <strong>{float(entry.get('tint', 0.0) or 0.0):+.1f}</strong></div>"
+            f"<div class='metric-line'><span>Validation Residual:</span> <strong>{float(entry.get('residual_abs_stops', 0.0) or 0.0):.3f} stops</strong></div>"
+            f"<div class='metric-line'><span>Reference Use:</span> <strong>{html.escape(str(entry.get('reference_use') or 'Included'))}</strong></div>"
+            "</div>"
+            "<div class='metric-column'>"
+            "<div class='metric-title'>Verification</div>"
+            f"<div class='metric-line'><span>Profile:</span> <strong>{html.escape(str(entry.get('profile_note') or 'Profile consistent with stored solve.'))}</strong></div>"
+            f"<div class='metric-line'><span>Flags:</span> <strong>{html.escape(' | '.join(flags))}</strong></div>"
+            f"<div class='metric-line'><span>Scalar Source:</span> <strong>{html.escape(str(entry.get('display_scalar_source') or 'stored measurement payload'))}</strong></div>"
+            f"<div class='metric-line'><span>Measurement Domain:</span> <strong>{html.escape(str(entry.get('measurement_domain') or REVIEW_PREVIEW_TRANSFORM))}</strong></div>"
+            "</div>"
+            "</div>"
+            f"{footer_markup}"
+            "</div>"
         )
-        camera_sections.append(
-            f"<section class='camera-page' data-corrected-overlay='{html.escape(corrected_overlay_image)}'>"
-            "<div class='camera-topline'>"
-            f"<div class='camera-title'><div class='camera-kicker'>{html.escape(str(entry.get('clip_id') or ''))}</div><h2>{html.escape(str(entry.get('camera_label') or 'Camera'))}</h2>{hero_badge_html}</div>"
-            f"<div class='camera-status-line'><span class='status-inline {html.escape(str(entry.get('tone') or 'warning'))}'>{html.escape(str(entry.get('status') or 'REVIEW'))}</span><div class='status-text'>{html.escape(str(entry.get('operator_result_label') or entry.get('status') or 'Review'))}</div></div>"
-            f"<div class='camera-action-line'><span>Recommended Action</span><strong>{html.escape(str(entry.get('recommended_action') or 'Review'))}</strong></div>"
-            "</div>"
-            "<div class='camera-main'>"
-            f"<div class='camera-images'>{''.join(comparison_figures)}</div>"
-            "<div class='verify-column'>"
-            f"{overlay_markup}"
-            "<div class='sample-coupling'>"
-            "<div class='sample-coupling-title'>Gray Exposure Sample Map</div>"
-            f"<div class='sample-coupling-row'><span>Sample 1</span><strong>{float(entry.get('sample_1_ire', 0.0) or 0.0):.1f} IRE</strong></div>"
-            f"<div class='sample-coupling-row'><span>Sample 2</span><strong>{float(entry.get('sample_2_ire', 0.0) or 0.0):.1f} IRE</strong></div>"
-            f"<div class='sample-coupling-row'><span>Sample 3</span><strong>{float(entry.get('sample_3_ire', 0.0) or 0.0):.1f} IRE</strong></div>"
-            "</div>"
-            "</div>"
-            "</div>"
-            "<div class='metric-block'>"
-            f"<div><span>Samples</span><strong>S1 {float(entry.get('sample_1_ire', 0.0) or 0.0):.1f} | S2 {float(entry.get('sample_2_ire', 0.0) or 0.0):.1f} | S3 {float(entry.get('sample_3_ire', 0.0) or 0.0):.1f}</strong></div>"
-            f"<div><span>Scalar</span><strong>{float(entry.get('display_scalar_ire', 0.0) or 0.0):.1f} IRE</strong></div>"
-            f"<div><span>Digital correction applied</span><strong>{float(entry.get('exposure_adjust_stops', 0.0) or 0.0):+.2f} exp | {int(round(float(entry.get('kelvin', 0.0) or 0.0)))}K | {float(entry.get('tint', 0.0) or 0.0):+.1f} tint</strong></div>"
-            f"<div><span>Validation Residual</span><strong>{float(entry.get('residual_abs_stops', 0.0) or 0.0):.3f} stops</strong></div>"
-            "</div>"
-            "<div class='flag-block'>"
-            f"<div><span>Reference</span><strong>{html.escape(str(entry.get('reference_use') or 'Included'))}</strong></div>"
-            f"<div><span>Sphere Detection</span><strong>{html.escape(str(entry.get('sphere_detection_note') or 'Verified'))}</strong></div>"
-            f"<div><span>Profile</span><strong>{html.escape(str(entry.get('profile_note') or 'Profile consistent with stored solve.'))}</strong></div>"
-            f"<div><span>Flags</span><strong>{html.escape(' | '.join(flags))}</strong></div>"
-            "</div>"
-            "</section>"
+        debug_rows.append(
+            {
+                "clip_id": clip_id,
+                "camera_label": camera_label,
+                "validation_status": str(entry.get("status") or "REVIEW"),
+                "resolved_asset_paths": {
+                    "original": str(original_info.get("output_path") or original_source),
+                    "corrected": str(corrected_info.get("output_path") or corrected_source),
+                    "mask": str(overlay_info.get("output_path") or overlay_source),
+                },
+                "measurement_values": {
+                    "sample_1_ire": sample_1_ire,
+                    "sample_2_ire": sample_2_ire,
+                    "sample_3_ire": sample_3_ire,
+                    "target_sample_label": str(entry.get("target_sample_label") or CONTACT_SHEET_TARGET_SAMPLE_LABEL),
+                    "display_scalar_log2": scalar_log2,
+                    "exposure_adjust_stops": float(entry.get("exposure_adjust_stops", 0.0) or 0.0),
+                },
+                "fallback_used": bool(entry.get("fallback_used")),
+            }
         )
-
-    return f"""<!doctype html>
+    markup = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>R3DMatch Calibration Assessment</title>
+  <title>{html.escape(final_title)}</title>
   <style>
     :root {{ --ink:#0f172a; --muted:#475569; --soft:#64748b; --paper:#ffffff; --ground:#edf2f7; --line:#d7dee8; --softline:#e7edf4; --pass:#166534; --review:#92400e; --fail:#991b1b; }}
     * {{ box-sizing:border-box; }}
-    body {{ margin:0; background:var(--ground); color:var(--ink); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
-    .page {{ max-width:1660px; margin:0 auto; padding:18px; }}
-    .shell {{ display:grid; gap:16px; }}
-    .contact-page, .camera-page {{ background:var(--paper); border:1px solid var(--line); }}
-    .contact-page {{ padding:16px 18px 18px; display:grid; gap:14px; page-break-after:always; }}
-    .camera-page {{ padding:16px 18px 18px; display:grid; gap:12px; page-break-before:always; }}
-    .sheet-header {{ display:grid; grid-template-columns:auto 1fr; gap:18px; align-items:start; padding-bottom:10px; border-bottom:2px solid var(--ink); }}
-    .sheet-brand {{ min-width:120px; }}
-    .sheet-brand-placeholder {{ min-width:0; }}
-    .brand-logo {{ width:132px; height:auto; object-fit:contain; display:block; }}
-    .brand-logo-text {{ font-size:34px; font-weight:800; }}
-    .sheet-kicker, .section-note, .camera-kicker, .metric-block span, .flag-block span, .camera-action-line span, .sample-coupling-title, .figure-label {{ font-size:11px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; color:var(--soft); }}
-    h1 {{ margin:0; font-size:34px; line-height:1; letter-spacing:-.03em; }}
-    h2 {{ margin:0; font-size:22px; line-height:1.1; }}
-    .sheet-meta {{ margin-top:8px; display:flex; flex-wrap:wrap; gap:10px 14px; font-size:14px; line-height:1.45; color:var(--muted); }}
-    .sheet-meta span {{ white-space:nowrap; }}
-    .sheet-guide {{ margin-top:8px; font-size:13px; line-height:1.4; color:var(--muted); }}
-    .grid-section, .synopsis-section {{ display:grid; gap:8px; }}
-    .section-strip {{ display:flex; justify-content:space-between; align-items:flex-end; gap:16px; padding-bottom:6px; border-bottom:1px solid var(--line); }}
-    .camera-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }}
-    .camera-cell {{ display:grid; gap:5px; align-content:start; }}
-    .cell-image, .comparison-figure img, .overlay-figure img, .missing-image {{ width:100%; display:block; aspect-ratio:16/10; object-fit:cover; background:#dce3ec; border:1px solid var(--line); }}
-    .missing-image {{ display:grid; place-items:center; color:var(--soft); font-size:16px; }}
-    .cell-line {{ font-size:13px; line-height:1.35; }}
-    .cell-clip {{ font-weight:700; }}
-    .cell-meta {{ color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
-    .cell-totals-label {{ font-size:11px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; color:var(--soft); }}
-    .cell-totals {{ font-size:14px; font-weight:700; letter-spacing:.01em; }}
-    .synopsis-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }}
-    .chart-panel {{ border:1px solid var(--line); padding:8px; }}
-    .chart-frame svg {{ display:block; width:100%; height:auto; }}
-    .camera-topline {{ display:grid; grid-template-columns:1.2fr auto 1fr; gap:16px; align-items:end; padding-bottom:10px; border-bottom:2px solid var(--ink); }}
-    .camera-title h2 {{ margin-top:4px; font-size:30px; }}
-    .hero-tag, .hero-badge {{ margin-top:6px; font-size:11px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; color:#991b1b; }}
-    .status-inline {{ display:inline-block; padding:6px 12px; border:1px solid currentColor; font-size:13px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; }}
-    .status-inline.good {{ color:var(--pass); }}
-    .status-inline.warning {{ color:var(--review); }}
-    .status-inline.danger {{ color:var(--fail); }}
-    .camera-status-line {{ justify-self:center; text-align:center; }}
-    .status-text {{ margin-top:6px; font-size:14px; color:var(--muted); }}
-    .camera-action-line {{ justify-self:end; text-align:right; }}
-    .camera-action-line strong {{ display:block; margin-top:4px; font-size:20px; line-height:1.2; }}
-    .camera-main {{ display:grid; grid-template-columns:1.55fr .85fr; gap:14px; align-items:start; }}
-    .camera-images {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }}
-    .comparison-figure, .overlay-figure {{ margin:0; display:grid; gap:8px; }}
-    .verify-column {{ display:grid; gap:8px; }}
-    .sample-coupling {{ border-top:1px solid var(--ink); border-bottom:1px solid var(--line); }}
-    .sample-coupling-row {{ display:flex; justify-content:space-between; gap:12px; padding:8px 0; border-top:1px solid var(--softline); font-size:15px; }}
-    .sample-coupling-row:first-of-type {{ border-top:0; }}
-    .sample-coupling-row strong {{ font-size:18px; }}
-    .metric-block, .flag-block {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:0; border-top:1px solid var(--ink); border-bottom:1px solid var(--line); }}
-    .metric-block > div, .flag-block > div {{ padding:10px 10px 10px 0; border-right:1px solid var(--softline); }}
-    .metric-block > div:last-child, .flag-block > div:last-child {{ border-right:0; padding-right:0; }}
-    .metric-block strong, .flag-block strong {{ display:block; margin-top:5px; font-size:18px; line-height:1.35; }}
-    .flag-block strong {{ font-size:15px; }}
-    @media (max-width:1280px) {{ .synopsis-grid,.camera-main,.metric-block,.flag-block {{ grid-template-columns:1fr; }} .camera-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .camera-topline {{ grid-template-columns:1fr; align-items:start; }} .camera-action-line {{ justify-self:start; text-align:left; }} }}
-    @media (max-width:860px) {{ .page {{ padding:10px; }} .camera-grid,.camera-images,.synopsis-grid,.camera-main,.metric-block,.flag-block,.sheet-header {{ grid-template-columns:1fr; }} .sheet-meta span,.cell-meta {{ white-space:normal; }} h1 {{ font-size:28px; }} .camera-title h2 {{ font-size:24px; }} }}
-    @media print {{ body {{ background:white; }} .page {{ padding:6px; }} .contact-page,.camera-page {{ break-inside:avoid; }} }}
+    body {{ margin:0; background:var(--ground); color:var(--ink); font-family:"Futura","Avenir Next","Helvetica Neue",Helvetica,Arial,"Roboto",sans-serif; }}
+    .page {{ width:100%; background:var(--paper); padding:0.26in 0.32in 0.24in; page-break-after:always; }}
+    .header {{ width:100%; border-bottom:2px solid var(--ink); padding-bottom:10px; margin-bottom:12px; }}
+    .header-left, .header-right {{ display:inline-block; vertical-align:top; }}
+    .header-left {{ width:59%; }}
+    .header-right {{ width:40%; text-align:right; }}
+    .brand-logo {{ width:122px; height:auto; display:inline-block; vertical-align:top; margin-right:12px; }}
+    .brand-logo-text {{ display:inline-block; vertical-align:top; font-size:28px; font-weight:800; }}
+    .title-block {{ display:inline-block; vertical-align:top; max-width:72%; }}
+    .report-title {{ font-size:28px; font-weight:800; line-height:1.05; }}
+    .report-subtitle {{ margin-top:5px; font-size:16px; color:var(--muted); }}
+    .camera-id {{ font-size:24px; font-weight:800; line-height:1.05; }}
+    .camera-clip {{ margin-top:4px; font-size:16px; color:var(--muted); }}
+    .camera-status {{ margin-top:8px; font-size:15px; font-weight:700; }}
+    .camera-action {{ margin-top:6px; font-size:15px; line-height:1.35; }}
+    .camera-stamp {{ margin-top:6px; font-size:13px; color:var(--soft); }}
+    .image-row {{ width:100%; margin-bottom:12px; }}
+    .image-panel {{ width:32%; display:inline-block; vertical-align:top; margin-right:1.6%; }}
+    .image-panel:last-child {{ margin-right:0; }}
+    .image-label {{ margin-bottom:6px; font-size:13px; font-weight:800; letter-spacing:.04em; text-transform:uppercase; color:var(--soft); }}
+    .image-panel img {{ width:100%; max-height:3.35in; display:block; object-fit:cover; border:1px solid var(--line); background:#dce3ec; }}
+    .metrics {{ width:100%; border-top:1px solid var(--ink); border-bottom:1px solid var(--line); padding:10px 0 8px; }}
+    .metric-column {{ width:32%; display:inline-block; vertical-align:top; margin-right:1.6%; padding-right:10px; }}
+    .metric-column:last-child {{ margin-right:0; padding-right:0; }}
+    .metric-title {{ margin-bottom:8px; font-size:13px; font-weight:800; letter-spacing:.05em; text-transform:uppercase; color:var(--soft); }}
+    .metric-line {{ margin:0 0 7px; font-size:15px; line-height:1.35; }}
+    .metric-line span {{ color:var(--muted); }}
+    .metric-line strong {{ font-weight:800; }}
+    .footer {{ width:100%; margin-top:12px; }}
+    .footer-title {{ margin-bottom:6px; font-size:13px; font-weight:800; letter-spacing:.05em; text-transform:uppercase; color:var(--soft); }}
+    .footer-line {{ margin:0 0 5px; font-size:14px; color:var(--muted); }}
+    .footer-chart {{ border:1px solid var(--line); padding:8px; }}
+    .footer-chart svg {{ width:100%; height:auto; display:block; }}
+    @page {{ size: letter portrait; margin: 0.35in; }}
+    @media print {{ body {{ background:white; print-color-adjust:exact; -webkit-print-color-adjust:exact; }} }}
   </style>
 </head>
 <body>
-  <div class="page">
-    <div class="shell">
-      {''.join(contact_pages_markup)}
-      {''.join(camera_sections)}
-    </div>
-  </div>
+  {''.join(page_markup)}
 </body>
 </html>"""
+    if html_file is not None:
+        asset_validation = _validate_contact_sheet_html_assets_markup(markup, html_path=str(html_file))
+        missing_assets = list(asset_validation.get("missing_assets") or [])
+        if missing_assets:
+            preview = "; ".join(missing_assets[:6])
+            if len(missing_assets) > 6:
+                preview += f"; ... and {len(missing_assets) - 6} more"
+            raise RuntimeError(
+                "Generated contact_sheet.html references missing image assets. "
+                f"HTML: {html_file}. Missing: {preview}"
+            )
+        debug_payload = {
+            "html_path": str(html_file),
+            "resolved_asset_paths": list(asset_validation.get("resolved_assets") or []),
+            "measurement_values_per_camera": debug_rows,
+            "validation_status": {
+                "status_counts": dict(view_model.get("status_counts") or {}),
+                "all_within_tolerance": bool(view_model.get("all_within_tolerance")),
+                "median_residual": float(view_model.get("median_residual", 0.0) or 0.0),
+                "worst_residual": float(view_model.get("worst_residual", 0.0) or 0.0),
+            },
+        }
+        debug_path = html_file.parent / "contact_sheet_debug.json"
+        debug_path.write_text(json.dumps(debug_payload, indent=2), encoding="utf-8")
+        payload["contact_sheet_debug_path"] = str(debug_path)
+        payload["html_asset_validation"] = asset_validation
+    return markup

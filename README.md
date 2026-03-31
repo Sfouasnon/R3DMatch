@@ -72,12 +72,92 @@ Not a dashboard. Not a summary.
 - Gray sphere visible to all cameras
 - Verified via IPP2 monitoring (false color / waveform)
 
-### 2. Run calibration
+### 2. Health check
+
+Recommended operator preflight:
 
 ```bash
-r3dmatch review-calibration \
-  --input path/to/r3d/files \
-  --output runs/session_name
+/bin/sh scripts/run_r3dmatch_web.sh 5000
+```
+
+This launcher:
+
+- uses the project runtime
+- sets `PYTHONPATH`
+- auto-populates `DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib` on macOS when it is unset and Homebrew libs are available there
+- preserves externally set `RED_SDK_ROOT` and `RED_SDK_REDISTRIBUTABLE_DIR`
+- runs `r3dmatch runtime-health --strict --require-red-backend` before opening the web UI
+
+Direct health check:
+
+```bash
+./.venv/bin/python -m r3dmatch.cli runtime-health --strict --require-red-backend
+```
+
+### 3. Run review
+
+Recommended web path:
+
+1. Launch the app with `/bin/sh scripts/run_r3dmatch_web.sh 5000`
+2. Open `http://127.0.0.1:5000`
+3. Scan the calibration folder
+4. Run `Full Contact Sheet`
+
+Direct CLI wrapper:
+
+```bash
+/bin/sh scripts/run_r3dmatch_review.sh /path/to/r3d/files \
+  --out /path/to/run \
+  --target-type gray_sphere \
+  --processing-mode both \
+  --backend red \
+  --review-mode full_contact_sheet \
+  --preview-mode monitoring \
+  --target-strategy median
+```
+
+Key outputs:
+
+- `report/contact_sheet.html`
+- `report/preview_contact_sheet.pdf`
+- `report/contact_sheet.json`
+- `report/review_package.json`
+- `report/ipp2_validation.json`
+
+## RED SDK Setup
+
+The RED SDK is **not** stored in this repo.
+
+For the native RED backend:
+
+1. Install the RED SDK externally.
+2. Set `RED_SDK_ROOT` to the SDK root, for example:
+
+```bash
+export RED_SDK_ROOT=/Users/sfouasnon/Desktop/R3DSplat_Dependecies/RED_SDK/R3DSDKv9_2_0
+```
+
+3. If the redistributable runtime is not under the SDK root, also set:
+
+```bash
+export RED_SDK_REDISTRIBUTABLE_DIR=/path/to/Redistributable/mac
+```
+
+4. Rebuild the native bridge:
+
+```bash
+scripts/build_red_sdk_bridge.sh
+```
+
+R3DMatch no longer uses `src/RED_SDK/...` as an operational SDK fallback.
+
+## HTML-Master Contact Sheet
+
+The contact sheet is authored once in HTML and the final PDF is exported from that HTML.
+
+- `contact_sheet.html` is the master artifact
+- `preview_contact_sheet.pdf` is generated from the HTML export path
+- no parallel custom PDF layout path is used for the contact sheet
 
 ## Supporting Docs
 

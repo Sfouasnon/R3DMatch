@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import importlib
 import math
+import os
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional, Tuple
+from typing import Any, Iterable, Iterator, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -17,6 +19,145 @@ DecodedFrame = Tuple[int, float, np.ndarray]
 # Internal frame layout contract:
 # - backends may produce HWC or CHW RGB float32 arrays
 # - the Python analysis pipeline always consumes CHW float32 arrays
+
+
+@dataclass(frozen=True)
+class RedSdkConfiguration:
+    root: Optional[Path]
+    include_dir: Optional[Path]
+    library_dir: Optional[Path]
+    redistributable_dir: Optional[Path]
+    errors: tuple[str, ...]
+
+
+def _platform_red_sdk_library_dir(root: Path) -> Path:
+    if os.name == "nt":
+        return root / "Lib" / "win64"
+    if os.uname().sysname == "Darwin":
+        return root / "Lib" / "mac64"
+    return root / "Lib" / "linux64"
+
+
+def _platform_red_sdk_redistributable_dir(root: Path) -> Path:
+    if os.name == "nt":
+        return root / "Redistributable" / "win"
+    if os.uname().sysname == "Darwin":
+        return root / "Redistributable" / "mac"
+    return root / "Redistributable" / "linux"
+
+
+def _expand_env_path(value: str | None) -> Optional[Path]:
+    if value is None:
+        return None
+    stripped = str(value).strip()
+    if not stripped:
+        return None
+    return Path(stripped).expanduser()
+
+
+def _normalize_path_for_compare(path: Optional[Path]) -> Optional[str]:
+    if path is None:
+        return None
+    try:
+        return str(path.resolve(strict=False))
+    except Exception:
+        return str(path)
+
+
+def resolve_red_sdk_configuration(environ: Optional[Mapping[str, str]] = None) -> RedSdkConfiguration:
+    env = environ or os.environ
+    root = _expand_env_path(env.get("RED_SDK_ROOT"))
+    include_override = _expand_env_path(env.get("RED_SDK_INCLUDE_DIR"))
+    library_override = _expand_env_path(env.get("RED_SDK_LIBRARY_DIR"))
+    redistributable_override = _expand_env_path(env.get("RED_SDK_REDISTRIBUTABLE_DIR"))
+    include_dir = include_override
+    library_dir = library_override
+    redistributable_dir = redistributable_override
+    errors: list[str] = []
+
+    if root is None:
+        errors.append(
+            "RED_SDK_ROOT is not set. Point it at your external RED SDK install, for example "
+            "'/Users/sfouasnon/Desktop/R3DSplat_Dependecies/RED_SDK/R3DSDKv9_2_0'."
+        )
+    elif not root.exists():
+        errors.append(f"RED_SDK_ROOT does not exist: {root}")
+    else:
+        include_dir = include_dir or (root / "Include")
+        library_dir = library_dir or _platform_red_sdk_library_dir(root)
+        redistributable_dir = redistributable_dir or _platform_red_sdk_redistributable_dir(root)
+
+    if root is not None and include_dir is not None and not include_dir.exists():
+        errors.append(f"RED SDK include directory could not be resolved: {include_dir}")
+    if root is not None and library_dir is not None and not library_dir.exists():
+        errors.append(f"RED SDK library directory could not be resolved: {library_dir}")
+    if redistributable_dir is None:
+        errors.append(
+            "RED SDK redistributable path could not be resolved. Set RED_SDK_ROOT or RED_SDK_REDISTRIBUTABLE_DIR."
+        )
+    elif not redistributable_dir.exists():
+        errors.append(f"RED SDK redistributable path does not exist: {redistributable_dir}")
+
+    return RedSdkConfiguration(
+        root=root,
+        include_dir=include_dir,
+        library_dir=library_dir,
+        redistributable_dir=redistributable_dir,
+        errors=tuple(errors),
+    )
+
+
+def red_sdk_configuration_error(config: RedSdkConfiguration) -> str:
+    details = " ".join(config.errors).strip()
+    setup_hint = (
+        "Set RED_SDK_ROOT to the external SDK root and rebuild the native bridge with "
+        "scripts/build_red_sdk_bridge.sh. Set RED_SDK_REDISTRIBUTABLE_DIR explicitly if the "
+        "redistributable runtime lives outside the SDK root."
+    )
+    return f"{details} {setup_hint}".strip()
+
+
+def _bridge_configuration(native: Any) -> dict[str, object]:
+    if hasattr(native, "bridge_configuration"):
+        try:
+            payload = dict(native.bridge_configuration())
+            return payload
+        except Exception:
+            return {}
+    return {}
+
+
+def load_configured_red_native_module() -> Any:
+    config = resolve_red_sdk_configuration()
+    if config.errors:
+        raise RuntimeError(red_sdk_configuration_error(config))
+
+    assert config.root is not None
+    assert config.redistributable_dir is not None
+    os.environ["RED_SDK_ROOT"] = str(config.root)
+    os.environ["RED_SDK_REDISTRIBUTABLE_DIR"] = str(config.redistributable_dir)
+
+    native = _load_red_native_module()
+    if native is None:
+        raise RuntimeError(
+            "RED backend requested but native bridge is not built. "
+            + red_sdk_configuration_error(config)
+        )
+
+    bridge_config = _bridge_configuration(native)
+    compiled_root_raw = bridge_config.get("compiled_red_sdk_root")
+    compiled_root = _expand_env_path(str(compiled_root_raw)) if compiled_root_raw else None
+    if compiled_root is not None:
+        compiled_norm = _normalize_path_for_compare(compiled_root)
+        runtime_norm = _normalize_path_for_compare(config.root)
+        if compiled_norm and runtime_norm and compiled_norm != runtime_norm:
+            raise RuntimeError(
+                "RED SDK bridge was built against a different SDK root. "
+                f"Bridge root: {compiled_root}. Runtime RED_SDK_ROOT: {config.root}. "
+                "Rebuild the native bridge with scripts/build_red_sdk_bridge.sh after setting RED_SDK_ROOT."
+            )
+
+    return native
 
 
 class R3DBackend(ABC):
@@ -133,11 +274,7 @@ class RedSdkDecoder(R3DBackend):
     name = "red"
 
     def __init__(self) -> None:
-        self._native = _load_red_native_module()
-        if self._native is None:
-            raise RuntimeError(
-                "RED backend requested but native bridge is not built. Set RED_SDK_ROOT and run scripts/build_red_sdk_bridge.sh."
-            )
+        self._native = load_configured_red_native_module()
         if hasattr(self._native, "sdk_available") and not self._native.sdk_available():
             message = getattr(self._native, "unavailable_message", lambda: "RED SDK bridge unavailable.")()
             raise RuntimeError(message)
