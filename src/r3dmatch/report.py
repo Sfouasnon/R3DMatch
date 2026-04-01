@@ -8018,51 +8018,91 @@ def _contact_sheet_resolve_measurement_fields(
     exposure_metrics: Dict[str, object],
     ipp2_row: Dict[str, object],
 ) -> Dict[str, object]:
-    sample_sources = [
-        ("ipp2_validation", ipp2_row),
-        ("strategy_clip", clip_row),
-        ("exposure_metrics", exposure_metrics),
-        ("shared_original", shared),
-    ]
-    sample_1_ire, sample_1_source = _contact_sheet_collect_sample_numeric("sample_1_ire", required=True, sources=sample_sources)
-    sample_2_ire, sample_2_source = _contact_sheet_collect_sample_numeric("sample_2_ire", required=True, sources=sample_sources)
-    sample_3_ire, sample_3_source = _contact_sheet_collect_sample_numeric("sample_3_ire", required=True, sources=sample_sources)
-    scalar_sources = [
-        ("strategy_clip.display_scalar_log2", {"value": clip_row.get("display_scalar_log2")}),
-        ("shared_original.display_scalar_log2", {"value": shared.get("display_scalar_log2")}),
-        ("exposure_metrics.display_scalar_log2", {"value": exposure_metrics.get("display_scalar_log2")}),
-        ("strategy_clip.measured_log2_luminance_monitoring", {"value": clip_row.get("measured_log2_luminance_monitoring")}),
-        ("shared_original.measured_log2_luminance_monitoring", {"value": shared.get("measured_log2_luminance_monitoring")}),
-        ("exposure_metrics.measured_log2_luminance_monitoring", {"value": exposure_metrics.get("measured_log2_luminance_monitoring")}),
-        ("strategy_clip.measured_log2_luminance", {"value": clip_row.get("measured_log2_luminance")}),
-    ]
+    # -------------------------------------------------------------------------
+    # AUTHORITATIVE MEASUREMENT SOURCE: shared_original ONLY
+    # -------------------------------------------------------------------------
+    # The displayed "original" sample values MUST represent the true measurement
+    # pipeline: R3D → REDLine (IPP2 render, useMeta) → JPEG → OpenCV sphere
+    # detection → Masked pixel sampling → Median per region → Luminance → IRE
+    # These values are stored in shared_original. NO FALLBACKS. NO EXCEPTIONS.
+    # -------------------------------------------------------------------------
+
+    # Extract sample IRE values from shared_original ONLY
+    sample_aliases = {
+        "sample_1_ire": ("sample_1_ire", "bright_ire"),
+        "sample_2_ire": ("sample_2_ire", "center_ire"),
+        "sample_3_ire": ("sample_3_ire", "dark_ire"),
+    }
+
+    def _extract_authoritative_sample(field_name: str) -> float:
+        """Extract sample value from shared_original. Fail hard if missing or invalid."""
+        aliases = sample_aliases.get(field_name, (field_name,))
+        for alias in aliases:
+            raw_value = shared.get(alias)
+            if raw_value in (None, ""):
+                continue
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Contact-sheet field {alias} is not numeric in shared_original for {clip_id}: {raw_value!r}"
+                ) from exc
+            return value
+        raise RuntimeError(
+            f"Contact-sheet field {field_name} is missing from shared_original for {clip_id}. "
+            f"This is a data integrity error: the authoritative measurement source must contain valid sample values."
+        )
+
+    sample_1_ire = _extract_authoritative_sample("sample_1_ire")
+    sample_2_ire = _extract_authoritative_sample("sample_2_ire")
+    sample_3_ire = _extract_authoritative_sample("sample_3_ire")
+
+    # -------------------------------------------------------------------------
+    # SCALAR: Must be derived from shared_original ONLY
+    # -------------------------------------------------------------------------
     scalar_value = None
     scalar_source = ""
-    for source_name, source in scalar_sources:
-        raw_value = source.get("value")
-        if raw_value in (None, ""):
-            continue
+
+    # First try display_scalar_log2 from shared_original
+    raw_scalar = shared.get("display_scalar_log2")
+    if raw_scalar not in (None, ""):
         try:
-            scalar_value = float(raw_value)
+            scalar_value = float(raw_scalar)
+            scalar_source = "shared_original.display_scalar_log2"
         except (TypeError, ValueError) as exc:
             raise RuntimeError(
-                f"Contact-sheet scalar is not numeric for {clip_id} in {source_name}: {raw_value!r}"
+                f"Contact-sheet scalar display_scalar_log2 is not numeric in shared_original for {clip_id}: {raw_scalar!r}"
             ) from exc
-        scalar_source = source_name
-        break
+
+    # Fallback to measured_log2_luminance_monitoring from shared_original
     if scalar_value is None:
-        raise RuntimeError(f"Contact-sheet scalar is missing from the stored measurement payload for {clip_id}.")
+        raw_scalar = shared.get("measured_log2_luminance_monitoring")
+        if raw_scalar not in (None, ""):
+            try:
+                scalar_value = float(raw_scalar)
+                scalar_source = "shared_original.measured_log2_luminance_monitoring"
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Contact-sheet scalar measured_log2_luminance_monitoring is not numeric in shared_original for {clip_id}: {raw_scalar!r}"
+                ) from exc
+
+    if scalar_value is None:
+        raise RuntimeError(
+            f"Contact-sheet scalar is missing from shared_original for {clip_id}. "
+            f"This is a data integrity error: the authoritative measurement source must contain a valid scalar."
+        )
+
     return {
-        "sample_1_ire": float(sample_1_ire or 0.0),
-        "sample_2_ire": float(sample_2_ire or 0.0),
-        "sample_3_ire": float(sample_3_ire or 0.0),
+        "sample_1_ire": sample_1_ire,
+        "sample_2_ire": sample_2_ire,
+        "sample_3_ire": sample_3_ire,
         "sample_sources": {
-            "sample_1_ire": sample_1_source,
-            "sample_2_ire": sample_2_source,
-            "sample_3_ire": sample_3_source,
+            "sample_1_ire": "shared_original",
+            "sample_2_ire": "shared_original",
+            "sample_3_ire": "shared_original",
         },
         "target_sample_label": CONTACT_SHEET_TARGET_SAMPLE_LABEL,
-        "display_scalar_log2": float(scalar_value),
+        "display_scalar_log2": scalar_value,
         "display_scalar_source": scalar_source,
     }
 
