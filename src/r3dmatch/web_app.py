@@ -21,7 +21,7 @@ from typing import Dict, List, Optional
 
 from flask import Flask, Response, jsonify, redirect, render_template_string, request, send_file, url_for
 
-from .ftps_ingest import normalize_source_mode, plan_ftps_request, source_mode_label
+from .ftps_ingest import ingest_manifest_path_for, normalize_source_mode, plan_ftps_request, source_mode_label
 from .identity import clip_id_from_path, subset_key_from_clip_id
 from .matching import discover_clips
 from .progress import load_review_progress, review_progress_path_for
@@ -39,10 +39,21 @@ from .report import (
     _detect_redline_capabilities,
     _normalize_preview_settings,
     _resolve_redline_executable,
+    normalize_report_focus,
+    report_focus_label,
     normalize_review_mode,
+    resolve_redline_tool_status,
     review_mode_label,
 )
-from .runtime_env import ensure_runtime_environment, runtime_health_payload
+from .runtime_env import (
+    ensure_runtime_environment,
+    persist_redline_configured_path,
+    read_redline_config,
+    runtime_cli_prefix,
+    runtime_health_payload,
+    runtime_subprocess_env,
+    write_redline_config,
+)
 from .workflow import (
     matching_domain_label,
     post_apply_verification_path_for,
@@ -87,6 +98,9 @@ PAGE_TEMPLATE = """
     .field { margin-bottom: 12px; min-width: 0; }
     .field label { display: block; font-weight: 700; margin-bottom: 6px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: #475569; }
     .field input[type="text"], .field select { width: 100%; box-sizing: border-box; padding: 12px 14px; border: 1px solid #c7ccd4; border-radius: 12px; background: white; color: #0f172a; }
+    .field-with-action { display: flex; gap: 8px; align-items: center; }
+    .field-with-action input[type="text"] { flex: 1 1 auto; min-width: 0; }
+    .browse-button { flex: 0 0 auto; }
     .row { display: flex; gap: 12px; flex-wrap: wrap; }
     .row > * { flex: 1 1 220px; }
     .checkbox-row { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
@@ -231,6 +245,10 @@ PAGE_TEMPLATE = """
     .clip-id { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #0f172a; font-weight: 800; }
     .clip-group { text-align: right; color: #64748b; font-weight: 700; }
     .empty-state { padding: 20px 16px; color: #64748b; font-size: 14px; line-height: 1.6; }
+    .browse-feedback { display: none; margin-bottom: 12px; padding: 10px 12px; border-radius: 10px; font-size: 14px; }
+    .browse-feedback.visible { display: block; }
+    .browse-feedback.info { background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; }
+    .browse-feedback.warning { background: #fff7ed; color: #9a3412; border: 1px solid #fdba74; }
     @media (max-width: 980px) {
       .subset-layout { grid-template-columns: 1fr; }
       .subset-column { min-height: 0; }
@@ -280,6 +298,7 @@ PAGE_TEMPLATE = """
           <span class="metric-label">Interpreter</span>
           <span class="metric-value" style="font-size:16px; line-height:1.4;">{{ runtime_health.interpreter }}</span>
           <div class="meta">Virtual env: {{ runtime_health.virtual_env or 'none' }}</div>
+          <div class="meta">Runtime: {{ 'packaged app' if runtime_health.frozen_app else 'dev/python' }}</div>
         </div>
         <div class="summary-panel">
           <span class="metric-label">HTML → PDF</span>
@@ -288,23 +307,56 @@ PAGE_TEMPLATE = """
           <div class="meta">DYLD: {{ runtime_health.dyld_fallback_library_path or '<unset>' }}</div>
         </div>
         <div class="summary-panel">
-          <span class="metric-label">RED Backend</span>
-          <span class="metric-value">{{ 'Ready' if runtime_health.red_backend_ready else 'Check setup' }}</span>
+          <span class="metric-label">RED SDK Runtime</span>
+          <span class="metric-value">{{ 'Ready' if runtime_health.red_sdk_runtime.ready else 'Check setup' }}</span>
+          <div class="meta">Source: {{ runtime_health.red_sdk_runtime.source or 'missing' }}</div>
           <div class="meta">RED_SDK_ROOT: {{ runtime_health.red_sdk_root or '<unset>' }}</div>
-          {% if runtime_health.resolved_red_sdk_redistributable_dir %}
-            <div class="meta">Redistributable: {{ runtime_health.resolved_red_sdk_redistributable_dir }}</div>
-          {% endif %}
+          <div class="meta">Redistributable: {{ runtime_health.red_sdk_runtime.redistributable_dir or '<unset>' }}</div>
+        </div>
+        <div class="summary-panel">
+          <span class="metric-label">REDLine Tool</span>
+          <span class="metric-value">{{ 'Ready' if runtime_health.redline_tool.ready else 'External tool required' }}</span>
+          <div class="meta">Source: {{ runtime_health.redline_tool.source or 'missing' }}</div>
+          <div class="meta">Executable: {{ runtime_health.redline_tool.resolved_path or runtime_health.redline_tool.configured or '<unset>' }}</div>
         </div>
       </div>
+      <form method="post" action="{{ url_for('configure_redline') }}" style="margin-top:14px;">
+        <div class="field">
+          <label for="redline_executable">REDLine Executable Path</label>
+          <div class="field-with-action">
+            <input
+              id="redline_executable"
+              name="redline_executable"
+              type="text"
+              value="{{ runtime_health.redline_tool.configured_path or '' }}"
+              placeholder="/Applications/REDCINE-X Professional/.../REDline">
+            <button
+              type="button"
+              class="secondary browse-button"
+              data-browse-target="redline_executable"
+              data-browse-kind="file"
+              data-browse-title="Select REDLine Executable">Browse</button>
+            <button type="submit">Save REDLine Path</button>
+          </div>
+          <div class="meta">Persists to {{ runtime_health.redline_tool.configured_config_path }}. Leave blank and save to clear the stored path and fall back to PATH/environment discovery.</div>
+        </div>
+      </form>
       {% if not runtime_health.html_pdf_ready and runtime_health.weasyprint_error %}
         <div class="meta" style="margin-top:12px;">PDF export preflight: {{ runtime_health.weasyprint_error }}</div>
       {% endif %}
-      {% if not runtime_health.red_backend_ready and runtime_health.red_backend_error %}
-        <div class="meta" style="margin-top:8px;">RED backend preflight: {{ runtime_health.red_backend_error }}</div>
+      {% if not runtime_health.red_sdk_runtime.ready and runtime_health.red_sdk_runtime.error %}
+        <div class="meta" style="margin-top:8px;">RED SDK runtime preflight: {{ runtime_health.red_sdk_runtime.error }}</div>
+      {% endif %}
+      {% if not runtime_health.redline_tool.ready and runtime_health.redline_tool.error %}
+        <div class="meta" style="margin-top:8px;">REDLine preflight: {{ runtime_health.redline_tool.error }}</div>
+      {% endif %}
+      {% if runtime_health.frozen_app and not runtime_health.red_sdk_root and not runtime_health.red_sdk_runtime.ready %}
+        <div class="meta" style="margin-top:8px;">Packaged app note: Finder launches do not inherit your shell environment. Launch the app from Terminal or provide RED_SDK_ROOT before starting the app when external RED runtime configuration is still required.</div>
       {% endif %}
     </div>
 
     <form method="post" action="{{ url_for('scan') }}">
+      <div id="browse-feedback" class="browse-feedback"></div>
       <div class="card">
         <h2 class="section-title">Calibration Folder</h2>
         <div class="row">
@@ -318,9 +370,19 @@ PAGE_TEMPLATE = """
         </div>
         <div class="field">
           <label for="input_path">Calibration Folder Path</label>
-          <input id="input_path" name="input_path" type="text" value="{{ form.input_path }}">
+          <div class="field-with-action">
+            <input id="input_path" name="input_path" type="text" value="{{ form.input_path }}">
+            <button type="button" class="secondary browse-button" data-browse-target="input_path" data-browse-title="Select Calibration Folder">Browse</button>
+          </div>
         </div>
         <div id="ftps-fields" {% if form.source_mode != 'ftps_camera_pull' %}style="display:none"{% endif %}>
+          <div class="field">
+            <label for="local_ingest_root">Local Ingest Cache Root (Optional)</label>
+            <div class="field-with-action">
+              <input id="local_ingest_root" name="local_ingest_root" type="text" value="{{ form.local_ingest_root }}" placeholder="Leave blank to ingest under the review output folder">
+              <button type="button" class="secondary browse-button" data-browse-target="local_ingest_root" data-browse-title="Select Local Ingest Cache Root">Browse</button>
+            </div>
+          </div>
           <div class="row">
             <div class="field">
               <label for="ftps_reel">FTPS Reel</label>
@@ -338,7 +400,12 @@ PAGE_TEMPLATE = """
           <div class="meta">FTPS ingest uses the built-in camera map and default RED camera credentials unless overridden in the CLI.</div>
         </div>
         <div class="actions">
-          <button type="submit">Scan Folder</button>
+          <button type="submit">{% if form.source_mode == 'ftps_camera_pull' %}Plan Request{% else %}Scan Folder{% endif %}</button>
+          {% if form.source_mode == 'ftps_camera_pull' %}
+            <button type="submit" formaction="{{ url_for('discover_ftps') }}" class="secondary">Discover</button>
+            <button type="submit" formaction="{{ url_for('download_ftps') }}" class="secondary">Download</button>
+            <button type="submit" formaction="{{ url_for('retry_failed_ftps') }}" class="secondary">Retry Failed</button>
+          {% endif %}
         </div>
       </div>
 
@@ -466,7 +533,10 @@ PAGE_TEMPLATE = """
         <h2 class="section-title">Output Folder</h2>
         <div class="field">
           <label for="output_path">Output Folder Path</label>
-          <input id="output_path" name="output_path" type="text" value="{{ form.output_path }}">
+          <div class="field-with-action">
+            <input id="output_path" name="output_path" type="text" value="{{ form.output_path }}">
+            <button type="button" class="secondary browse-button" data-browse-target="output_path" data-browse-title="Select Output Folder">Browse</button>
+          </div>
         </div>
       </div>
 
@@ -510,6 +580,15 @@ PAGE_TEMPLATE = """
               <option value="lightweight_analysis" {% if form.review_mode == 'lightweight_analysis' %}selected{% endif %}>Lightweight Analysis</option>
             </select>
             <div class="meta">Lightweight Analysis skips bulk still generation and produces a fast exposure-first diagnostic brief.</div>
+          </div>
+          <div class="field">
+            <label for="report_focus">Large-Array Export Focus</label>
+            <select id="report_focus" name="report_focus">
+              {% for value in ['auto', 'full', 'outliers', 'anchors', 'cluster_extremes'] %}
+                <option value="{{ value }}" {% if form.report_focus == value %}selected{% endif %}>{{ report_focus_labels[value] }}</option>
+              {% endfor %}
+            </select>
+            <div class="meta">Large arrays default to overview-first with focused detail pages. Choose a narrower export when you want outliers or anchors first.</div>
           </div>
         </div>
       </div>
@@ -592,7 +671,7 @@ PAGE_TEMPLATE = """
       <div class="card">
         <h2 class="section-title">Actions</h2>
         <div class="actions">
-          <button type="submit" formaction="{{ url_for('run_review') }}">Run Review</button>
+          <button type="submit" formaction="{{ url_for('run_review') }}">{% if form.source_mode == 'ftps_camera_pull' %}Download + Process{% else %}Run Review{% endif %}</button>
           <button type="submit" formaction="{{ url_for('approve_master') }}" class="secondary">Approve Master RMD</button>
           <button type="submit" formaction="{{ url_for('clear_preview') }}" class="secondary">Clear Preview Cache</button>
           {% if report_url %}
@@ -611,7 +690,10 @@ PAGE_TEMPLATE = """
           </div>
           <div class="field">
             <label for="verification_after_path">After-Apply Review Folder</label>
-            <input id="verification_after_path" name="verification_after_path" type="text" value="{{ form.verification_after_path }}" placeholder="/path/to/reacquired/review/output">
+            <div class="field-with-action">
+              <input id="verification_after_path" name="verification_after_path" type="text" value="{{ form.verification_after_path }}" placeholder="/path/to/reacquired/review/output">
+              <button type="button" class="secondary browse-button" data-browse-target="verification_after_path" data-browse-title="Select After-Apply Review Folder">Browse</button>
+            </div>
           </div>
         </div>
         <div class="actions">
@@ -671,6 +753,11 @@ PAGE_TEMPLATE = """
         <div class="meta"><strong>Command:</strong> <span id="task-command">{{ task.command }}</span></div>
         <pre class="log" id="task-log">{{ task.log_text }}</pre>
       </details>
+    </div>
+
+    <div class="card">
+      <h2 class="section-title">FTPS Ingest</h2>
+      <div id="ingest-surface">{{ task.ingest_surface_html | safe }}</div>
     </div>
 
     <div class="card">
@@ -752,6 +839,61 @@ PAGE_TEMPLATE = """
       });
     }
     wireChartModal();
+
+    function setBrowseFeedback(message, tone) {
+      const feedback = document.getElementById('browse-feedback');
+      if (!feedback) return;
+      if (!message) {
+        feedback.className = 'browse-feedback';
+        feedback.textContent = '';
+        return;
+      }
+      feedback.className = 'browse-feedback visible ' + (tone || 'info');
+      feedback.textContent = message;
+    }
+
+    async function browsePathField(targetField, title, kind) {
+      const input = document.getElementById(targetField);
+      if (!input) return;
+      const body = new URLSearchParams();
+      body.set('field', targetField);
+      body.set('title', title || '');
+      body.set('current_path', input.value || '');
+      const endpoint = kind === 'file' ? '{{ url_for("browse_file") }}' : '{{ url_for("browse_folder") }}';
+      const noun = kind === 'file' ? 'File' : 'Folder';
+      try {
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'},
+          body: body.toString(),
+        });
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) {
+          setBrowseFeedback(payload.error || (noun + ' browse failed.'), 'warning');
+          return;
+        }
+        if (payload.cancelled) {
+          setBrowseFeedback(noun + ' selection cancelled.', 'info');
+          return;
+        }
+        if (payload.path) {
+          input.value = payload.path;
+          setBrowseFeedback('Selected ' + noun.toLowerCase() + ': ' + payload.path, 'info');
+        }
+      } catch (error) {
+        setBrowseFeedback(noun + ' browse failed: ' + String(error), 'warning');
+      }
+    }
+
+    document.querySelectorAll('[data-browse-target]').forEach((button) => {
+      button.addEventListener('click', () => {
+        browsePathField(
+          button.dataset.browseTarget,
+          button.dataset.browseTitle || '',
+          button.dataset.browseKind || 'folder',
+        );
+      });
+    });
 
     function toggleManualReference() {
       const manual = document.getElementById('manual_strategy');
@@ -1226,12 +1368,11 @@ PAGE_TEMPLATE = """
 def build_review_web_command(repo_root: str, form: Dict[str, object]) -> List[str]:
     source_mode = normalize_source_mode(str(form.get("source_mode", "local_folder")))
     review_mode = normalize_review_mode(str(form.get("review_mode", "full_contact_sheet")))
+    report_focus = normalize_report_focus(str(form.get("report_focus", "auto")))
     matching_domain_value = "perceptual"
-    input_path = str(form["input_path"]) if source_mode == "local_folder" else str(Path(str(form["output_path"])).expanduser().resolve() / "ingest")
+    input_path = str(form["input_path"]) if source_mode == "local_folder" else str(_resolved_ingest_root_for_form(form))
     args = [
-        sys.executable or "python3",
-        "-m",
-        "r3dmatch.cli",
+        *_runtime_cli_prefix(),
         "review-calibration",
         input_path,
         "--out",
@@ -1248,11 +1389,15 @@ def build_review_web_command(repo_root: str, form: Dict[str, object]) -> List[st
         matching_domain_value,
         "--review-mode",
         review_mode,
+        "--report-focus",
+        report_focus,
         "--preview-mode",
         str(form["preview_mode"]),
     ]
     if source_mode == "ftps_camera_pull":
         args.extend(["--ftps-reel", str(form["ftps_reel"]), "--ftps-clips", str(form["ftps_clips"])])
+        if str(form.get("local_ingest_root", "")).strip():
+            args.extend(["--ftps-local-root", str(_resolved_ingest_root_for_form(form))])
         for camera in [item.strip() for item in str(form.get("ftps_cameras", "")).split(",") if item.strip()]:
             args.extend(["--ftps-camera", camera])
     roi_mode = str(form.get("roi_mode", "sphere_auto"))
@@ -1279,8 +1424,44 @@ def build_review_web_command(repo_root: str, form: Dict[str, object]) -> List[st
     return ["/bin/tcsh", "-c", shell_command]
 
 
+def _resolved_ingest_root_for_form(form: Dict[str, object]) -> Path:
+    local_ingest_root = str(form.get("local_ingest_root", "") or "").strip()
+    if local_ingest_root:
+        return Path(local_ingest_root).expanduser().resolve()
+    output_root = str(form.get("output_path", "") or "").strip()
+    if output_root:
+        return Path(output_root).expanduser().resolve() / "ingest"
+    return Path("ingest").resolve()
+
+
+def build_ftps_ingest_web_command(repo_root: str, form: Dict[str, object], *, action: str) -> List[str]:
+    ingest_root = _resolved_ingest_root_for_form(form)
+    args = [
+        *_runtime_cli_prefix(),
+        "ingest-ftps",
+        "--action",
+        action,
+        "--out",
+        str(ingest_root),
+    ]
+    if action != "retry-failed":
+        args.extend(["--ftps-reel", str(form["ftps_reel"]), "--ftps-clips", str(form["ftps_clips"])])
+    else:
+        args.extend(["--manifest-path", str(ingest_manifest_path_for(ingest_root))])
+    for camera in [item.strip() for item in str(form.get("ftps_cameras", "")).split(",") if item.strip()]:
+        args.extend(["--ftps-camera", camera])
+    shell_command = _build_tcsh_launch_prefix(repo_root, invocation_source="web_ui") + " ".join(
+        shlex.quote(item) for item in args
+    )
+    return ["/bin/tcsh", "-c", shell_command]
+
+
 def _build_tcsh_launch_prefix(repo_root: str, *, invocation_source: Optional[str] = None) -> str:
-    commands = [f'cd "{repo_root}"', 'setenv PYTHONPATH "$PWD/src"']
+    commands: List[str] = []
+    if getattr(sys, "frozen", False):
+        commands.append(f'cd "{Path(sys.executable).resolve().parent}"')
+    else:
+        commands.extend([f'cd "{repo_root}"', 'setenv PYTHONPATH "$PWD/src"'])
     if invocation_source:
         commands.append(f"setenv R3DMATCH_INVOCATION_SOURCE {shlex.quote(invocation_source)}")
     dyld_fallback_library_path = str(os.environ.get("DYLD_FALLBACK_LIBRARY_PATH") or "").strip()
@@ -1299,9 +1480,7 @@ def build_approve_web_command(repo_root: str, form: Dict[str, object]) -> List[s
     strategy = form["target_strategies"][0] if form["target_strategies"] else "median"
     output_path = str(form.get("resolved_output_path") or form["output_path"])
     args = [
-        sys.executable or "python3",
-        "-m",
-        "r3dmatch.cli",
+        *_runtime_cli_prefix(),
         "approve-master-rmd",
         output_path,
         "--target-strategy",
@@ -1317,9 +1496,91 @@ def build_approve_web_command(repo_root: str, form: Dict[str, object]) -> List[s
 
 def build_clear_cache_web_command(repo_root: str, form: Dict[str, object]) -> List[str]:
     output_path = str(form.get("resolved_output_path") or form["output_path"])
-    args = [sys.executable or "python3", "-m", "r3dmatch.cli", "clear-preview-cache", output_path]
+    args = [*_runtime_cli_prefix(), "clear-preview-cache", output_path]
     shell_command = _build_tcsh_launch_prefix(repo_root) + " ".join(shlex.quote(item) for item in args)
     return ["/bin/tcsh", "-c", shell_command]
+
+
+def _runtime_cli_prefix() -> List[str]:
+    return runtime_cli_prefix()
+
+
+def _subprocess_env_for_web(repo_root: str, *, invocation_source: Optional[str] = None) -> Dict[str, str]:
+    return runtime_subprocess_env(repo_root, invocation_source=invocation_source)
+
+
+def _browse_folder_titles() -> Dict[str, str]:
+    return {
+        "input_path": "Select Calibration Folder",
+        "output_path": "Select Output Folder",
+        "local_ingest_root": "Select Local Ingest Cache Root",
+        "verification_after_path": "Select After-Apply Review Folder",
+    }
+
+
+def _browse_folder_via_native_dialog(repo_root: str, *, field: str, current_path: str, title: str) -> Dict[str, object]:
+    if field not in _browse_folder_titles():
+        return {"ok": False, "cancelled": False, "path": "", "error": f"Unsupported browse field: {field}"}
+    args = [*_runtime_cli_prefix(), "pick-folder", "--title", title or _browse_folder_titles()[field]]
+    if str(current_path).strip():
+        args.extend(["--directory", str(Path(current_path).expanduser())])
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=_subprocess_env_for_web(repo_root, invocation_source="web_ui"),
+        )
+    except Exception as exc:
+        return {"ok": False, "cancelled": False, "path": "", "error": str(exc)}
+    if result.returncode != 0:
+        error_text = str(result.stderr or result.stdout or "Folder picker failed.").strip()
+        return {"ok": False, "cancelled": False, "path": "", "error": error_text}
+    selected = str(result.stdout or "").strip()
+    if not selected:
+        return {"ok": True, "cancelled": True, "path": "", "error": ""}
+    return {"ok": True, "cancelled": False, "path": str(Path(selected).expanduser()), "error": ""}
+
+
+def _browse_file_titles() -> Dict[str, str]:
+    return {
+        "redline_executable": "Select REDLine Executable",
+    }
+
+
+def _browse_file_via_native_dialog(repo_root: str, *, field: str, current_path: str, title: str) -> Dict[str, object]:
+    if field not in _browse_file_titles():
+        return {"ok": False, "cancelled": False, "path": "", "error": f"Unsupported file browse field: {field}"}
+    args = [
+        *_runtime_cli_prefix(),
+        "pick-file",
+        "--title",
+        title or _browse_file_titles()[field],
+        "--filter",
+        "Executables (*)",
+    ]
+    if str(current_path).strip():
+        current_candidate = Path(current_path).expanduser()
+        start_dir = current_candidate if current_candidate.is_dir() else current_candidate.parent
+        args.extend(["--directory", str(start_dir)])
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=_subprocess_env_for_web(repo_root, invocation_source="web_ui"),
+        )
+    except Exception as exc:
+        return {"ok": False, "cancelled": False, "path": "", "error": str(exc)}
+    if result.returncode != 0:
+        error_text = str(result.stderr or result.stdout or "File picker failed.").strip()
+        return {"ok": False, "cancelled": False, "path": "", "error": error_text}
+    selected = str(result.stdout or "").strip()
+    if not selected:
+        return {"ok": True, "cancelled": True, "path": "", "error": ""}
+    return {"ok": True, "cancelled": False, "path": str(Path(selected).expanduser()), "error": ""}
 
 
 def _camera_label_from_clip_id(clip_id: str) -> str:
@@ -1327,6 +1588,10 @@ def _camera_label_from_clip_id(clip_id: str) -> str:
     if len(parts) > 1 and parts[1]:
         return parts[1][0]
     return str(clip_id)[:1] if clip_id else "?"
+
+
+def _persist_redline_configured_path(candidate_path: str) -> Dict[str, object]:
+    return persist_redline_configured_path(candidate_path)
 
 
 def scan_sources(input_path: str) -> Dict[str, object]:
@@ -1426,6 +1691,7 @@ def _default_form() -> Dict[str, object]:
         "input_path": "",
         "output_path": "",
         "run_label": "",
+        "local_ingest_root": "",
         "ftps_reel": "",
         "ftps_clips": "",
         "ftps_cameras": "",
@@ -1443,6 +1709,7 @@ def _default_form() -> Dict[str, object]:
         "reference_clip_id": "",
         "hero_clip_id": "",
         "review_mode": "full_contact_sheet",
+        "report_focus": "auto",
         "preview_mode": "monitoring",
         "preview_lut": "",
         "apply_cameras": "",
@@ -1454,7 +1721,7 @@ def _default_form() -> Dict[str, object]:
 
 def _parse_form(post_data) -> Dict[str, object]:
     form = _default_form()
-    for key in ["source_mode", "input_path", "output_path", "run_label", "ftps_reel", "ftps_clips", "ftps_cameras", "backend", "target_type", "processing_mode", "matching_domain", "roi_x", "roi_y", "roi_w", "roi_h", "reference_clip_id", "hero_clip_id", "review_mode", "preview_mode", "preview_lut", "apply_cameras", "verification_after_path", "roi_mode"]:
+    for key in ["source_mode", "input_path", "output_path", "run_label", "local_ingest_root", "ftps_reel", "ftps_clips", "ftps_cameras", "backend", "target_type", "processing_mode", "matching_domain", "roi_x", "roi_y", "roi_w", "roi_h", "reference_clip_id", "hero_clip_id", "review_mode", "report_focus", "preview_mode", "preview_lut", "apply_cameras", "verification_after_path", "roi_mode"]:
         form[key] = post_data.get(key, form[key]).strip()
     strategies = post_data.getlist("target_strategies")
     form["target_strategies"] = strategies or []
@@ -1462,6 +1729,7 @@ def _parse_form(post_data) -> Dict[str, object]:
     form["selected_clip_groups"] = [str(item).strip() for item in post_data.getlist("selected_clip_groups") if str(item).strip()]
     form["advanced_clip_selection"] = post_data.get("advanced_clip_selection", "").strip().lower() in {"1", "true", "on", "yes"}
     form["matching_domain"] = "perceptual"
+    form["report_focus"] = normalize_report_focus(form.get("report_focus"))
     return form
 
 
@@ -1495,15 +1763,21 @@ def _validate_form(form: Dict[str, object], *, require_output: bool = True, requ
         normalized_review_mode = normalize_review_mode(str(form.get("review_mode", "full_contact_sheet")))
     except ValueError as exc:
         return str(exc)
+    runtime_health = runtime_health_payload()
     if str(form.get("backend", "mock")).strip().lower() == "red":
-        red_sdk_root = str(os.environ.get("RED_SDK_ROOT") or "").strip()
-        if not red_sdk_root:
-            return (
-                "RED backend requires RED_SDK_ROOT in the web app environment. "
-                "Set RED_SDK_ROOT to your external RED SDK install and relaunch the web UI."
+        sdk_runtime = dict(runtime_health.get("red_sdk_runtime") or {})
+        redline_tool = dict(runtime_health.get("redline_tool") or {})
+        if not bool(sdk_runtime.get("ready")):
+            return str(
+                sdk_runtime.get("error")
+                or "RED SDK runtime is unavailable in the current web app environment."
+            )
+        if not bool(redline_tool.get("ready")):
+            return str(
+                redline_tool.get("error")
+                or "REDLine is unavailable in the current web app environment."
             )
     if normalized_review_mode == "full_contact_sheet":
-        runtime_health = runtime_health_payload()
         if not bool(runtime_health.get("html_pdf_ready")):
             interpreter = str(runtime_health.get("interpreter") or sys.executable)
             dyld = str(runtime_health.get("dyld_fallback_library_path") or "")
@@ -1541,6 +1815,28 @@ def _validate_form(form: Dict[str, object], *, require_output: bool = True, requ
         lut_path = Path(preview_lut).expanduser().resolve()
         if not lut_path.exists():
             return "Preview LUT path does not exist."
+    return None
+
+
+def _validate_ftps_ingest_form(form: Dict[str, object], *, action: str) -> Optional[str]:
+    try:
+        resolved_source_mode = normalize_source_mode(str(form.get("source_mode", "local_folder")))
+    except ValueError as exc:
+        return str(exc)
+    if resolved_source_mode != "ftps_camera_pull":
+        return "FTPS ingest actions require Source Mode = FTPS Camera Pull."
+    ingest_root = _resolved_ingest_root_for_form(form)
+    if not str(form.get("ftps_reel", "")).strip() and action != "retry-failed":
+        return "FTPS ingest requires a reel identifier."
+    if not str(form.get("ftps_clips", "")).strip() and action != "retry-failed":
+        return "FTPS ingest requires clip numbers or ranges."
+    if not str(form.get("output_path", "")).strip() and not str(form.get("local_ingest_root", "")).strip():
+        return "Set Output Folder Path or Local Ingest Cache Root before running FTPS ingest."
+    if action == "retry-failed" and not ingest_manifest_path_for(ingest_root).exists():
+        return f"Retry Failed requires an existing ingest manifest at {ingest_manifest_path_for(ingest_root)}."
+    planned = _plan_ftps_scan(form) if action != "retry-failed" else None
+    if isinstance(planned, dict) and planned.get("warning"):
+        return str(planned["warning"])
     return None
 
 
@@ -2015,10 +2311,7 @@ def _build_operator_surfaces(
     recommendation = dict((review_validation or {}).get("recommendation") or {})
     physical = dict((review_validation or {}).get("physical_validation") or {})
     run_assessment = dict((review_validation or {}).get("run_assessment") or (review_payload or {}).get("run_assessment") or {})
-    wb_model = dict((review_payload or {}).get("white_balance_model") or {})
-    wb_candidates = list(wb_model.get("candidates") or [])
-    chosen_model_key = str(wb_model.get("model_key") or "")
-    chosen_candidate = next((item for item in wb_candidates if str(item.get("model_key") or "") == chosen_model_key), {})
+    raw_wb_model = dict((review_payload or {}).get("white_balance_model") or {})
     commit_rows: List[Dict[str, object]] = []
     if isinstance(commit_payload, dict):
         per_camera_note_map: Dict[str, Dict[str, object]] = {}
@@ -2048,6 +2341,7 @@ def _build_operator_surfaces(
                 }
             )
         commit_rows.sort(key=_severity_for_commit_row)
+    wb_model = _resolve_white_balance_model_surface(raw_wb_model, commit_rows)
     verification_surface = post_apply_report or dict((review_validation or {}).get("post_apply_validation") or {})
     camera_state_lookup = _current_state_lookup(camera_state_report)
     apply_lookup = _apply_result_lookup(apply_report)
@@ -2123,18 +2417,16 @@ def _build_operator_surfaces(
         "run_assessment": run_assessment,
         "white_balance_model": {
             "model_label": str(wb_model.get("model_label") or "n/a"),
-            "model_key": chosen_model_key,
+            "model_key": str(wb_model.get("model_key") or ""),
             "shared_kelvin": wb_model.get("shared_kelvin"),
+            "shared_kelvin_mode": str(wb_model.get("shared_kelvin_mode") or "unavailable"),
             "shared_tint": wb_model.get("shared_tint"),
-            "candidate_count": len(wb_candidates),
-            "selection_reason": (
-                f"{str(wb_model.get('model_label') or 'Selected model')} was chosen because it kept the weighted post-neutral residual at "
-                f"{float((chosen_candidate.get('metrics') or {}).get('weighted_mean_post_neutral_residual', 0.0) or 0.0):.4f} "
-                f"while holding Kelvin scatter to {float((chosen_candidate.get('metrics') or {}).get('kelvin_axis_stddev', 0.0) or 0.0):.4f}."
-                if chosen_candidate
-                else "No white-balance model summary is available yet."
-            ),
-            "candidates": wb_candidates,
+            "shared_tint_mode": str(wb_model.get("shared_tint_mode") or "unavailable"),
+            "candidate_count": int(wb_model.get("candidate_count", 0) or 0),
+            "selection_reason": str(wb_model.get("selection_reason") or "No white-balance model summary is available yet."),
+            "source_measurement_type": str(wb_model.get("source_measurement_type") or ""),
+            "diagnostics": dict(wb_model.get("diagnostics") or {}),
+            "candidates": [dict(item) for item in list(wb_model.get("candidates") or []) if isinstance(item, dict)],
         },
         "physical_validation": {
             "status": str(physical.get("status") or "pending"),
@@ -2226,6 +2518,120 @@ def _apply_result_lookup(apply_report: Optional[Dict[str, object]]) -> Dict[str,
         if key:
             lookup[key] = dict(row)
     return lookup
+
+
+def _white_balance_mode_from_values(values: List[float], *, tolerance: float) -> tuple[str, Optional[float]]:
+    usable = [float(value) for value in values]
+    if not usable:
+        return ("unavailable", None)
+    if max(usable) - min(usable) <= float(tolerance):
+        return ("shared", float(sum(usable) / len(usable)))
+    return ("per_camera", None)
+
+
+def _fallback_white_balance_label(kelvin_mode: str, tint_mode: str) -> str:
+    if kelvin_mode == "shared" and tint_mode == "shared":
+        return "Shared Kelvin / Shared Tint"
+    if kelvin_mode == "shared" and tint_mode == "per_camera":
+        return "Shared Kelvin / Per-Camera Tint"
+    if kelvin_mode == "per_camera" and tint_mode == "shared":
+        return "Per-Camera Kelvin / Shared Tint"
+    if kelvin_mode == "per_camera" and tint_mode == "per_camera":
+        return "Per-Camera Kelvin / Per-Camera Tint"
+    return "n/a"
+
+
+def _resolve_white_balance_model_surface(
+    raw_model: Optional[Dict[str, object]],
+    commit_rows: List[Dict[str, object]],
+) -> Dict[str, object]:
+    model = dict(raw_model or {})
+    candidate_rows = [dict(item) for item in list(model.get("candidates") or []) if isinstance(item, dict)]
+    chosen_model_key = str(model.get("model_key") or "").strip()
+    direct_available = bool(
+        str(model.get("model_label") or "").strip()
+        or chosen_model_key
+        or candidate_rows
+        or str(model.get("status") or "").strip() == "available"
+    )
+    retained_rows = [dict(item) for item in commit_rows if not bool(item.get("excluded_from_commit"))]
+    calibration_rows = [
+        dict(item.get("calibration") or {})
+        for item in (retained_rows or commit_rows)
+        if isinstance(item.get("calibration"), dict)
+    ]
+    kelvin_values = [int(row.get("kelvin")) for row in calibration_rows if row.get("kelvin") is not None]
+    tint_values = [float(row.get("tint")) for row in calibration_rows if row.get("tint") is not None]
+    kelvin_mode, shared_kelvin = _white_balance_mode_from_values([float(value) for value in kelvin_values], tolerance=50.0)
+    tint_mode, shared_tint = _white_balance_mode_from_values(tint_values, tolerance=0.1)
+    fallback_label = _fallback_white_balance_label(kelvin_mode, tint_mode)
+    diagnostics = dict(model.get("diagnostics") or {})
+    if direct_available:
+        chosen_candidate = next((item for item in candidate_rows if str(item.get("model_key") or "") == chosen_model_key), {})
+        selection_reason = str(model.get("selection_reason") or "")
+        if not selection_reason:
+            selection_reason = (
+                f"{str(model.get('model_label') or fallback_label)} was chosen from {len(candidate_rows)} white-balance candidate model(s)."
+                if candidate_rows
+                else "Stored white-balance solve metadata is available."
+            )
+        diagnostics.setdefault("retained_camera_count", len(retained_rows or commit_rows))
+        diagnostics.setdefault("summary_kind", "direct_solve")
+        diagnostics.setdefault("source_sample_count", 0)
+        diagnostics.setdefault("kelvin_spread", int(round(max(kelvin_values) - min(kelvin_values))) if len(kelvin_values) >= 2 else 0)
+        diagnostics.setdefault("tint_spread", round(float(max(tint_values) - min(tint_values)), 3) if len(tint_values) >= 2 else 0.0)
+        return {
+            "status": str(model.get("status") or "available"),
+            "model_label": str(model.get("model_label") or fallback_label),
+            "model_key": chosen_model_key,
+            "shared_kelvin": model.get("shared_kelvin", int(round(shared_kelvin)) if shared_kelvin is not None else None),
+            "shared_kelvin_mode": str(model.get("shared_kelvin_mode") or kelvin_mode),
+            "shared_tint": model.get("shared_tint", round(float(shared_tint), 1) if shared_tint is not None else None),
+            "shared_tint_mode": str(model.get("shared_tint_mode") or tint_mode),
+            "candidate_count": int(model.get("candidate_count", len(candidate_rows) or (1 if calibration_rows else 0)) or 0),
+            "selection_reason": selection_reason,
+            "source_measurement_type": str(model.get("source_measurement_type") or "neutral_rgb_samples"),
+            "candidates": candidate_rows,
+            "diagnostics": diagnostics,
+            "chosen_candidate": chosen_candidate,
+        }
+    selection_reason = (
+        "Derived from final per-camera Kelvin/Tint payloads because no white-balance model comparison summary was serialized."
+        if calibration_rows
+        else "No white-balance solution is available."
+    )
+    fallback_candidate = {
+        "model_key": f"fallback_{kelvin_mode}_{tint_mode}",
+        "model_label": fallback_label,
+        "metrics": {},
+        "shared_kelvin": int(round(shared_kelvin)) if shared_kelvin is not None else None,
+        "shared_tint": round(float(shared_tint), 1) if shared_tint is not None else None,
+    } if calibration_rows else {}
+    diagnostics = {
+        "retained_camera_count": len(retained_rows or commit_rows),
+        "mean_neutral_residual_before_solve": 0.0,
+        "mean_neutral_residual_after_solve": 0.0,
+        "max_neutral_residual": 0.0,
+        "kelvin_spread": int(round(max(kelvin_values) - min(kelvin_values))) if len(kelvin_values) >= 2 else 0,
+        "tint_spread": round(float(max(tint_values) - min(tint_values)), 3) if len(tint_values) >= 2 else 0.0,
+        "source_sample_count": 0,
+        "summary_kind": "fallback_derived",
+    }
+    return {
+        "status": "available" if calibration_rows else "unavailable",
+        "model_label": "Derived from Final WB Values" if calibration_rows else "n/a",
+        "model_key": str(fallback_candidate.get("model_key") or ""),
+        "shared_kelvin": int(round(shared_kelvin)) if shared_kelvin is not None else None,
+        "shared_kelvin_mode": kelvin_mode,
+        "shared_tint": round(float(shared_tint), 1) if shared_tint is not None else None,
+        "shared_tint_mode": tint_mode,
+        "candidate_count": 1 if calibration_rows else 0,
+        "selection_reason": selection_reason,
+        "source_measurement_type": "final_commit_values" if calibration_rows else "",
+        "candidates": [fallback_candidate] if fallback_candidate else [],
+        "diagnostics": diagnostics,
+        "chosen_candidate": fallback_candidate,
+    }
 
 
 def _severity_for_commit_row(row: Dict[str, object]) -> tuple[int, float, float]:
@@ -2406,8 +2812,17 @@ def _render_decision_surface(surface: Dict[str, object]) -> str:
     excluded_cameras = list(physical.get("excluded_cameras") or [])
     overview = _calibration_overview_from_payload(dict(surface.get("review_payload") or {}), run_assessment, readiness)
     readiness_tone = str(overview.get("state_tone") or readiness.get("tone") or "pending")
-    shared_kelvin_text = "per-camera" if wb_model.get("shared_kelvin") is None else str(wb_model.get("shared_kelvin"))
-    shared_tint_text = "per-camera" if wb_model.get("shared_tint") is None else str(wb_model.get("shared_tint"))
+    wb_diagnostics = dict(wb_model.get("diagnostics") or {})
+    shared_kelvin_text = (
+        str(wb_model.get("shared_kelvin"))
+        if str(wb_model.get("shared_kelvin_mode") or "") == "shared" and wb_model.get("shared_kelvin") is not None
+        else "per-camera"
+    )
+    shared_tint_text = (
+        str(wb_model.get("shared_tint"))
+        if str(wb_model.get("shared_tint_mode") or "") == "shared" and wb_model.get("shared_tint") is not None
+        else "per-camera"
+    )
     failure_html = "".join(
         f"<li><strong>{html.escape(str(item.get('code') or 'warning'))}</strong>: {html.escape(str(item.get('message') or ''))}</li>"
         for item in failure_modes
@@ -2464,6 +2879,7 @@ def _render_decision_surface(surface: Dict[str, object]) -> str:
         str(wb_model.get("selection_reason") or ""),
         f"Shared Kelvin: {shared_kelvin_text}.",
         f"Shared Tint Anchor: {shared_tint_text}.",
+        f"Summary source: {str(wb_diagnostics.get('summary_kind') or 'unknown').replace('_', ' ')}.",
     ]
     validation_points = [
         f"Retained gray sphere Sample 2 range: {overview.get('sample_2_ire_range_text', 'n/a')}.",
@@ -2578,6 +2994,11 @@ def _render_decision_surface(surface: Dict[str, object]) -> str:
           <div><span class="metric-label">Shared Kelvin</span><span class="metric-value">{html.escape(shared_kelvin_text)}</span></div>
           <div><span class="metric-label">Shared Tint Anchor</span><span class="metric-value">{html.escape(shared_tint_text)}</span></div>
           <div><span class="metric-label">Models Compared</span><span class="metric-value">{int(wb_model.get('candidate_count', 0) or 0)}</span></div>
+          <div><span class="metric-label">Retained Cameras</span><span class="metric-value">{int(wb_diagnostics.get('retained_camera_count', 0) or 0)}</span></div>
+          <div><span class="metric-label">Kelvin Spread</span><span class="metric-value">{int(wb_diagnostics.get('kelvin_spread', 0) or 0)} K</span></div>
+          <div><span class="metric-label">Tint Spread</span><span class="metric-value">{float(wb_diagnostics.get('tint_spread', 0.0) or 0.0):.2f}</span></div>
+          <div><span class="metric-label">Source Samples</span><span class="metric-value">{int(wb_diagnostics.get('source_sample_count', 0) or 0)}</span></div>
+          <div><span class="metric-label">Mean Residual</span><span class="metric-value">{float(wb_diagnostics.get('mean_neutral_residual_after_solve', 0.0) or 0.0):.4f}</span></div>
         </div>
         {_bullet_list_html(wb_points)}
       </div>
@@ -2614,6 +3035,58 @@ def _render_decision_surface(surface: Dict[str, object]) -> str:
     </div>
     {visuals_html}
     """
+
+
+def _render_ingest_surface(manifest: Dict[str, object]) -> str:
+    if not manifest:
+        return '<div class="empty-state">Use Discover, Download, or Retry Failed to inspect and pull FTPS media into a local ingest root.</div>'
+    rows = list(manifest.get("per_camera_status") or [])
+    if not rows:
+        return '<div class="empty-state">No FTPS per-camera status is available yet.</div>'
+    metrics = (
+        f"<div class='surface-metrics'>"
+        f"<div><span class='metric-label'>Action</span><span class='metric-value'>{html.escape(str(manifest.get('action') or 'download').replace('-', ' '))}</span></div>"
+        f"<div><span class='metric-label'>Status</span><span class='metric-value'>{html.escape(str(manifest.get('status') or 'pending'))}</span></div>"
+        f"<div><span class='metric-label'>Requested Cameras</span><span class='metric-value'>{int(manifest.get('requested_camera_count', 0) or 0)}</span></div>"
+        f"<div><span class='metric-label'>Reachable</span><span class='metric-value'>{int(manifest.get('reachable_camera_count', 0) or 0)}</span></div>"
+        f"<div><span class='metric-label'>Matched Files</span><span class='metric-value'>{int(manifest.get('matched_file_count', 0) or 0)}</span></div>"
+        f"<div><span class='metric-label'>Downloaded Files</span><span class='metric-value'>{int(manifest.get('downloaded_file_count', 0) or 0)}</span></div>"
+        f"<div><span class='metric-label'>Skipped Existing</span><span class='metric-value'>{int(manifest.get('skipped_existing_count', 0) or 0)}</span></div>"
+        f"<div><span class='metric-label'>Bytes</span><span class='metric-value'>{int(manifest.get('bytes_transferred', 0) or 0):,}</span></div>"
+        f"</div>"
+    )
+    body = []
+    for row in rows:
+        row_status = str(row.get("status") or "pending")
+        tone = "success" if row_status in {"matched", "downloaded"} else "warning" if row_status in {"reachable_no_matches", "partial"} else "danger"
+        notes = []
+        if row.get("failure_code"):
+            notes.append(str(row.get("failure_code")))
+        if row.get("errors"):
+            notes.append(str((row.get("errors") or [])[-1]))
+        body.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.get('camera_label') or ''))}</td>"
+            f"<td>{html.escape(str(row.get('host') or ''))}</td>"
+            f"<td>{_badge_html(row_status.replace('_', ' '), tone)}</td>"
+            f"<td>{int(row.get('matched_file_count', 0) or 0)}</td>"
+            f"<td>{int(row.get('downloaded_file_count', 0) or 0)}</td>"
+            f"<td>{int(row.get('skipped_existing_count', 0) or 0)}</td>"
+            f"<td>{int(row.get('failed_file_count', 0) or 0)}</td>"
+            f"<td>{int(row.get('bytes_transferred', 0) or 0):,}</td>"
+            f"<td>{html.escape('; '.join(notes) if notes else ('reachable' if row.get('reachable') else 'unreachable'))}</td>"
+            "</tr>"
+        )
+    manifest_path = html.escape(str(manifest.get("manifest_path") or ""))
+    return (
+        f"{metrics}"
+        f"<div class='meta'>Manifest: {manifest_path}</div>"
+        "<div class='table-wrap' style='margin-top:12px;'><table class='data-table'><thead><tr>"
+        "<th>Camera</th><th>Host</th><th>Status</th><th>Matched</th><th>Downloaded</th><th>Skipped</th><th>Failed</th><th>Bytes</th><th>Notes</th>"
+        "</tr></thead><tbody>"
+        + "".join(body)
+        + "</tbody></table></div>"
+    )
 
 
 def _render_commit_table(surface: Dict[str, object]) -> str:
@@ -3021,43 +3494,56 @@ def _ensure_scan_preview(input_path: str, scan: Dict[str, object], form: Optiona
         )
         scan["preview_warning"] = None
         return str(output_path)
-    redline_executable = _resolve_redline_executable()
-    capabilities = _detect_redline_capabilities(redline_executable)
-    settings = _normalize_preview_settings(
-        preview_mode=preview_mode,
-        preview_output_space=None,
-        preview_output_gamma=None,
-        preview_highlight_rolloff=None,
-        preview_shadow_rolloff=None,
-        preview_lut=None,
-    )
-    actual_preview_mode = str(settings.get("preview_mode") or "monitoring")
-    kelvin_raw = resolved_form.get("kelvin", scan.get("kelvin", 5600))
-    tint_raw = resolved_form.get("tint", scan.get("tint", 0))
     try:
-        kelvin = int(round(float(kelvin_raw if kelvin_raw not in (None, "") else 5600)))
-    except (TypeError, ValueError):
-        kelvin = 5600
-    try:
-        tint = float(tint_raw if tint_raw not in (None, "") else 0)
-    except (TypeError, ValueError):
-        tint = 0.0
-    command = _build_redline_preview_command(
-        clip_path,
-        output_path=str(output_path),
-        frame_index=0,
-        exposure_stops=None,
-        kelvin=kelvin,
-        tint=tint,
-        color_cdl=None,
-        color_method=None,
-        redline_executable=redline_executable,
-        preview_settings=settings,
-        redline_capabilities=capabilities,
-        use_as_shot_metadata=True,
-        rmd_path=None,
-    )
-    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+        redline_executable = _resolve_redline_executable()
+        capabilities = _detect_redline_capabilities(redline_executable)
+        settings = _normalize_preview_settings(
+            preview_mode=preview_mode,
+            preview_output_space=None,
+            preview_output_gamma=None,
+            preview_highlight_rolloff=None,
+            preview_shadow_rolloff=None,
+            preview_lut=None,
+        )
+        actual_preview_mode = str(settings.get("preview_mode") or "monitoring")
+        kelvin_raw = resolved_form.get("kelvin", scan.get("kelvin", 5600))
+        tint_raw = resolved_form.get("tint", scan.get("tint", 0))
+        try:
+            kelvin = int(round(float(kelvin_raw if kelvin_raw not in (None, "") else 5600)))
+        except (TypeError, ValueError):
+            kelvin = 5600
+        try:
+            tint = float(tint_raw if tint_raw not in (None, "") else 0)
+        except (TypeError, ValueError):
+            tint = 0.0
+        command = _build_redline_preview_command(
+            clip_path,
+            output_path=str(output_path),
+            frame_index=0,
+            exposure_stops=None,
+            kelvin=kelvin,
+            tint=tint,
+            color_cdl=None,
+            color_method=None,
+            redline_executable=redline_executable,
+            preview_settings=settings,
+            redline_capabilities=capabilities,
+            use_as_shot_metadata=True,
+            rmd_path=None,
+        )
+        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    except Exception as exc:
+        LOGGER.warning(
+            "Scan preview generation failed for %s via %s",
+            clip_id or clip_path,
+            preview_mode,
+            exc_info=True,
+        )
+        scan["preview_warning"] = (
+            f"ROI preview unavailable because preview extraction failed for {clip_id or 'the selected clip'}: {exc}"
+        )
+        scan["preview_note"] = None
+        return None
     if completed.returncode != 0:
         scan["preview_warning"] = f"ROI preview fallback in use because preview extraction failed for {clip_id or 'the selected clip'}."
         scan["preview_note"] = None
@@ -3095,6 +3581,13 @@ APPROVAL_STAGES = [
     "Complete",
 ]
 
+INGEST_STAGES = [
+    "Planning request",
+    "Discovering cameras",
+    "Downloading media",
+    "Complete",
+]
+
 
 def _make_cancel_file_path() -> str:
     return str((Path("/tmp") / f"r3dmatch_cancel_{uuid.uuid4().hex}.flag").resolve())
@@ -3109,7 +3602,7 @@ def _process_is_alive(process: Optional[subprocess.Popen[str]]) -> bool:
         return False
 
 
-def _artifacts_ready_for_task(task: TaskState, output_root: Optional[Path], *, is_review: bool, is_approve: bool) -> bool:
+def _artifacts_ready_for_task(task: TaskState, output_root: Optional[Path], *, is_review: bool, is_approve: bool, is_ingest: bool) -> bool:
     if output_root is None or not output_root.exists():
         return False
     if is_review:
@@ -3117,7 +3610,23 @@ def _artifacts_ready_for_task(task: TaskState, output_root: Optional[Path], *, i
     if is_approve:
         approval_root = output_root / "approval"
         return _path_is_current(approval_root / "calibration_report.pdf", started_at=task.started_at) or _path_is_current(approval_root / "approval_manifest.json", started_at=task.started_at)
+    if is_ingest:
+        return _path_is_current(ingest_manifest_path_for(output_root), started_at=task.started_at)
     return False
+
+
+def _load_ingest_manifest(output_root: Optional[Path], *, started_at: Optional[float] = None) -> Optional[Dict[str, object]]:
+    if output_root is None:
+        return None
+    manifest_path = ingest_manifest_path_for(output_root)
+    if not manifest_path.exists() or not _path_is_current(manifest_path, started_at=started_at):
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    payload["manifest_path"] = str(manifest_path)
+    return payload
 
 
 def _load_review_validation(output_root: Optional[Path], *, started_at: Optional[float] = None) -> Optional[Dict[str, object]]:
@@ -3267,6 +3776,7 @@ def _infer_progress(task: TaskState) -> None:
     output_root = Path(resolved_output).expanduser().resolve() if resolved_output else None
     is_review = "review-calibration" in task.command
     is_approve = "approve-master-rmd" in task.command
+    is_ingest = "ingest-ftps" in task.command
     review_progress = _load_review_progress(output_root, started_at=task.started_at) if is_review else None
     review_validation = (
         _load_review_validation_with_completion_fallback(
@@ -3396,10 +3906,27 @@ def _infer_progress(task: TaskState) -> None:
             task.preview_pdf_path = str(approval_pdf) if approval_pdf_ready else None
             task.preview_html_path = None
             task.report_ready = approval_pdf_ready or approval_manifest_ready
+    elif is_ingest:
+        task.total_stages = len(INGEST_STAGES)
+        ingest_manifest = _load_ingest_manifest(output_root, started_at=task.started_at)
+        if ingest_manifest:
+            action = str(ingest_manifest.get("action") or "download")
+            downloaded = int(ingest_manifest.get("downloaded_file_count", 0) or 0)
+            matched = int(ingest_manifest.get("matched_file_count", 0) or 0)
+            if action == "discover":
+                task.items_total = max(matched, int(ingest_manifest.get("requested_camera_count", 0) or 0))
+                task.items_completed = int(ingest_manifest.get("reachable_camera_count", 0) or 0)
+                task.stage_index = len(INGEST_STAGES) - 1 if not process_alive else 1
+                task.stage = INGEST_STAGES[task.stage_index]
+            else:
+                task.items_total = max(matched, downloaded, task.items_total)
+                task.items_completed = downloaded
+                task.stage_index = len(INGEST_STAGES) - 1 if not process_alive else 2
+                task.stage = INGEST_STAGES[task.stage_index]
 
     _update_progress_timestamp(task, previous_progress_state)
 
-    artifacts_ready = _artifacts_ready_for_task(task, output_root, is_review=is_review, is_approve=is_approve)
+    artifacts_ready = _artifacts_ready_for_task(task, output_root, is_review=is_review, is_approve=is_approve, is_ingest=is_ingest)
     last_activity_at = max(task.started_at, task.last_output_at, task.last_progress_at)
     stalled = process_alive and (now - last_activity_at) >= STALL_THRESHOLD_SECONDS
 
@@ -3433,6 +3960,17 @@ def _infer_progress(task: TaskState) -> None:
             task.stage = "Finalization failed"
         return
 
+    if task.returncode == 0 and is_ingest:
+        ingest_manifest = _load_ingest_manifest(output_root, started_at=task.started_at)
+        if ingest_manifest is not None:
+            task.status = "completed"
+            task.stage_index = len(INGEST_STAGES) - 1
+            task.stage = INGEST_STAGES[-1]
+        else:
+            task.status = "failed"
+            task.stage = "Ingest finalization failed"
+        return
+
     if task.returncode == 0 and artifacts_ready:
         task.status = "completed"
         if is_review:
@@ -3462,6 +4000,7 @@ def _status_payload(task: TaskState) -> Dict[str, object]:
         base = task.snapshot()
     output_root = _canonical_output_root_from_base(base)
     review_progress = _load_review_progress(output_root, started_at=float(base.get("started_at") or 0.0)) if "review-calibration" in base["command"] else None
+    ingest_manifest = _load_ingest_manifest(output_root, started_at=float(base.get("started_at") or 0.0)) if "ingest-ftps" in base["command"] else None
     review_validation = (
         _load_review_validation_with_completion_fallback(
             output_root,
@@ -3502,7 +4041,7 @@ def _status_payload(task: TaskState) -> Dict[str, object]:
     writeback_verification_report = _load_latest_writeback_verification_report(output_root) if output_root else None
     post_apply_report = _load_post_apply_verification(output_root) if output_root else None
     resolved_review_mode = normalize_review_mode(str(base.get("review_mode") or "full_contact_sheet")) if "review-calibration" in base["command"] else ""
-    stage_names = REVIEW_STAGES if "review-calibration" in base["command"] else APPROVAL_STAGES if "approve-master-rmd" in base["command"] else []
+    stage_names = REVIEW_STAGES if "review-calibration" in base["command"] else APPROVAL_STAGES if "approve-master-rmd" in base["command"] else INGEST_STAGES if "ingest-ftps" in base["command"] else []
     progress_percent = int(((base["stage_index"] + (1 if base["status"] == "completed" else 0)) / max(len(stage_names), 1)) * 100) if stage_names else 0
     can_cancel = bool(base.get("process_alive")) or base["status"] == "cancelling"
     last_activity_seconds = int(max(0.0, time.time() - max(float(base.get("last_output_at") or 0.0), float(base.get("last_progress_at") or 0.0), float(base.get("started_at") or 0.0))))
@@ -3547,6 +4086,8 @@ def _status_payload(task: TaskState) -> Dict[str, object]:
             "validation_path": review_validation.get("validation_path") if isinstance(review_validation, dict) else None,
             "validation_errors": validation_errors,
             "validation_warnings": validation_warnings,
+            "ingest_manifest": ingest_manifest,
+            "ingest_surface_html": _render_ingest_surface(ingest_manifest or {}),
             "decision_surface": operator_surfaces,
             "decision_surface_html": _render_decision_surface(operator_surfaces),
             "commit_table_html": _render_commit_table(operator_surfaces),
@@ -3608,6 +4149,12 @@ def _start_command_task(
             task.stage = REVIEW_STAGES[0]
             task.items_completed = 0
             task.items_total = clip_count
+        elif "ingest-ftps" in task.command:
+            task.total_stages = len(INGEST_STAGES)
+            task.stage_index = 0
+            task.stage = INGEST_STAGES[0]
+            task.items_completed = 0
+            task.items_total = 0
         elif "approve-master-rmd" in task.command:
             task.total_stages = len(APPROVAL_STAGES)
             task.stage_index = 0
@@ -3659,6 +4206,8 @@ def create_app() -> Flask:
 
     def render_page() -> str:
         state: UiState = app.config["UI_STATE"]
+        runtime_health = runtime_health_payload()
+        app.config["RUNTIME_HEALTH"] = runtime_health
         selected_clip_ids = _resolve_selected_clip_ids(state.form, state.scan)
         subset_ui = _subset_selection_ui(state.form, state.scan)
         task_payload = _status_payload(state.task)
@@ -3685,7 +4234,14 @@ def create_app() -> Flask:
             error=state.error,
             message=state.message,
             report_url=report_url,
-            runtime_health=app.config["RUNTIME_HEALTH"],
+            report_focus_labels={
+                "auto": report_focus_label("auto"),
+                "full": report_focus_label("full"),
+                "outliers": report_focus_label("outliers"),
+                "anchors": report_focus_label("anchors"),
+                "cluster_extremes": report_focus_label("cluster_extremes"),
+            },
+            runtime_health=runtime_health,
         )
 
     @app.get("/")
@@ -3742,6 +4298,81 @@ def create_app() -> Flask:
                 preview_mode=str(form.get("preview_mode", "")),
             )
             state.message = "Review command started."
+        return render_page()
+
+    @app.post("/discover-ftps")
+    def discover_ftps() -> str:
+        state: UiState = app.config["UI_STATE"]
+        form = _parse_form(request.form)
+        state.scan = _plan_ftps_scan(form)
+        form["resolved_output_path"] = _resolved_output_path_for_form(form, state.scan)
+        state.update_form(form)
+        error = _validate_ftps_ingest_form(form, action="discover")
+        state.error = error
+        state.message = None
+        if error is None:
+            command = build_ftps_ingest_web_command(app.config["REPO_ROOT"], form, action="discover")
+            _start_command_task(
+                state,
+                command,
+                str(_resolved_ingest_root_for_form(form)),
+                clip_count=0,
+                strategies_text="",
+                source_mode=str(form.get("source_mode", "")),
+                review_mode="",
+                preview_mode="",
+            )
+            state.message = "FTPS discovery started."
+        return render_page()
+
+    @app.post("/download-ftps")
+    def download_ftps() -> str:
+        state: UiState = app.config["UI_STATE"]
+        form = _parse_form(request.form)
+        state.scan = _plan_ftps_scan(form)
+        form["resolved_output_path"] = _resolved_output_path_for_form(form, state.scan)
+        state.update_form(form)
+        error = _validate_ftps_ingest_form(form, action="download")
+        state.error = error
+        state.message = None
+        if error is None:
+            command = build_ftps_ingest_web_command(app.config["REPO_ROOT"], form, action="download")
+            _start_command_task(
+                state,
+                command,
+                str(_resolved_ingest_root_for_form(form)),
+                clip_count=0,
+                strategies_text="",
+                source_mode=str(form.get("source_mode", "")),
+                review_mode="",
+                preview_mode="",
+            )
+            state.message = "FTPS download started."
+        return render_page()
+
+    @app.post("/retry-failed-ftps")
+    def retry_failed_ftps() -> str:
+        state: UiState = app.config["UI_STATE"]
+        form = _parse_form(request.form)
+        state.scan = _plan_ftps_scan(form)
+        form["resolved_output_path"] = _resolved_output_path_for_form(form, state.scan)
+        state.update_form(form)
+        error = _validate_ftps_ingest_form(form, action="retry-failed")
+        state.error = error
+        state.message = None
+        if error is None:
+            command = build_ftps_ingest_web_command(app.config["REPO_ROOT"], form, action="retry-failed")
+            _start_command_task(
+                state,
+                command,
+                str(_resolved_ingest_root_for_form(form)),
+                clip_count=0,
+                strategies_text="",
+                source_mode=str(form.get("source_mode", "")),
+                review_mode="",
+                preview_mode="",
+            )
+            state.message = "FTPS retry started."
         return render_page()
 
     @app.post("/approve-master-rmd")
@@ -4020,6 +4651,44 @@ def create_app() -> Flask:
         if not candidate.exists():
             return redirect(url_for("index"))
         return send_file(candidate)
+
+    @app.post("/browse-folder")
+    def browse_folder() -> Response:
+        field = str(request.form.get("field", "") or "").strip()
+        title = str(request.form.get("title", "") or "").strip()
+        current_path = str(request.form.get("current_path", "") or "").strip()
+        payload = _browse_folder_via_native_dialog(
+            str(app.config["REPO_ROOT"]),
+            field=field,
+            current_path=current_path,
+            title=title,
+        )
+        status_code = 200 if payload.get("ok") else 400
+        return jsonify(payload), status_code
+
+    @app.post("/browse-file")
+    def browse_file() -> Response:
+        field = str(request.form.get("field", "") or "").strip()
+        title = str(request.form.get("title", "") or "").strip()
+        current_path = str(request.form.get("current_path", "") or "").strip()
+        payload = _browse_file_via_native_dialog(
+            str(app.config["REPO_ROOT"]),
+            field=field,
+            current_path=current_path,
+            title=title,
+        )
+        status_code = 200 if payload.get("ok") else 400
+        return jsonify(payload), status_code
+
+    @app.post("/configure-redline")
+    def configure_redline() -> str:
+        state: UiState = app.config["UI_STATE"]
+        candidate_path = str(request.form.get("redline_executable", "") or "").strip()
+        payload = _persist_redline_configured_path(candidate_path)
+        state.error = None if payload.get("ok") else str(payload.get("error") or "Unable to save REDLine configuration.")
+        state.message = str(payload.get("message") or "") if payload.get("ok") else None
+        app.config["RUNTIME_HEALTH"] = runtime_health_payload()
+        return render_page()
 
     @app.get("/artifact")
     def artifact() -> Response:

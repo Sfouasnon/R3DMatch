@@ -16,20 +16,52 @@ There is no parallel custom contact-sheet PDF compositor path.
 
 The final contact sheet uses a deterministic page system built for WeasyPrint:
 
-- one `.page` container per camera
+- one `.page` container per report page
 - block layout plus inline-block only for row composition
 - no CSS grid or flexbox in the authored contact-sheet page layout
-- fixed four-part page structure:
-  - `.header`
-  - `.image-row`
-  - `.metrics`
-  - `.footer`
+- overview pages render before detailed per-camera pages for larger arrays
 
-Each camera page renders exactly three report images:
+Detailed camera pages now use a denser two-panel image row:
 
-- Original Frame
+- Original + Solve Overlay
 - Corrected Frame
-- Sphere Mask Overlay
+
+The standalone overlay panel was removed. The overlay now does real verification work in the before/after comparison row instead of occupying a separate third panel.
+
+## Large-array review behavior
+
+Large arrays now switch to overview-first review automatically.
+
+- threshold: `18` cameras
+- default focus for large arrays: `outliers`
+- explicit focus modes:
+  - `auto`
+  - `full`
+  - `outliers`
+  - `anchors`
+  - `cluster_extremes`
+
+The overview layer now summarizes:
+
+- camera count
+- excluded count
+- outlier count
+- center IRE range
+- median residual
+- default detail focus
+- recommended attention cameras
+- outliers / excluded cameras
+- anchors / references
+
+Overview tiles are sorted in physical-ish camera-label order and show:
+
+- camera label
+- PASS / REVIEW state
+- residual
+- scalar IRE
+- anchor / excluded context
+
+Detailed pages are then filtered according to the effective report focus instead of always exporting every camera first.
 
 ## Authoritative displayed values
 
@@ -53,6 +85,13 @@ Displayed values are:
 - `kelvin`
 - `tint`
 - validation residual
+
+The detailed metrics are grouped as:
+
+- Gray Exposure
+- Original WB Evaluation
+- Correction
+- Verification
 
 Important semantic rule:
 
@@ -111,21 +150,17 @@ It includes:
 
 The report keeps only decision-useful surfaces:
 
-- Original Frame
+- Original + Solve Overlay
 - Corrected Frame
-- Sphere Mask Overlay
 - key measurement values
+- original WB evaluation when truthfully available
 - correction values
 - validation residual
 - recommended action
-- one white-balance deviation chart when persisted values are available
+- one overview white-balance deviation chart when persisted values are available
+- overview exposure summary
 
-The first page/footer also carries:
-
-- `Original Array Synopsis`
-- `What To Look For`
-
-Low-value clutter was removed instead of preserved.
+Low-value clutter was removed instead of preserved. Large-array exports no longer force an operator to read every full camera page before seeing outliers and anchors.
 
 ## White-balance deviation chart
 
@@ -150,12 +185,20 @@ The report actions now read:
 - `Open Report (HTML)`
 - `Export PDF`
 
+The web review form now also exposes `Large-Array Export Focus`, which passes `--report-focus` through the review command so the operator can explicitly choose:
+
+- `Auto`
+- `All Cameras`
+- `Outliers Only`
+- `Anchors / References`
+- `Cluster Extremes`
+
 ## Validation completed
 
 Code validation:
 
 - `py_compile src/r3dmatch/report.py tests/test_cli.py`
-- `221 passed` in `tests/test_cli.py`
+- `227 passed` in `tests/test_cli.py`
 
 Real artifact probe:
 

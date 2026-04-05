@@ -11,6 +11,7 @@ from typing import Any, Iterable, Iterator, Mapping, Optional, Tuple
 
 import numpy as np
 
+from .app_resources import bundled_red_redistributable_dir
 from .identity import clip_id_from_path, group_key_from_clip_id, original_filename_from_path
 from .models import ClipMetadata
 
@@ -27,7 +28,16 @@ class RedSdkConfiguration:
     include_dir: Optional[Path]
     library_dir: Optional[Path]
     redistributable_dir: Optional[Path]
-    errors: tuple[str, ...]
+    redistributable_source: str = "missing"
+    errors: tuple[str, ...] = ()
+
+
+REQUIRED_RED_REDISTRIBUTABLE_FILES = (
+    "REDDecoder.dylib",
+    "REDMetal.dylib",
+    "REDOpenCL.dylib",
+    "REDR3D.dylib",
+)
 
 
 def _platform_red_sdk_library_dir(root: Path) -> Path:
@@ -64,6 +74,25 @@ def _normalize_path_for_compare(path: Optional[Path]) -> Optional[str]:
         return str(path)
 
 
+def red_redistributable_validation(redistributable_dir: Optional[Path]) -> tuple[str, ...]:
+    if redistributable_dir is None:
+        return ("RED SDK redistributable path could not be resolved. Set RED_SDK_ROOT or RED_SDK_REDISTRIBUTABLE_DIR.",)
+    if not redistributable_dir.exists():
+        return (f"RED SDK redistributable path does not exist: {redistributable_dir}",)
+    missing = [
+        filename
+        for filename in REQUIRED_RED_REDISTRIBUTABLE_FILES
+        if not (redistributable_dir / filename).exists()
+    ]
+    if missing:
+        return (
+            "RED SDK redistributable path is incomplete: missing "
+            + ", ".join(missing)
+            + f" in {redistributable_dir}",
+        )
+    return ()
+
+
 def resolve_red_sdk_configuration(environ: Optional[Mapping[str, str]] = None) -> RedSdkConfiguration:
     env = environ or os.environ
     root = _expand_env_path(env.get("RED_SDK_ROOT"))
@@ -73,36 +102,41 @@ def resolve_red_sdk_configuration(environ: Optional[Mapping[str, str]] = None) -
     include_dir = include_override
     library_dir = library_override
     redistributable_dir = redistributable_override
+    redistributable_source = "environment_override" if redistributable_override is not None else "missing"
     errors: list[str] = []
 
     if root is None:
-        errors.append(
-            "RED_SDK_ROOT is not set. Point it at your external RED SDK install, for example "
-            "'/Users/sfouasnon/Desktop/R3DSplat_Dependecies/RED_SDK/R3DSDKv9_2_0'."
-        )
+        if redistributable_dir is None:
+            bundled = bundled_red_redistributable_dir()
+            if bundled is not None:
+                redistributable_dir = bundled
+                redistributable_source = "bundled_app"
+            else:
+                errors.append(
+                    "RED_SDK_ROOT is not set. Point it at your external RED SDK install, for example "
+                    "'/Users/sfouasnon/Desktop/R3DSplat_Dependecies/RED_SDK/R3DSDKv9_2_0'."
+                )
     elif not root.exists():
         errors.append(f"RED_SDK_ROOT does not exist: {root}")
     else:
         include_dir = include_dir or (root / "Include")
         library_dir = library_dir or _platform_red_sdk_library_dir(root)
-        redistributable_dir = redistributable_dir or _platform_red_sdk_redistributable_dir(root)
+        if redistributable_dir is None:
+            redistributable_dir = _platform_red_sdk_redistributable_dir(root)
+            redistributable_source = "sdk_root"
 
     if root is not None and include_dir is not None and not include_dir.exists():
         errors.append(f"RED SDK include directory could not be resolved: {include_dir}")
     if root is not None and library_dir is not None and not library_dir.exists():
         errors.append(f"RED SDK library directory could not be resolved: {library_dir}")
-    if redistributable_dir is None:
-        errors.append(
-            "RED SDK redistributable path could not be resolved. Set RED_SDK_ROOT or RED_SDK_REDISTRIBUTABLE_DIR."
-        )
-    elif not redistributable_dir.exists():
-        errors.append(f"RED SDK redistributable path does not exist: {redistributable_dir}")
+    errors.extend(red_redistributable_validation(redistributable_dir))
 
     return RedSdkConfiguration(
         root=root,
         include_dir=include_dir,
         library_dir=library_dir,
         redistributable_dir=redistributable_dir,
+        redistributable_source=redistributable_source,
         errors=tuple(errors),
     )
 
@@ -132,9 +166,9 @@ def load_configured_red_native_module() -> Any:
     if config.errors:
         raise RuntimeError(red_sdk_configuration_error(config))
 
-    assert config.root is not None
     assert config.redistributable_dir is not None
-    os.environ["RED_SDK_ROOT"] = str(config.root)
+    if config.root is not None:
+        os.environ["RED_SDK_ROOT"] = str(config.root)
     os.environ["RED_SDK_REDISTRIBUTABLE_DIR"] = str(config.redistributable_dir)
 
     native = _load_red_native_module()

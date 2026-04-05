@@ -28,7 +28,7 @@ from .rcp2_websocket import (
 DEFAULT_RCP2_RAW_PORT = 1112
 DEFAULT_RCP2_WEBSOCKET_PORT = 9998
 DEFAULT_RCP2_PORT = DEFAULT_RCP2_WEBSOCKET_PORT
-DEFAULT_RCP2_SDK_ROOT = "/Users/sfouasnon/Desktop/R3DSplat_Dependecies/RCP_SDK_v6.62.0"
+DEFAULT_RCP2_SDK_ROOT = ""
 DEFAULT_CONNECT_TIMEOUT_MS = 4000
 DEFAULT_OPERATION_TIMEOUT_MS = 2500
 DEFAULT_CONNECT_RETRIES = 2
@@ -76,6 +76,17 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def resolve_rcp2_sdk_root(sdk_root: Optional[str] = None) -> str:
+    explicit = str(sdk_root or "").strip()
+    if explicit:
+        return explicit
+    for env_name in ("R3DMATCH_RCP2_SDK_ROOT", "RCP2_SDK_ROOT"):
+        value = str(os.environ.get(env_name, "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _live_bridge_source_path() -> Path:
     return Path(__file__).resolve().parent / "native" / "rcp2_live_bridge.c"
 
@@ -104,8 +115,10 @@ def _inventory_label_from_payload(entry: Dict[str, object]) -> Optional[str]:
 
 
 def _sdk_paths(sdk_root: str = DEFAULT_RCP2_SDK_ROOT) -> Dict[str, Path]:
-    root = Path(sdk_root).expanduser()
+    resolved_root = resolve_rcp2_sdk_root(sdk_root)
+    root = Path(resolved_root).expanduser() if resolved_root else Path()
     return {
+        "sdk_root_configured": Path(resolved_root).expanduser() if resolved_root else None,
         "sdk_root": root,
         "header_path": root / "rcp_sdk" / "rcp_api" / "rcp_api.h",
         "source_path": root / "rcp_sdk" / "rcp_api" / "rcp_api.c",
@@ -116,6 +129,11 @@ def _sdk_paths(sdk_root: str = DEFAULT_RCP2_SDK_ROOT) -> Dict[str, Path]:
 
 def _compile_live_bridge(sdk_root: str = DEFAULT_RCP2_SDK_ROOT) -> Path:
     paths = _sdk_paths(sdk_root)
+    if paths.get("sdk_root_configured") is None:
+        raise Rcp2ApplyError(
+            "RCP SDK root is not configured. Set R3DMATCH_RCP2_SDK_ROOT or RCP2_SDK_ROOT, "
+            "or pass --sdk-root when using the raw-legacy RCP2 transport."
+        )
     header_path = paths["header_path"]
     source_path = paths["source_path"]
     bridge_source_path = paths["bridge_source_path"]
@@ -172,7 +190,7 @@ def probe_rcp2_sdk(sdk_root: str = DEFAULT_RCP2_SDK_ROOT, *, ensure_live_bridge:
         except Exception as exc:  # pragma: no cover - exercised in live environments
             bridge_error = str(exc)
     return {
-        "sdk_root": str(paths["sdk_root"]),
+        "sdk_root": str(paths.get("sdk_root_configured") or ""),
         "header_path": str(paths["header_path"]),
         "source_path": str(paths["source_path"]),
         "bridge_source_path": str(paths["bridge_source_path"]),

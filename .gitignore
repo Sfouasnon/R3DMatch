@@ -14,7 +14,7 @@ dist/
 runs/
 out_*
 calibration_card/
-
+runs/
 # macOS
 .DS_Store
 
@@ -24,3 +24,4 @@ calibration_card/
 
 # Local scratch
 .codex_write_test
+src/original_report_file/

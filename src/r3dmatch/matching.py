@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import time
@@ -30,6 +31,17 @@ from .sdk import resolve_backend
 from .sidecar import write_sidecar_file
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def analyze_path(
     input_path: str,
     *,
@@ -54,6 +66,7 @@ def analyze_path(
     runtime_trace_path: Optional[str] = None,
     invocation_source: str = "direct_cli",
     measurement_source: str = "scene_sdk_decode_with_proxy_monitoring",
+    sphere_assist_path: Optional[str] = None,
 ) -> Dict[str, object]:
     analysis_started_at = time.perf_counter()
     emit_review_progress(
@@ -112,6 +125,7 @@ def analyze_path(
     rendered_preview_context = None
     if str(measurement_source or "").strip() == "rendered_preview_ipp2":
         rendered_preview_context = _resolve_rendered_preview_context()
+    sphere_assist_entries = _load_sphere_assist_entries(sphere_assist_path)
     emit_review_progress(
         progress_path,
         phase="measurement_start",
@@ -150,6 +164,7 @@ def analyze_path(
                 measurement_source=measurement_source,
                 measurement_output_dir=str(out_root),
                 rendered_preview_context=rendered_preview_context,
+                sphere_assist_entry=dict(sphere_assist_entries.get(clip_id) or {}) or None,
             )
         )
         emit_review_progress(
@@ -493,6 +508,7 @@ def analyze_clip(
     measurement_source: str = "scene_sdk_decode_with_proxy_monitoring",
     measurement_output_dir: Optional[str] = None,
     rendered_preview_context: Optional[Dict[str, object]] = None,
+    sphere_assist_entry: Optional[Dict[str, object]] = None,
 ) -> ClipResult:
     raise_if_cancelled("Run cancelled before clip decode.")
     clip_started_at = time.perf_counter()
@@ -535,6 +551,7 @@ def analyze_clip(
             rendered_preview_context=rendered_preview_context or _resolve_rendered_preview_context(),
             clip_started_at=clip_started_at,
             function_durations=function_durations,
+            sphere_assist_entry=sphere_assist_entry,
         )
 
     frame_stats: list[FrameStat] = []
@@ -714,6 +731,25 @@ def _resolve_rendered_preview_context() -> Dict[str, object]:
     }
 
 
+def _load_sphere_assist_entries(path: Optional[str]) -> Dict[str, Dict[str, object]]:
+    resolved = str(path or "").strip()
+    if not resolved:
+        return {}
+    assist_path = Path(resolved).expanduser().resolve()
+    payload = json.loads(assist_path.read_text(encoding="utf-8"))
+    raw_entries = payload.get("entries") or payload.get("clips") or {}
+    if isinstance(raw_entries, dict):
+        entries = [dict(value, clip_id=str(key)) if isinstance(value, dict) else {"clip_id": str(key)} for key, value in raw_entries.items()]
+    else:
+        entries = [dict(item) for item in raw_entries if isinstance(item, dict)]
+    mapping: Dict[str, Dict[str, object]] = {}
+    for entry in entries:
+        clip_id = str(entry.get("clip_id") or "").strip()
+        if clip_id:
+            mapping[clip_id] = entry
+    return mapping
+
+
 def _analyze_clip_via_rendered_preview(
     *,
     clip,
@@ -727,42 +763,49 @@ def _analyze_clip_via_rendered_preview(
     rendered_preview_context: Dict[str, object],
     clip_started_at: float,
     function_durations: Dict[str, float],
+    sphere_assist_entry: Optional[Dict[str, object]] = None,
 ) -> ClipResult:
-    from .report import _measure_rendered_preview_roi_ipp2, _preview_transform_label, render_preview_frame
+    from .report import (
+        _measure_rendered_preview_roi_ipp2,
+        _preview_transform_label,
+        _render_preview_frame_with_retries,
+        preview_still_extension,
+    )
 
     if measurement_output_dir is None:
         raise RuntimeError("Rendered-preview measurement requires a measurement output directory.")
     measurement_root = Path(measurement_output_dir).expanduser().resolve() / "previews" / "_measurement"
     measurement_root.mkdir(parents=True, exist_ok=True)
-    preview_path = measurement_root / f"{clip.clip_id}.original.analysis.measurement.jpg"
+    preview_extension = preview_still_extension(
+        str((rendered_preview_context.get("preview_settings") or {}).get("preview_still_format") or "tiff")
+    )
+    preview_path = measurement_root / f"{clip.clip_id}.original.analysis.measurement.{preview_extension}"
 
     render_started_at = time.perf_counter()
-    render = render_preview_frame(
+    render = _render_preview_frame_with_retries(
         source_path,
         str(preview_path),
+        clip_id=str(clip.clip_id),
+        variant="measurement_original",
         frame_index=int(sample_plan.start_frame),
         redline_executable=str(rendered_preview_context["redline_executable"]),
         redline_capabilities=dict(rendered_preview_context["redline_capabilities"]),
         preview_settings=dict(rendered_preview_context["preview_settings"]),
         use_as_shot_metadata=True,
+        max_attempts=4,
     )
     render_seconds = time.perf_counter() - render_started_at
     function_durations["render_preview_seconds"] = float(render_seconds)
-    if int(render["returncode"]) != 0:
-        raise RuntimeError(
-            f"REDLine preview render failed for {clip.clip_id} during lightweight measurement. "
-            f"Command: {' '.join(render['command'])}. STDERR: {str(render['stderr']).strip()}"
-        )
     actual_preview_path = Path(str(render["output_path"])).expanduser().resolve()
-    if not actual_preview_path.exists():
-        raise RuntimeError(
-            f"REDLine preview render did not create expected file for lightweight measurement: {actual_preview_path}"
-        )
+    preview_stat = actual_preview_path.stat()
+    measurement_epoch_seconds = time.time()
+    render_attempt_diagnostics = [dict(item) for item in list(render.get("attempt_diagnostics") or [])]
 
     measure_started_at = time.perf_counter()
     measured = _measure_rendered_preview_roi_ipp2(
         str(actual_preview_path),
         calibration_roi if str(target_type or "").strip().lower().replace("-", "_") == "gray_sphere" else calibration_roi,
+        manual_assist_entry=sphere_assist_entry,
     )
     measure_seconds = time.perf_counter() - measure_started_at
     function_durations["measure_rendered_preview_seconds"] = float(measure_seconds)
@@ -776,6 +819,62 @@ def _analyze_clip_via_rendered_preview(
     )
     raw_offset = float(global_reference - measured_log2)
     measurement_runtime = dict(measured.get("measurement_runtime") or {})
+    zone_measurements = [dict(item) for item in list(measured.get("zone_measurements") or [])]
+    zone_geometries = [
+        {
+            "label": str(item.get("label") or ""),
+            "display_label": str(item.get("display_label") or ""),
+            "bounds": dict(item.get("bounds") or {}),
+            "zone_fraction": float(item.get("zone_fraction", 0.0) or 0.0),
+            "sampling_method": str(item.get("sampling_method") or ""),
+        }
+        for item in zone_measurements
+    ]
+    measurement_provenance = {
+        "measurement_source_asset": {
+            "path": str(actual_preview_path),
+            "exists_at_measurement_time": True,
+            "file_size_bytes": int(preview_stat.st_size),
+            "sha256": _sha256_file(actual_preview_path),
+            "preview_format": actual_preview_path.suffix.lstrip(".").lower(),
+            "pixel_dtype": str(measured.get("rendered_image_dtype") or ""),
+            "bit_depth": measured.get("rendered_image_bit_depth"),
+            "normalization_denominator": measured.get("rendered_image_normalization_denominator"),
+            "image_dimensions": {
+                "width": int(measured.get("render_width", 0) or 0),
+                "height": int(measured.get("render_height", 0) or 0),
+            },
+            "measured_at_epoch_seconds": float(measurement_epoch_seconds),
+            "analysis_stage": "rendered_preview_measurement",
+        },
+        "render_identity": {
+            "source_path": str(Path(source_path).expanduser().resolve()),
+            "frame_index": int(sample_plan.start_frame),
+            "timestamp_seconds": float(sample_plan.start_frame / max(float(clip.fps or 24.0), 1e-6)),
+            "measurement_domain": "rendered_preview_ipp2",
+            "monitoring_preview_transform": _preview_transform_label(dict(rendered_preview_context["preview_settings"])),
+            "render_command": list(render.get("command") or []),
+            "redline_executable": str(rendered_preview_context.get("redline_executable") or ""),
+            "redline_capabilities": dict(rendered_preview_context.get("redline_capabilities") or {}),
+            "preview_settings": dict(rendered_preview_context.get("preview_settings") or {}),
+            "use_as_shot_metadata": True,
+            "render_returncode": int(render.get("returncode", 0) or 0),
+            "render_attempt_count": int(render.get("attempt_count", 1) or 1),
+            "render_recovered_after_retry": bool(render.get("recovered_after_retry")),
+            "render_attempt_diagnostics": render_attempt_diagnostics,
+        },
+        "measurement_geometry": {
+            "detected_sphere_roi": dict(measured.get("detected_sphere_roi") or {}),
+            "detected_gray_card_roi": dict(measured.get("detected_gray_card_roi") or {}),
+            "dominant_gradient_axis": dict(measured.get("dominant_gradient_axis") or {}),
+            "measurement_crop_bounds": dict(measured.get("measurement_crop_bounds") or {}),
+            "measurement_crop_size": dict(measured.get("measurement_crop_size") or {}),
+            "zone_geometry": zone_geometries,
+            "gray_target_class": str(measured.get("gray_target_class") or ""),
+            "gray_target_detection_method": str(measured.get("gray_target_detection_method") or ""),
+            "manual_assist_metadata": dict(measured.get("manual_assist_metadata") or {}),
+        },
+    }
     frame_runtime = {
         "frame_index": int(sample_plan.start_frame),
         "timestamp_seconds": float(sample_plan.start_frame / max(float(clip.fps or 24.0), 1e-6)),
@@ -783,6 +882,7 @@ def _analyze_clip_via_rendered_preview(
         "measure_frame_seconds": float(measure_seconds),
         "measurement_runtime": measurement_runtime,
         "rendered_image_path": str(actual_preview_path),
+        "measurement_provenance": measurement_provenance,
     }
     diagnostics = {
         "sampled_frames": 1,
@@ -810,12 +910,19 @@ def _analyze_clip_via_rendered_preview(
         "rendered_measurement_returncode": int(render.get("returncode", 0) or 0),
         "rendered_measurement_stdout": str(render.get("stdout") or ""),
         "rendered_measurement_stderr": str(render.get("stderr") or ""),
+        "rendered_measurement_attempt_count": int(render.get("attempt_count", 1) or 1),
+        "rendered_measurement_recovered_after_retry": bool(render.get("recovered_after_retry")),
+        "rendered_measurement_attempt_diagnostics": render_attempt_diagnostics,
         "rendered_measurement_source": "rendered_preview_ipp2",
         "rendered_measurement_domain": "rendered_preview_ipp2",
+        "measurement_provenance": measurement_provenance,
         "measurement_render_resolution": {
             "width": int(measured.get("render_width", 0) or 0),
             "height": int(measured.get("render_height", 0) or 0),
         },
+        "rendered_measurement_preview_format": str(measured.get("rendered_preview_format") or actual_preview_path.suffix.lstrip(".").lower()),
+        "rendered_measurement_image_dtype": str(measured.get("rendered_image_dtype") or ""),
+        "rendered_measurement_bit_depth": measured.get("rendered_image_bit_depth"),
         "workload_trace": {
             "representative_frame_index": int(sample_plan.start_frame),
             "frames_analyzed": 1,
@@ -825,7 +932,7 @@ def _analyze_clip_via_rendered_preview(
             "measurement_domain": "rendered_preview_ipp2",
             "measurement_source": "rendered_preview_ipp2",
             "detection_count": 1,
-            "gradient_axis_count": 1 if list(measured.get("zone_measurements") or []) else 0,
+            "gradient_axis_count": 1 if zone_measurements else 0,
             "region_stat_count": 1,
             "strategy_reuse": True,
             "render_time_seconds": float(render_seconds),
@@ -846,7 +953,7 @@ def _analyze_clip_via_rendered_preview(
             "decode_height": int(measured.get("render_height", 0) or 0),
             "decode_half_res": False,
             "detection_count": 1,
-            "gradient_axis_count": 1 if list(measured.get("zone_measurements") or []) else 0,
+            "gradient_axis_count": 1 if zone_measurements else 0,
             "region_stat_count": 1,
             "strategy_reuse": True,
             "durations_seconds": dict(function_durations),
@@ -873,7 +980,12 @@ def _analyze_clip_via_rendered_preview(
             "bottom_ire": float(measured.get("bottom_ire", 0.0) or 0.0),
             "zone_spread_ire": float(measured.get("zone_spread_ire", 0.0) or 0.0),
             "zone_spread_stops": float(measured.get("zone_spread_stops", 0.0) or 0.0),
-            "zone_measurements": [dict(item) for item in list(measured.get("zone_measurements") or [])],
+            "zone_measurements": zone_measurements,
+            "gray_target_class": str(measured.get("gray_target_class") or ""),
+            "gray_target_detection_method": str(measured.get("gray_target_detection_method") or ""),
+            "gray_target_confidence": float(measured.get("gray_target_confidence", 0.0) or 0.0),
+            "gray_target_fallback_used": bool(measured.get("gray_target_fallback_used")),
+            "gray_target_review_recommended": bool(measured.get("gray_target_review_recommended")),
             "sphere_detection_confidence": float(measured.get("sphere_detection_confidence", 0.0) or 0.0),
             "sphere_detection_label": str(measured.get("sphere_detection_label") or ""),
             "sphere_detection_source": str(measured.get("sphere_roi_source") or ""),

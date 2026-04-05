@@ -802,6 +802,18 @@ def _measure_pixel_cloud_statistics(
     low_percentile: float = 5.0,
     high_percentile: float = 95.0,
 ) -> Dict[str, object]:
+    def _bounded_rgb_preview(values: np.ndarray, *, limit: int = 24) -> Dict[str, object]:
+        preview = np.asarray(values, dtype=np.float32).reshape(-1, 3)
+        bounded = preview[: min(limit, preview.shape[0])]
+        return {
+            "count": int(preview.shape[0]),
+            "normalized_rgb_preview": [[float(channel) for channel in row] for row in bounded.tolist()],
+            "uint8_rgb_preview": [
+                [int(round(float(np.clip(channel, 0.0, 1.0)) * 255.0)) for channel in row]
+                for row in bounded.tolist()
+            ],
+        }
+
     pixel_array = np.asarray(pixels, dtype=np.float32).reshape(-1, 3)
     if pixel_array.size == 0:
         raise ValueError("sample region produced no pixels")
@@ -861,6 +873,18 @@ def _measure_pixel_cloud_statistics(
         "mask_fraction": float(mask_fraction),
         "interior_fraction": float(interior_fraction),
         "interior_radius_ratio": float(interior_radius_ratio),
+        "pixel_trace": {
+            "raw_rgb_preview": _bounded_rgb_preview(pixel_array),
+            "valid_rgb_preview": _bounded_rgb_preview(valid_pixels),
+            "trimmed_rgb_preview": _bounded_rgb_preview(trimmed_pixels),
+            "raw_luminance_preview": [float(value) for value in luminance[: min(32, luminance.size)].tolist()],
+            "valid_luminance_preview": [float(value) for value in valid_luminance[: min(32, valid_luminance.size)].tolist()],
+            "trimmed_luminance_preview": [float(value) for value in trimmed_luminance[: min(32, trimmed_luminance.size)].tolist()],
+            "trimmed_log2_preview": [float(value) for value in log_values[: min(32, log_values.size)].tolist()],
+            "median_trimmed_luminance": float(np.median(trimmed_luminance)) if trimmed_luminance.size else 0.0,
+            "median_log2_luminance": float(measurement["measured_log2_luminance"]),
+            "computed_ire": float((2.0 ** float(measurement["measured_log2_luminance"])) * 100.0),
+        },
     }
 
 
@@ -1105,6 +1129,7 @@ def measure_sphere_zone_profile_statistics(
                 "confidence": float(zone_stats["confidence"]),
                 "sampling_method": str(zone_stats["sampling_method"]),
                 "zone_fraction": zone_fraction,
+                "pixel_trace": dict(zone_stats.get("pixel_trace") or {}),
             }
         )
     zone_measurement_seconds = time.perf_counter() - zone_measurement_started_at

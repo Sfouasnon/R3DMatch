@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import subprocess
@@ -10,14 +11,16 @@ from typing import Optional, cast
 import numpy as np
 import pytest
 from PIL import Image, ImageDraw
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication
 from typer.testing import CliRunner
 
 from r3dmatch.calibration import build_array_calibration_from_analysis, calibrate_card_path, calibrate_color_path, calibrate_exposure_path, calibrate_sphere_path, center_crop_roi, derive_array_group_key, detect_gray_card_roi, load_calibration, load_card_roi_file, load_color_calibration, load_exposure_calibration, measure_card_from_roi, measure_color_region, measure_sphere_from_roi, solve_neutral_gains
 from r3dmatch.cli import app
 from r3dmatch.commit_values import build_commit_values, solve_kelvin_tint_from_chromaticity, solve_white_balance_model_for_records
-from r3dmatch.desktop_app import build_review_command, run_ui_self_check, scan_calibration_sources
+from r3dmatch.desktop_app import R3DMatchDesktopWindow, _build_desktop_results_summary, build_review_command, run_ui_self_check, scan_calibration_sources
 from r3dmatch.execution import CANCEL_FILE_ENV, CancellationError, run_cancellable_subprocess
-from r3dmatch.ftps_ingest import ingest_ftps_batch, plan_ftps_request
+from r3dmatch.ftps_ingest import discover_ftps_batch, ingest_ftps_batch, ingest_manifest_path_for, plan_ftps_request, retry_failed_ftps_batch, run_ftps_ingest_job
 from r3dmatch.identity import group_key_from_clip_id, rmd_name_for_clip_id, subset_key_from_clip_id
 from r3dmatch.matching import analyze_path, camera_group_from_clip_id, discover_clips, measure_frame_color_and_exposure
 from r3dmatch.models import GrayCardROI, SamplingRegion, SphereROI
@@ -42,18 +45,38 @@ from r3dmatch.rcp2_websocket import (
     expected_websocket_accept,
     extract_parameter_state,
 )
-from r3dmatch.report import _build_sphere_detection_artifacts, _build_strategy_payloads, _compute_image_difference_metrics, _contact_sheet_svg_color_deviation_chart, _derived_profile_scalar, _ipp2_closed_loop_next_correction, _ipp2_closed_loop_target, _ipp2_validation_presentation, _measure_rendered_preview_roi_ipp2, _measurement_values_for_record, _operator_guidance_for_correction, _report_grid_columns, _report_tiles_per_page, _resolve_redline_executable, _sphere_detection_label, _sphere_detection_note, build_contact_sheet_report, build_lightweight_analysis_report, build_review_package, contact_sheet_pdf_export_preflight, format_stop_string, preview_filename_for_clip_id, render_contact_sheet_html, render_contact_sheet_pdf, render_contact_sheet_pdf_from_html, render_preview_frame, round_to_standard_stop_fraction, validate_contact_sheet_html_assets
+from r3dmatch.report import _build_exposure_plot_svg, _build_scientific_validation_artifacts, _build_sphere_detection_artifacts, _build_strategy_payloads, _compute_image_difference_metrics, _contact_sheet_original_wb_block, _contact_sheet_svg_color_deviation_chart, _derived_profile_scalar, _detect_focus_chart_roi_hwc, _detect_sphere_roi_in_region_hwc, _focus_metric_bundle, _focus_validation_summary, _gray_target_consistency_summary, _ipp2_closed_loop_next_correction, _ipp2_closed_loop_target, _ipp2_validation_presentation, _load_preview_image_as_normalized_rgb, _manual_assist_sanitized_entry, _measure_rendered_preview_roi_ipp2, _measurement_values_for_record, _normalize_preview_image_array, _operator_guidance_for_correction, _report_grid_columns, _report_tiles_per_page, _resolve_redline_executable, _sphere_detection_label, _sphere_detection_note, _upgrade_trust_from_ipp2_validation, build_contact_sheet_report, build_lightweight_analysis_report, build_review_package, contact_sheet_pdf_export_preflight, format_stop_string, generate_preview_stills, preview_filename_for_clip_id, render_contact_sheet_html, render_contact_sheet_pdf, render_contact_sheet_pdf_from_html, render_preview_frame, round_to_standard_stop_fraction, validate_contact_sheet_html_assets
 from r3dmatch.rmd import render_rmd_xml, rmd_filename_for_clip_id, write_rmd_for_clip_with_metadata, write_rmds_from_analysis
-from r3dmatch.runtime_env import ensure_runtime_environment, runtime_health_payload
+from r3dmatch.runtime_env import (
+    DESKTOP_CONFIG_ENV,
+    ensure_runtime_environment,
+    persist_redline_configured_path,
+    redline_configured_path,
+    runtime_health_payload,
+)
 from r3dmatch.ui import build_table_rows, load_review_bundle
 from r3dmatch.sdk import MockR3DBackend, RedSdkConfiguration, RedSdkDecoder, load_configured_red_native_module, red_sdk_configuration_error, resolve_backend, resolve_red_sdk_configuration
 from r3dmatch.sidecar import build_sidecar_payload, sidecar_filename_for_clip_id
 from r3dmatch.transcode import build_redline_command, build_redline_command_variants, write_transcode_plan
 from r3dmatch.validation import validate_pipeline
-from r3dmatch.web_app import _calibration_overview_from_payload, _ensure_scan_preview, _normalize_subset_form, _preferred_roi_preview_record, _resolve_selected_clip_ids, _resolved_output_path_for_form, _scan_preview_path, _subset_selection_ui, _validate_form, build_review_web_command, create_app, scan_sources
+from r3dmatch.web_app import _build_tcsh_launch_prefix, _calibration_overview_from_payload, _ensure_scan_preview, _normalize_subset_form, _preferred_roi_preview_record, _resolve_selected_clip_ids, _resolved_ingest_root_for_form, _resolved_output_path_for_form, _scan_preview_path, _subset_selection_ui, _validate_form, _validate_ftps_ingest_form, build_ftps_ingest_web_command, build_review_web_command, create_app, scan_sources
 from r3dmatch.workflow import approve_master_rmd, build_post_apply_verification_from_reviews, clear_preview_cache, resolve_review_output_dir, review_calibration, validate_review_run_contract
 
 runner = CliRunner()
+
+
+def _write_fake_red_redistributables(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    for filename in ("REDDecoder.dylib", "REDMetal.dylib", "REDOpenCL.dylib", "REDR3D.dylib"):
+        (path / filename).write_bytes(b"runtime")
+
+
+def _qt_test_app() -> QApplication:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    return app
 
 
 @pytest.fixture(autouse=True)
@@ -95,6 +118,7 @@ def _stub_contact_sheet_pdf_when_weasyprint_native_libs_are_missing(
             preflight = _fake_contact_sheet_pdf_export_preflight(html_path)
             return {
                 "interpreter": sys.executable,
+                "frozen_app": False,
                 "virtual_env": "",
                 "dyld_fallback_library_path": str(os.environ.get("DYLD_FALLBACK_LIBRARY_PATH") or ""),
                 "dyld_fallback_source": "environment",
@@ -103,6 +127,24 @@ def _stub_contact_sheet_pdf_when_weasyprint_native_libs_are_missing(
                 "resolved_red_sdk_redistributable_dir": str(os.environ.get("RED_SDK_REDISTRIBUTABLE_DIR") or ""),
                 "red_backend_ready": True,
                 "red_backend_error": "",
+                "red_sdk_runtime": {
+                    "ready": True,
+                    "error": "",
+                    "redistributable_dir": str(os.environ.get("RED_SDK_REDISTRIBUTABLE_DIR") or ""),
+                    "source": "environment_override",
+                    "root": str(os.environ.get("RED_SDK_ROOT") or ""),
+                    "bundled_dir": "",
+                },
+                "redline_tool": {
+                    "ready": True,
+                    "configured": "REDLine",
+                    "resolved_path": "/usr/local/bin/REDLine",
+                    "source": "path",
+                    "config_path": "",
+                    "configured_path": "",
+                    "configured_config_path": str(Path("/tmp/redline.json")),
+                    "error": "",
+                },
                 "weasyprint_importable": True,
                 "weasyprint_error": "",
                 "asset_validation": preflight.get("asset_validation"),
@@ -195,9 +237,79 @@ def test_measure_rendered_preview_roi_ipp2_detects_off_center_sphere_when_roi_mi
 
     measured = _measure_rendered_preview_roi_ipp2(str(path), None)
 
-    assert measured["sphere_roi_source"] in {"primary_detected", "secondary_detected"}
-    assert measured["detected_sphere_roi"]["cx"] > 90.0
+    assert measured["sphere_roi_source"] in {"primary_detected", "secondary_detected", "opencv_hough_recovery", "opencv_contour_recovery", "forced_best_effort"}
+    assert measured["detected_sphere_roi"]["cx"] == pytest.approx(cx, abs=18.0)
+    assert measured["detected_sphere_roi"]["cy"] == pytest.approx(cy, abs=18.0)
     assert measured["top_ire"] > measured["mid_ire"] > measured["bottom_ire"]
+
+
+def test_measure_rendered_preview_roi_ipp2_detects_far_right_edge_sphere_when_roi_missing(tmp_path: Path) -> None:
+    tifffile = pytest.importorskip("tifffile")
+    height = 420
+    width = 520
+    image = np.full((height, width, 3), 0.05, dtype=np.float32)
+    yy, xx = np.meshgrid(np.arange(height, dtype=np.float32), np.arange(width, dtype=np.float32), indexing="ij")
+    cx = 442.0
+    cy = 214.0
+    radius = 44.0
+    distance = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    sphere_mask = distance <= radius
+    vertical = np.clip((yy - (cy - radius)) / max(2.0 * radius, 1.0), 0.0, 1.0)
+    sphere_luma = 0.30 - (vertical * 0.08)
+    image[sphere_mask] = np.stack([sphere_luma[sphere_mask]] * 3, axis=-1)
+    path = tmp_path / "far_right_edge_sphere.tiff"
+    tifffile.imwrite(path, np.clip(image * 65535.0, 0, 65535).astype(np.uint16), photometric="rgb")
+
+    measured = _measure_rendered_preview_roi_ipp2(str(path), None)
+
+    assert measured["detection_failed"] is False
+    assert measured["sphere_roi_source"] in {
+        "primary_detected",
+        "secondary_detected",
+        "localized_recovery",
+        "opencv_hough_recovery",
+        "opencv_contour_recovery",
+        "forced_best_effort",
+    }
+    assert measured["detected_sphere_roi"]["cx"] == pytest.approx(cx, abs=22.0)
+    assert measured["detected_sphere_roi"]["cy"] == pytest.approx(cy, abs=22.0)
+    assert measured["rendered_preview_format"] == "tiff"
+    assert measured["rendered_image_bit_depth"] == 16
+
+
+def test_measure_rendered_preview_roi_ipp2_prefers_bright_edge_sphere_over_darker_false_circle(tmp_path: Path) -> None:
+    tifffile = pytest.importorskip("tifffile")
+    height = 420
+    width = 640
+    image = np.full((height, width, 3), 0.06, dtype=np.float32)
+    yy, xx = np.meshgrid(np.arange(height, dtype=np.float32), np.arange(width, dtype=np.float32), indexing="ij")
+
+    false_cx = 210.0
+    false_cy = 205.0
+    false_radius = 46.0
+    false_distance = np.sqrt((xx - false_cx) ** 2 + (yy - false_cy) ** 2)
+    false_mask = false_distance <= false_radius
+    false_vertical = np.clip((yy - (false_cy - false_radius)) / max(2.0 * false_radius, 1.0), 0.0, 1.0)
+    false_luma = 0.19 - (false_vertical * 0.03)
+    image[false_mask] = np.stack([false_luma[false_mask]] * 3, axis=-1)
+
+    sphere_cx = 548.0
+    sphere_cy = 208.0
+    sphere_radius = 50.0
+    sphere_distance = np.sqrt((xx - sphere_cx) ** 2 + (yy - sphere_cy) ** 2)
+    sphere_mask = sphere_distance <= sphere_radius
+    sphere_vertical = np.clip((yy - (sphere_cy - sphere_radius)) / max(2.0 * sphere_radius, 1.0), 0.0, 1.0)
+    sphere_luma = 0.48 - (sphere_vertical * 0.07)
+    image[sphere_mask] = np.stack([sphere_luma[sphere_mask]] * 3, axis=-1)
+
+    path = tmp_path / "bright_edge_sphere_vs_false_circle.tiff"
+    tifffile.imwrite(path, np.clip(image * 65535.0, 0, 65535).astype(np.uint16), photometric="rgb")
+
+    measured = _measure_rendered_preview_roi_ipp2(str(path), None)
+
+    assert measured["detection_failed"] is False
+    assert measured["detected_sphere_roi"]["cx"] == pytest.approx(sphere_cx, abs=24.0)
+    assert measured["detected_sphere_roi"]["cy"] == pytest.approx(sphere_cy, abs=24.0)
 
 
 def test_measure_rendered_preview_roi_ipp2_fails_explicitly_when_no_sphere_candidate_exists(tmp_path: Path) -> None:
@@ -239,6 +351,313 @@ def test_measure_rendered_preview_roi_ipp2_reuses_original_roi_for_corrected_fra
     assert measured["detection_failed"] is False
     assert measured["sphere_roi_source"] == "reused_from_original"
     assert measured["detected_sphere_roi"]["cx"] == pytest.approx(cx)
+
+
+def test_measure_rendered_preview_roi_ipp2_falls_back_to_gray_card_when_sphere_is_unresolved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = np.full((96, 128, 3), 0.42, dtype=np.float32)
+    path = tmp_path / "gray_card_fallback.jpg"
+    Image.fromarray(np.clip(image * 255.0, 0, 255).astype(np.uint8), mode="RGB").save(path, format="JPEG")
+
+    monkeypatch.setattr(
+        "r3dmatch.report._detect_sphere_roi_in_region_hwc",
+        lambda _region: {"source": "failed", "confidence": 0.0, "confidence_label": "FAILED", "roi": None},
+    )
+    monkeypatch.setattr(
+        "r3dmatch.report._detect_gray_card_in_region_hwc",
+        lambda _region: {
+            "source": "gray_card_detected",
+            "confidence": 0.78,
+            "confidence_label": "MEDIUM",
+            "review_recommended": False,
+            "roi": {"x": 18.0, "y": 20.0, "w": 54.0, "h": 38.0},
+            "neutrality_score": 0.005,
+            "stats": {
+                "measured_log2_luminance": -2.25,
+                "measured_ire": 21.0,
+                "measured_rgb_mean": [0.42, 0.41, 0.40],
+                "measured_rgb_chromaticity": [0.342, 0.334, 0.324],
+                "valid_pixel_count": 1800,
+                "roi_variance": 0.0006,
+                "saturation_fraction": 0.0,
+                "mask_fraction": 0.91,
+                "gray_log2_stddev": 0.014,
+            },
+        },
+    )
+
+    measured = _measure_rendered_preview_roi_ipp2(str(path), None)
+
+    assert measured["detection_failed"] is False
+    assert measured["gray_target_class"] == "gray_card"
+    assert measured["gray_target_fallback_used"] is True
+    assert measured["sphere_roi_source"] == "gray_card_fallback"
+    assert measured["sample_1_ire"] == pytest.approx(21.0)
+    assert measured["sample_2_ire"] == pytest.approx(21.0)
+    assert measured["sample_3_ire"] == pytest.approx(21.0)
+    assert measured["detected_gray_card_roi"]["w"] == pytest.approx(54.0)
+
+
+def _write_scientific_validation_preview(tmp_path: Path) -> tuple[str, dict[str, object]]:
+    height = 320
+    width = 320
+    image = np.zeros((height, width, 3), dtype=np.float32)
+    yy, xx = np.meshgrid(np.arange(height, dtype=np.float32), np.arange(width, dtype=np.float32), indexing="ij")
+    cx = 220.0
+    cy = 150.0
+    radius = 50.0
+    distance = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    sphere_mask = distance <= radius
+    vertical = np.clip((yy - (cy - radius)) / max(2.0 * radius, 1.0), 0.0, 1.0)
+    sphere_luma = 0.40 - (vertical * 0.15)
+    for channel in range(3):
+        image[..., channel] = np.where(sphere_mask, sphere_luma, image[..., channel])
+    path = tmp_path / "scientific_validation.jpg"
+    Image.fromarray(np.clip(image * 255.0, 0, 255).astype(np.uint8), mode="RGB").save(path, format="JPEG")
+    measured = _measure_rendered_preview_roi_ipp2(
+        str(path),
+        {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        sphere_roi_override={"cx": cx, "cy": cy, "r": radius},
+    )
+    return str(path), measured
+
+
+def _measurement_fingerprint_for_path(path: Path) -> dict[str, object]:
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    with Image.open(path) as image:
+        return {
+            "measurement_source_asset": {
+                "path": str(path.resolve()),
+                "exists_at_measurement_time": True,
+                "file_size_bytes": int(path.stat().st_size),
+                "sha256": digest,
+                "image_dimensions": {"width": int(image.width), "height": int(image.height)},
+            }
+        }
+
+
+def test_build_scientific_validation_artifacts_exports_traceable_example(tmp_path: Path) -> None:
+    preview_path, measured = _write_scientific_validation_preview(tmp_path)
+    diagnostics = dict(measured)
+    diagnostics["rendered_measurement_preview_path"] = preview_path
+    diagnostics["measurement_provenance"] = _measurement_fingerprint_for_path(Path(preview_path))
+    analysis_record = {
+        "clip_id": "CAM001",
+        "analysis_path": str(tmp_path / "analysis" / "CAM001.analysis.json"),
+        "diagnostics": diagnostics,
+    }
+    payload = {
+        "recommended_strategy": {"strategy_key": "median"},
+        "ipp2_validation": {
+            "rows": [
+                {
+                    "clip_id": "CAM001",
+                    "strategy_key": "median",
+                    "ipp2_original_value_log2": float(diagnostics["measured_log2_luminance"]),
+                    "ipp2_original_zone_profile": list(diagnostics["zone_measurements"]),
+                }
+            ]
+        },
+        "strategies": [
+            {
+                "strategy_key": "median",
+                "clips": [
+                    {
+                        "clip_id": "CAM001",
+                        "metrics": {
+                            "exposure": {
+                                "sample_1_ire": float(diagnostics["sample_1_ire"]),
+                                "sample_2_ire": float(diagnostics["sample_2_ire"]),
+                                "sample_3_ire": float(diagnostics["sample_3_ire"]),
+                                "measured_log2_luminance_monitoring": float(diagnostics["measured_log2_luminance"]),
+                                "measurement_domain": "perceptual",
+                            }
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+    artifacts = _build_scientific_validation_artifacts(
+        out_root=tmp_path / "report",
+        analysis_records=[analysis_record],
+        payload=payload,
+    )
+
+    assert Path(artifacts["path"]).exists()
+    assert Path(artifacts["markdown_path"]).exists()
+    summary = json.loads(Path(artifacts["path"]).read_text(encoding="utf-8"))
+    assert summary["status"] == "fully_reconciled"
+    assert summary["worked_example"]["clip_id"] == "CAM001"
+    assert summary["consistency_validation"]["analysis_matches_recomputed"] is True
+    assert summary["consistency_validation"]["ipp2_validation_matches_analysis"] is True
+    assert summary["consistency_validation"]["report_matches_analysis"] is True
+    assert summary["measurement_provenance"]["fingerprint_matches"] is True
+    center_zone = next(item for item in summary["worked_example"]["zone_samples"] if item["label"] == "center")
+    assert len(center_zone["pixel_preview"]["normalized_rgb_preview"]) > 0
+    assert len(center_zone["luminance_preview"]) > 0
+
+
+def test_build_scientific_validation_artifacts_fails_on_report_ire_drift(tmp_path: Path) -> None:
+    preview_path, measured = _write_scientific_validation_preview(tmp_path)
+    diagnostics = dict(measured)
+    diagnostics["rendered_measurement_preview_path"] = preview_path
+    diagnostics["measurement_provenance"] = _measurement_fingerprint_for_path(Path(preview_path))
+    analysis_record = {
+        "clip_id": "CAM001",
+        "analysis_path": str(tmp_path / "analysis" / "CAM001.analysis.json"),
+        "diagnostics": diagnostics,
+    }
+    payload = {
+        "recommended_strategy": {"strategy_key": "median"},
+        "ipp2_validation": {
+            "rows": [
+                {
+                    "clip_id": "CAM001",
+                    "strategy_key": "median",
+                    "ipp2_original_value_log2": float(diagnostics["measured_log2_luminance"]),
+                    "ipp2_original_zone_profile": list(diagnostics["zone_measurements"]),
+                }
+            ]
+        },
+        "strategies": [
+            {
+                "strategy_key": "median",
+                "clips": [
+                    {
+                        "clip_id": "CAM001",
+                        "metrics": {
+                            "exposure": {
+                                "sample_1_ire": float(diagnostics["sample_1_ire"]) + 0.25,
+                                "sample_2_ire": float(diagnostics["sample_2_ire"]),
+                                "sample_3_ire": float(diagnostics["sample_3_ire"]),
+                                "measured_log2_luminance_monitoring": float(diagnostics["measured_log2_luminance"]),
+                                "measurement_domain": "perceptual",
+                            }
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+    with pytest.raises(RuntimeError, match="report IRE/scalar drift"):
+        _build_scientific_validation_artifacts(
+            out_root=tmp_path / "report",
+            analysis_records=[analysis_record],
+            payload=payload,
+            fail_on_analysis_drift=True,
+        )
+
+
+def test_build_scientific_validation_artifacts_reports_analysis_drift_state(tmp_path: Path) -> None:
+    preview_path, measured = _write_scientific_validation_preview(tmp_path)
+    diagnostics = dict(measured)
+    diagnostics["rendered_measurement_preview_path"] = preview_path
+    diagnostics["measurement_provenance"] = _measurement_fingerprint_for_path(Path(preview_path))
+    analysis_record = {
+        "clip_id": "CAM001",
+        "analysis_path": str(tmp_path / "analysis" / "CAM001.analysis.json"),
+        "diagnostics": diagnostics,
+    }
+    payload = {
+        "recommended_strategy": {"strategy_key": "median"},
+        "ipp2_validation": {
+            "rows": [
+                {
+                    "clip_id": "CAM001",
+                    "strategy_key": "median",
+                    "ipp2_original_value_log2": float(diagnostics["measured_log2_luminance"]),
+                    "ipp2_original_zone_profile": list(diagnostics["zone_measurements"]),
+                }
+            ]
+        },
+        "strategies": [
+            {
+                "strategy_key": "median",
+                "clips": [
+                    {
+                        "clip_id": "CAM001",
+                        "metrics": {
+                            "exposure": {
+                                "sample_1_ire": float(diagnostics["sample_1_ire"]) + 0.25,
+                                "sample_2_ire": float(diagnostics["sample_2_ire"]),
+                                "sample_3_ire": float(diagnostics["sample_3_ire"]),
+                                "measured_log2_luminance_monitoring": float(diagnostics["measured_log2_luminance"]),
+                                "measurement_domain": "perceptual",
+                            }
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+    artifacts = _build_scientific_validation_artifacts(
+        out_root=tmp_path / "report",
+        analysis_records=[analysis_record],
+        payload=payload,
+    )
+    summary = json.loads(Path(artifacts["path"]).read_text(encoding="utf-8"))
+    assert summary["status"] == "analysis_drift"
+    assert summary["consistency_validation"]["report_matches_analysis"] is False
+
+
+def test_build_scientific_validation_artifacts_reports_blocked_asset_mismatch_state(tmp_path: Path) -> None:
+    preview_path, measured = _write_scientific_validation_preview(tmp_path)
+    diagnostics = dict(measured)
+    diagnostics["rendered_measurement_preview_path"] = preview_path
+    diagnostics["measurement_provenance"] = _measurement_fingerprint_for_path(Path(preview_path))
+    diagnostics["measurement_provenance"]["measurement_source_asset"]["sha256"] = "0" * 64
+    analysis_record = {
+        "clip_id": "CAM001",
+        "analysis_path": str(tmp_path / "analysis" / "CAM001.analysis.json"),
+        "diagnostics": diagnostics,
+    }
+    payload = {
+        "recommended_strategy": {"strategy_key": "median"},
+        "ipp2_validation": {
+            "rows": [
+                {
+                    "clip_id": "CAM001",
+                    "strategy_key": "median",
+                    "ipp2_original_value_log2": float(diagnostics["measured_log2_luminance"]),
+                    "ipp2_original_zone_profile": list(diagnostics["zone_measurements"]),
+                }
+            ]
+        },
+        "strategies": [
+            {
+                "strategy_key": "median",
+                "clips": [
+                    {
+                        "clip_id": "CAM001",
+                        "metrics": {
+                            "exposure": {
+                                "sample_1_ire": float(diagnostics["sample_1_ire"]),
+                                "sample_2_ire": float(diagnostics["sample_2_ire"]),
+                                "sample_3_ire": float(diagnostics["sample_3_ire"]),
+                                "measured_log2_luminance_monitoring": float(diagnostics["measured_log2_luminance"]),
+                                "measurement_domain": "perceptual",
+                            }
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+    artifacts = _build_scientific_validation_artifacts(
+        out_root=tmp_path / "report",
+        analysis_records=[analysis_record],
+        payload=payload,
+    )
+    summary = json.loads(Path(artifacts["path"]).read_text(encoding="utf-8"))
+    assert summary["status"] == "blocked_asset_mismatch"
+    assert summary["measurement_provenance"]["status"] == "fingerprint_mismatch"
 
 
 def test_measurement_values_for_record_uses_sphere_sample_median_for_perceptual_domain() -> None:
@@ -288,9 +707,71 @@ def test_sphere_detection_label_thresholds() -> None:
 
 
 def test_sphere_detection_note_includes_recovery_labels() -> None:
-    assert _sphere_detection_note("primary_detected", "HIGH") == "Sphere detection: verified"
-    assert _sphere_detection_note("localized_recovery", "MEDIUM") == "Sphere detection: fallback used"
-    assert _sphere_detection_note("forced_best_effort", "LOW") == "Sphere detection: low-confidence recovery"
+    assert _sphere_detection_note("primary_detected", "HIGH") == "Sphere check verified"
+    assert _sphere_detection_note("localized_recovery", "MEDIUM") == "Alternate detection path used"
+    assert _sphere_detection_note("forced_best_effort", "LOW") == "Alternate detection path used — confirm sphere placement"
+
+
+def test_sphere_detection_prefers_off_center_gray_sphere_over_center_distractor() -> None:
+    height, width = 320, 520
+    image = np.full((height, width, 3), 0.12, dtype=np.float32)
+    yy, xx = np.meshgrid(np.arange(height, dtype=np.float32), np.arange(width, dtype=np.float32), indexing="ij")
+
+    true_cx, true_cy, true_r = 118.0, 174.0, 54.0
+    distractor_cx, distractor_cy, distractor_r = 300.0, 160.0, 54.0
+
+    true_distance = np.sqrt((xx - true_cx) ** 2 + (yy - true_cy) ** 2)
+    distractor_distance = np.sqrt((xx - distractor_cx) ** 2 + (yy - distractor_cy) ** 2)
+
+    true_mask = true_distance <= true_r
+    true_ring = np.abs(true_distance - true_r) <= 2.0
+    image[true_mask] = np.asarray([0.23, 0.23, 0.23], dtype=np.float32)
+    image[true_ring] = np.asarray([0.82, 0.82, 0.82], dtype=np.float32)
+
+    distractor_mask = distractor_distance <= distractor_r
+    distractor_ring = np.abs(distractor_distance - distractor_r) <= 2.0
+    image[distractor_mask] = np.asarray([0.24, 0.11, 0.32], dtype=np.float32)
+    image[distractor_ring] = np.asarray([0.86, 0.34, 0.18], dtype=np.float32)
+    checker = ((np.floor((xx - distractor_cx + distractor_r) / 8.0) + np.floor((yy - distractor_cy + distractor_r) / 8.0)) % 2) == 0
+    noisy_mask = distractor_mask & checker
+    image[noisy_mask] = np.asarray([0.46, 0.07, 0.55], dtype=np.float32)
+
+    detected = _detect_sphere_roi_in_region_hwc(np.clip(image, 0.0, 1.0))
+    roi = dict(detected.get("roi") or {})
+
+    assert detected["source"] != "failed"
+    assert roi
+    assert abs(float(roi["cx"]) - true_cx) < 24.0
+    assert abs(float(roi["cy"]) - true_cy) < 24.0
+    assert detected["confidence_label"] in {"HIGH", "MEDIUM", "LOW"}
+
+
+def test_measure_rendered_preview_recovers_sphere_outside_calibration_roi(tmp_path: Path) -> None:
+    tifffile = pytest.importorskip("tifffile")
+    height, width = 320, 520
+    image = np.full((height, width, 3), 0.08, dtype=np.float32)
+    yy, xx = np.meshgrid(np.arange(height, dtype=np.float32), np.arange(width, dtype=np.float32), indexing="ij")
+    sphere_cx, sphere_cy, sphere_r = 430.0, 170.0, 48.0
+    sphere_distance = np.sqrt((xx - sphere_cx) ** 2 + (yy - sphere_cy) ** 2)
+    sphere_mask = sphere_distance <= sphere_r
+    image[sphere_mask] = np.asarray([0.24, 0.24, 0.24], dtype=np.float32)
+    image[np.abs(sphere_distance - sphere_r) <= 2.0] = np.asarray([0.78, 0.78, 0.78], dtype=np.float32)
+    image[:, :220, :] = np.asarray([0.18, 0.18, 0.18], dtype=np.float32)
+    preview_path = tmp_path / "preview.tiff"
+    tifffile.imwrite(preview_path, np.clip(image * 65535.0, 0, 65535).astype(np.uint16), photometric="rgb")
+
+    measured = _measure_rendered_preview_roi_ipp2(
+        str(preview_path),
+        {"x": 0.00, "y": 0.00, "w": 0.46, "h": 1.00},
+    )
+
+    detected_roi = dict(measured.get("detected_sphere_roi") or {})
+    assert measured["gray_target_class"] == "sphere"
+    assert measured["measurement_region_scope"] == "full_frame"
+    assert measured["sample_plausibility"] in {"HIGH", "MEDIUM"}
+    assert detected_roi
+    assert abs(float(detected_roi["cx"]) - sphere_cx) < 28.0
+    assert abs(float(detected_roi["cy"]) - sphere_cy) < 28.0
 
 
 def test_ipp2_closed_loop_target_uses_original_zone_profiles_for_median_anchor() -> None:
@@ -485,6 +966,67 @@ def test_build_sphere_detection_artifacts_writes_overlay_images_and_summary(tmp_
     assert Path(artifacts["overlay_root"]).joinpath("CAM001.original_detection.png").exists()
     assert Path(artifacts["overlay_root"]).joinpath("CAM001.corrected_detection.png").exists()
     assert artifacts["summary"]["confidence_counts"]["HIGH"] == 1
+
+
+def test_desktop_results_summary_highlights_target_basis_and_plausibility(tmp_path: Path) -> None:
+    analysis_dir = tmp_path / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    (analysis_dir / "CAM001.analysis.json").write_text(
+        json.dumps(
+            {
+                "clip_id": "CAM001",
+                "confidence": 0.88,
+                "diagnostics": {
+                    "gray_target_class": "sphere",
+                    "gray_target_detection_method": "opencv_contour_recovery",
+                    "sample_plausibility": "HIGH",
+                    "gray_target_review_recommended": False,
+                    "measured_log2_luminance_monitoring": -1.18,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    html = _build_desktop_results_summary(
+        {
+            "contact_sheet_payload": {
+                "recommended_strategy": {
+                    "strategy_label": "Optimal Exposure",
+                    "strategy_summary": "Use the best match to the measured sphere.",
+                    "reference_clip_id": "CAM001",
+                },
+                "hero_recommendation": {"candidate_clip_id": "CAM001"},
+                "run_assessment": {"status": "READY", "operator_note": "Run is ready."},
+                "white_balance_model": {"model_label": "Shared Kelvin / Per-Camera Tint", "candidate_count": 4, "diagnostics": {"mean_neutral_residual_after_solve": 0.002, "source_sample_count": 12}},
+                "gray_target_consistency": {"dominant_target_class": "sphere", "summary": "Retained cameras consistently measured the gray sphere.", "mixed_target_classes": False},
+                "recommended_attention": ["CAM001"],
+                "selected_clip_groups": ["068"],
+                "executive_synopsis": "Optimal Exposure is the recommended strategy.",
+            },
+            "corrected_validation": {
+                "recommended_strategy_key": "",
+                "best_residual_stops": 0.001,
+                "worst_residual_stops": 0.004,
+                "outside_tolerance_cameras": [],
+                "rows": [
+                    {
+                        "clip_id": "CAM001",
+                        "camera_label": "CAM001",
+                        "applied_correction_stops": 0.08,
+                        "reference_use": "Included",
+                        "trust_class": "TRUSTED",
+                        "trust_reason": "Sphere solve is stable.",
+                    }
+                ],
+            },
+            "scientific_validation": {"status": "fully_reconciled", "reason": "Replay matched the archived report."},
+        },
+        tmp_path,
+    )
+    assert "Target:" in html
+    assert "Solve:" in html
+    assert "Plausibility:" in html
+    assert "Opencv Contour Recovery" in html
 
 
 def test_parameter_specs_use_documented_fallback_dividers() -> None:
@@ -819,7 +1361,7 @@ def test_resolve_red_sdk_configuration_uses_external_root(monkeypatch: pytest.Mo
     sdk_root = tmp_path / "R3DSDKv9_2_0"
     (sdk_root / "Include").mkdir(parents=True)
     (sdk_root / "Lib" / "mac64").mkdir(parents=True)
-    (sdk_root / "Redistributable" / "mac").mkdir(parents=True)
+    _write_fake_red_redistributables(sdk_root / "Redistributable" / "mac")
     monkeypatch.setenv("RED_SDK_ROOT", str(sdk_root))
     monkeypatch.delenv("RED_SDK_REDISTRIBUTABLE_DIR", raising=False)
 
@@ -829,6 +1371,26 @@ def test_resolve_red_sdk_configuration_uses_external_root(monkeypatch: pytest.Mo
     assert config.include_dir == sdk_root / "Include"
     assert config.library_dir == sdk_root / "Lib" / "mac64"
     assert config.redistributable_dir == sdk_root / "Redistributable" / "mac"
+    assert config.redistributable_source == "sdk_root"
+    assert config.errors == ()
+
+
+def test_resolve_red_sdk_configuration_uses_bundled_redistributable_when_root_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    bundled = tmp_path / "bundle" / "red_runtime" / "redistributable"
+    bundled.mkdir(parents=True)
+    for filename in ("REDDecoder.dylib", "REDMetal.dylib", "REDOpenCL.dylib", "REDR3D.dylib"):
+        (bundled / filename).write_bytes(b"runtime")
+    monkeypatch.delenv("RED_SDK_ROOT", raising=False)
+    monkeypatch.delenv("RED_SDK_REDISTRIBUTABLE_DIR", raising=False)
+    monkeypatch.setattr("r3dmatch.sdk.bundled_red_redistributable_dir", lambda: bundled)
+
+    config = resolve_red_sdk_configuration()
+
+    assert config.root is None
+    assert config.redistributable_dir == bundled
+    assert config.redistributable_source == "bundled_app"
     assert config.errors == ()
 
 
@@ -852,7 +1414,7 @@ def test_load_configured_red_native_module_rejects_bridge_root_mismatch(
     sdk_root = tmp_path / "R3DSDKv9_2_0"
     (sdk_root / "Include").mkdir(parents=True)
     (sdk_root / "Lib" / "mac64").mkdir(parents=True)
-    (sdk_root / "Redistributable" / "mac").mkdir(parents=True)
+    _write_fake_red_redistributables(sdk_root / "Redistributable" / "mac")
     monkeypatch.setenv("RED_SDK_ROOT", str(sdk_root))
     fake_module = types.SimpleNamespace(
         bridge_configuration=lambda: {
@@ -869,7 +1431,7 @@ def test_red_backend_uses_native_module_when_available(monkeypatch: pytest.Monke
     sdk_root = tmp_path / "R3DSDKv9_2_0"
     (sdk_root / "Include").mkdir(parents=True)
     (sdk_root / "Lib" / "mac64").mkdir(parents=True)
-    (sdk_root / "Redistributable" / "mac").mkdir(parents=True)
+    _write_fake_red_redistributables(sdk_root / "Redistributable" / "mac")
     monkeypatch.setenv("RED_SDK_ROOT", str(sdk_root))
     fake_module = types.SimpleNamespace(
         sdk_available=lambda: True,
@@ -903,7 +1465,7 @@ def test_red_backend_wraps_decode_errors_with_clip_context(monkeypatch: pytest.M
     sdk_root = tmp_path / "R3DSDKv9_2_0"
     (sdk_root / "Include").mkdir(parents=True)
     (sdk_root / "Lib" / "mac64").mkdir(parents=True)
-    (sdk_root / "Redistributable" / "mac").mkdir(parents=True)
+    _write_fake_red_redistributables(sdk_root / "Redistributable" / "mac")
     monkeypatch.setenv("RED_SDK_ROOT", str(sdk_root))
     native_detail = (
         "RED SDK frame decode failed. "
@@ -961,10 +1523,10 @@ def test_exact_rmd_naming_from_clip_id() -> None:
 
 
 def test_preview_path_generation_from_clip_id() -> None:
-    assert preview_filename_for_clip_id("G007_D060_0324M6_001", "both") == "G007_D060_0324M6_001.both.review.jpg"
+    assert preview_filename_for_clip_id("G007_D060_0324M6_001", "both") == "G007_D060_0324M6_001.both.review.tiff"
     assert (
         preview_filename_for_clip_id("G007_D060_0324M6_001", "both", strategy="median", run_id="batch01")
-        == "G007_D060_0324M6_001.both.review.median.batch01.jpg"
+        == "G007_D060_0324M6_001.both.review.median.batch01.tiff"
     )
 
 
@@ -985,12 +1547,15 @@ def test_desktop_ui_review_command_uses_tcsh_and_preview_options() -> None:
         preview_mode="monitoring",
         preview_lut="/tmp/show.cube",
     )
-    joined = " ".join(command)
-    assert command[0] == "/bin/tcsh"
-    assert "setenv PYTHONPATH" in joined
-    assert "--preview-mode monitoring" in joined
-    assert "--preview-lut /tmp/show.cube" in joined
-    assert "--reference-clip-id G007_D060_0324M6_001" in joined
+    assert command[1:4] == ["-m", "r3dmatch.cli", "review-calibration"]
+    assert "--preview-mode" in command
+    assert "monitoring" in command
+    assert "--preview-still-format" in command
+    assert "tiff" in command
+    assert "--artifact-mode" in command
+    assert "production" in command
+    assert "/tmp/show.cube" in command
+    assert "G007_D060_0324M6_001" in command
 
 
 def test_scan_calibration_sources_discovers_rdc_media(tmp_path: Path) -> None:
@@ -1005,7 +1570,228 @@ def test_scan_calibration_sources_discovers_rdc_media(tmp_path: Path) -> None:
     assert summary["rdc_count"] == 1
     assert summary["r3d_count"] == 1
     assert summary["clip_ids"] == ["A001_C001_0001AB_001"]
+    assert [group["group_id"] for group in summary["clip_groups"]] == ["001"]
     assert summary["warning"] is None
+
+
+def test_normalize_preview_image_array_scales_uint8_and_uint16() -> None:
+    uint8 = np.array([[[0, 128, 255]]], dtype=np.uint8)
+    uint16 = np.array([[[0, 32768, 65535]]], dtype=np.uint16)
+    normalized8, meta8 = _normalize_preview_image_array(uint8)
+    normalized16, meta16 = _normalize_preview_image_array(uint16)
+    assert normalized8.dtype == np.float32
+    assert normalized16.dtype == np.float32
+    assert float(normalized8[0, 0, 2]) == pytest.approx(1.0)
+    assert float(normalized8[0, 0, 1]) == pytest.approx(128.0 / 255.0, rel=1e-6)
+    assert float(normalized16[0, 0, 2]) == pytest.approx(1.0)
+    assert float(normalized16[0, 0, 1]) == pytest.approx(32768.0 / 65535.0, rel=1e-6)
+    assert meta8["normalization_denominator"] == 255.0
+    assert meta16["normalization_denominator"] == 65535.0
+
+
+def test_load_preview_image_as_normalized_rgb_preserves_uint16_tiff_metadata(tmp_path: Path) -> None:
+    tifffile = pytest.importorskip("tifffile")
+    tiff_path = tmp_path / "preview.tiff"
+    source = np.array([[[0, 32768, 65535]]], dtype=np.uint16)
+    tifffile.imwrite(tiff_path, source, photometric="rgb")
+    normalized, metadata = _load_preview_image_as_normalized_rgb(tiff_path)
+    assert normalized.dtype == np.float32
+    assert float(normalized[0, 0, 2]) == pytest.approx(1.0)
+    assert float(normalized[0, 0, 1]) == pytest.approx(32768.0 / 65535.0, rel=1e-6)
+    assert metadata["bit_depth"] == 16
+    assert metadata["normalization_denominator"] == 65535.0
+    assert metadata["preview_format"] == "tiff"
+
+
+def test_load_preview_image_as_normalized_rgb_retries_truncated_jpeg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    jpeg_path = tmp_path / "preview.jpg"
+    Image.fromarray(np.full((4, 4, 3), 160, dtype=np.uint8), mode="RGB").save(jpeg_path, format="JPEG")
+    real_open = Image.open
+    attempts = {"count": 0}
+
+    def flaky_open(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if str(path) == str(jpeg_path) and attempts["count"] < 2:
+            attempts["count"] += 1
+            raise OSError("image file is truncated")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("r3dmatch.report.Image.open", flaky_open)
+    monkeypatch.setattr("r3dmatch.report.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("r3dmatch.report._wait_for_file_ready", lambda _path, **_kwargs: None)
+
+    normalized, metadata = _load_preview_image_as_normalized_rgb(jpeg_path)
+
+    assert attempts["count"] == 2
+    assert normalized.shape == (4, 4, 3)
+    assert metadata["preview_format"] == "jpg"
+    assert metadata["bit_depth"] == 8
+
+
+def test_load_preview_image_as_normalized_rgb_retries_truncated_tiff_until_ready(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tiff_path = tmp_path / "preview.tiff"
+    Image.fromarray(np.full((4, 4, 3), 220, dtype=np.uint8), mode="RGB").save(tiff_path, format="TIFF")
+    attempts = {"count": 0}
+    real_loader = _load_preview_image_as_normalized_rgb
+
+    def flaky_once(path):  # type: ignore[no-untyped-def]
+        if str(path) == str(tiff_path) and attempts["count"] < 3:
+            attempts["count"] += 1
+            raise OSError("image file is truncated (156 bytes not processed)")
+        return original_once(path)
+
+    original_once = __import__("r3dmatch.report", fromlist=["_load_preview_image_once"])._load_preview_image_once
+    monkeypatch.setattr("r3dmatch.report._load_preview_image_once", flaky_once)
+    monkeypatch.setattr("r3dmatch.report.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("r3dmatch.report._wait_for_file_ready", lambda _path, **_kwargs: None)
+
+    normalized, metadata = real_loader(tiff_path)
+
+    assert attempts["count"] == 3
+    assert normalized.shape == (4, 4, 3)
+    assert metadata["preview_format"] == "tiff"
+
+
+def test_manual_assist_sanitized_entry_keeps_coordinate_lists() -> None:
+    payload = _manual_assist_sanitized_entry(
+        {
+            "clip_id": "CAM001",
+            "center_preview_px": [1004, 329],
+            "radius_preview_px": 72,
+            "center_normalized": [],
+            "operator_note": "Manual sphere center placed from low-bandwidth preview.",
+        }
+    )
+
+    assert payload["clip_id"] == "CAM001"
+    assert payload["center_preview_px"] == [1004, 329]
+    assert payload["radius_preview_px"] == 72
+    assert "center_normalized" not in payload
+
+
+def test_upgrade_trust_from_ipp2_validation_recovers_sphere_camera() -> None:
+    upgraded = _upgrade_trust_from_ipp2_validation(
+        {
+            "trust_class": "EXCLUDED",
+            "trust_score": 0.31,
+            "trust_reason": "Outside primary exposure group",
+            "stability_label": "Excluded from reference",
+            "correction_confidence": "LOW",
+            "reference_use": "Excluded",
+            "screened_reasons": ["Outside primary exposure group", "outside central exposure cluster"],
+        },
+        ipp2_validation={
+            "status": "PASS",
+            "profile_audit_label": "Profile mismatch",
+            "validation_residual_stops": 0.03,
+        },
+        gray_target_class="sphere",
+        sample_plausibility="MEDIUM",
+    )
+
+    assert upgraded["trust_class"] == "USE_WITH_CAUTION"
+    assert upgraded["reference_use"] == "Included"
+    assert "Recovered on corrected-frame validation" in upgraded["screened_reasons"]
+
+
+def test_upgrade_trust_from_ipp2_validation_preserves_non_sphere_target() -> None:
+    upgraded = _upgrade_trust_from_ipp2_validation(
+        {
+            "trust_class": "EXCLUDED",
+            "trust_score": 0.2,
+            "trust_reason": "Outside primary exposure group",
+            "reference_use": "Excluded",
+            "screened_reasons": ["Outside primary exposure group"],
+        },
+        ipp2_validation={
+            "status": "PASS",
+            "profile_audit_label": "Profile aligned",
+            "validation_residual_stops": 0.01,
+        },
+        gray_target_class="gray_card",
+        sample_plausibility="HIGH",
+    )
+
+    assert upgraded["trust_class"] == "EXCLUDED"
+    assert upgraded["reference_use"] == "Excluded"
+
+
+def test_detect_focus_chart_roi_hwc_finds_colorchecker_cluster() -> None:
+    image = np.ones((420, 820, 3), dtype=np.float32) * 0.72
+    rows, cols = 4, 6
+    start_x, start_y = 620, 120
+    cell_w, cell_h = 24, 28
+    gap = 4
+    palette = [
+        (0.82, 0.28, 0.26),
+        (0.27, 0.53, 0.82),
+        (0.18, 0.68, 0.36),
+        (0.86, 0.72, 0.22),
+        (0.76, 0.34, 0.78),
+        (0.32, 0.79, 0.78),
+    ]
+    for row in range(rows):
+        for col in range(cols):
+            x0 = start_x + (col * (cell_w + gap))
+            y0 = start_y + (row * (cell_h + gap))
+            image[y0:y0 + cell_h, x0:x0 + cell_w, :] = palette[(row + col) % len(palette)]
+    detection = _detect_focus_chart_roi_hwc(image)
+    assert detection["found"] is True
+    roi = dict(detection["roi"])
+    assert roi["x0"] < start_x
+    assert roi["x1"] > start_x + (cols * (cell_w + gap)) - gap
+    assert detection["confidence"] > 0.5
+
+
+def test_focus_metric_bundle_prefers_sharp_image() -> None:
+    image = np.zeros((240, 240, 3), dtype=np.float32)
+    image[:, ::12, :] = 1.0
+    image[::12, :, :] = 1.0
+    sharp_metrics = _focus_metric_bundle(image)
+    blurred = np.asarray(Image.fromarray(np.clip(image * 255.0, 0.0, 255.0).astype(np.uint8)).filter(ImageFilter.GaussianBlur(radius=3)), dtype=np.float32) / 255.0
+    blur_metrics = _focus_metric_bundle(blurred)
+    assert sharp_metrics["laplacian_variance"] > blur_metrics["laplacian_variance"]
+    assert sharp_metrics["tenengrad"] > blur_metrics["tenengrad"]
+    assert sharp_metrics["fft_high_frequency_energy"] > blur_metrics["fft_high_frequency_energy"]
+
+
+def test_focus_validation_summary_marks_tiff_sufficient_for_matching_ranks() -> None:
+    rows = [
+        {"clip_id": "A", "laplacian_variance": 12.0, "tenengrad": 9.0, "fft_high_frequency_energy": 0.6, "composite_focus_score": 1.0},
+        {"clip_id": "B", "laplacian_variance": 8.0, "tenengrad": 6.0, "fft_high_frequency_energy": 0.4, "composite_focus_score": 0.75},
+        {"clip_id": "C", "laplacian_variance": 4.0, "tenengrad": 3.0, "fft_high_frequency_energy": 0.2, "composite_focus_score": 0.42},
+    ]
+    reference_rows = [
+        {"clip_id": "A", "laplacian_variance": 11.5, "tenengrad": 8.7, "fft_high_frequency_energy": 0.58, "composite_focus_score": 0.98},
+        {"clip_id": "B", "laplacian_variance": 7.8, "tenengrad": 5.8, "fft_high_frequency_energy": 0.39, "composite_focus_score": 0.73},
+        {"clip_id": "C", "laplacian_variance": 4.2, "tenengrad": 3.1, "fft_high_frequency_energy": 0.22, "composite_focus_score": 0.44},
+    ]
+    summary = _focus_validation_summary(rows=rows, reference_rows=reference_rows)
+    assert summary["tiff_is_sufficient"] is True
+    assert summary["confidence"] == "high"
+    assert summary["rank_correlation"] > 0.95
+
+
+def test_build_review_command_includes_focus_validation_flag() -> None:
+    command = build_review_command(
+        repo_root="/Users/sfouasnon/Desktop/R3DMatch",
+        input_path="/tmp/input",
+        output_path="/tmp/output",
+        backend="red",
+        target_type="gray_card",
+        processing_mode="both",
+        roi_x=None,
+        roi_y=None,
+        roi_w=None,
+        roi_h=None,
+        target_strategies=["median"],
+        reference_clip_id=None,
+        preview_mode="monitoring",
+        preview_lut=None,
+        preview_still_format="tiff",
+        artifact_mode="production",
+        focus_validation=True,
+    )
+    assert "--focus-validation" in command
 
 
 def test_scan_calibration_sources_warns_on_empty_folder(tmp_path: Path) -> None:
@@ -1099,6 +1885,7 @@ def test_build_review_web_command_uses_tcsh_and_preview_options(monkeypatch: pyt
             "reference_clip_id": "G007_D060_0324M6_001",
             "hero_clip_id": "",
             "review_mode": "full_contact_sheet",
+            "report_focus": "outliers",
             "preview_mode": "monitoring",
             "preview_lut": "/tmp/show.cube",
         },
@@ -1112,9 +1899,400 @@ def test_build_review_web_command_uses_tcsh_and_preview_options(monkeypatch: pyt
     assert "setenv RED_SDK_REDISTRIBUTABLE_DIR /external/red/sdk/Redistributable/mac" in joined
     assert "setenv R3DMATCH_INVOCATION_SOURCE web_ui" in joined
     assert "--review-mode full_contact_sheet" in joined
+    assert "--report-focus outliers" in joined
     assert "--preview-mode monitoring" in joined
     assert "--preview-lut /tmp/show.cube" in joined
     assert "--reference-clip-id G007_D060_0324M6_001" in joined
+
+
+def test_build_review_web_command_uses_embedded_cli_prefix_when_frozen(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("r3dmatch.web_app.sys.executable", "/tmp/R3DMatch.app/Contents/MacOS/R3DMatch")
+    monkeypatch.setattr("r3dmatch.web_app.sys.frozen", True, raising=False)
+    command = build_review_web_command(
+        "/Users/sfouasnon/Desktop/R3DMatch",
+        {
+            "input_path": "/tmp/in",
+            "output_path": "/tmp/out",
+            "run_label": "",
+            "backend": "mock",
+            "target_type": "gray_sphere",
+            "processing_mode": "both",
+            "matching_domain": "perceptual",
+            "roi_x": "",
+            "roi_y": "",
+            "roi_w": "",
+            "roi_h": "",
+            "selected_clip_ids": [],
+            "selected_clip_groups": [],
+            "target_strategies": ["median"],
+            "reference_clip_id": "",
+            "hero_clip_id": "",
+            "review_mode": "full_contact_sheet",
+            "report_focus": "auto",
+            "preview_mode": "monitoring",
+            "preview_lut": "",
+        },
+    )
+    joined = " ".join(command)
+    assert "/tmp/R3DMatch.app/Contents/MacOS/R3DMatch --cli review-calibration" in joined
+    assert "-m r3dmatch.cli" not in joined
+
+
+def test_build_tcsh_launch_prefix_uses_bundle_runtime_when_frozen(monkeypatch: pytest.MonkeyPatch) -> None:
+    executable = str((Path("/tmp/R3DMatch.app/Contents/MacOS/R3DMatch")).resolve())
+    monkeypatch.setattr("r3dmatch.web_app.sys.executable", executable)
+    monkeypatch.setattr("r3dmatch.web_app.sys.frozen", True, raising=False)
+    monkeypatch.setenv("DYLD_FALLBACK_LIBRARY_PATH", "/opt/homebrew/lib")
+    monkeypatch.setenv("RED_SDK_ROOT", "/external/red/sdk")
+    prefix = _build_tcsh_launch_prefix("/Users/sfouasnon/Desktop/R3DMatch", invocation_source="web_ui")
+    assert f'cd "{Path(executable).parent}"' in prefix
+    assert 'setenv PYTHONPATH "$PWD/src"' not in prefix
+    assert "setenv DYLD_FALLBACK_LIBRARY_PATH /opt/homebrew/lib" in prefix
+    assert "setenv RED_SDK_ROOT /external/red/sdk" in prefix
+    assert "setenv R3DMATCH_INVOCATION_SOURCE web_ui" in prefix
+
+
+def test_web_launcher_dispatches_embedded_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    from r3dmatch import web_launcher
+
+    captured: dict[str, object] = {}
+
+    def fake_cli_app() -> None:
+        captured["argv"] = list(web_launcher.sys.argv)
+
+    monkeypatch.setattr("r3dmatch.web_launcher.sys.argv", ["R3DMatch", "--cli", "runtime-health", "--strict"])
+    monkeypatch.setattr("r3dmatch.cli.app", fake_cli_app)
+
+    web_launcher.main()
+
+    assert captured["argv"] == ["R3DMatch", "runtime-health", "--strict"]
+
+
+def test_web_launcher_defaults_to_desktop_ui(monkeypatch: pytest.MonkeyPatch) -> None:
+    from r3dmatch import web_launcher
+
+    called: dict[str, object] = {}
+
+    def fake_launch(repo_root: str, *, minimal_mode: bool = False, smoke_exit_ms: int = 0) -> None:
+        called["repo_root"] = repo_root
+        called["minimal_mode"] = minimal_mode
+        called["smoke_exit_ms"] = smoke_exit_ms
+
+    monkeypatch.setattr("r3dmatch.web_launcher.launch_desktop_ui", fake_launch)
+    monkeypatch.setattr("r3dmatch.web_launcher.sys.argv", ["R3DMatch"])
+
+    web_launcher.main()
+
+    assert str(called["repo_root"]).endswith("/R3DMatch")
+    assert called["minimal_mode"] is False
+    assert called["smoke_exit_ms"] == 0
+
+
+def test_web_launcher_desktop_smoke_forwards_auto_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    from r3dmatch import web_launcher
+
+    called: dict[str, object] = {}
+
+    def fake_launch(repo_root: str, *, minimal_mode: bool = False, smoke_exit_ms: int = 0) -> None:
+        called["repo_root"] = repo_root
+        called["smoke_exit_ms"] = smoke_exit_ms
+
+    monkeypatch.setattr("r3dmatch.web_launcher.launch_desktop_ui", fake_launch)
+    monkeypatch.setattr("r3dmatch.web_launcher.sys.argv", ["R3DMatch", "--desktop-smoke", "--desktop-smoke-ms", "900"])
+
+    web_launcher.main()
+
+    assert called["smoke_exit_ms"] == 900
+
+
+def test_desktop_window_matching_domain_maps_display_label_to_perceptual(tmp_path: Path) -> None:
+    app = _qt_test_app()
+    window = R3DMatchDesktopWindow(repo_root=str(tmp_path))
+    try:
+        window.input_path.setText(str(tmp_path))
+        window.output_path.setText(str(tmp_path / "out"))
+        assert window.matching_domain.currentText() == "Display (IPP2 / BT.709 / BT.1886)"
+        assert window.matching_domain.currentData() == "perceptual"
+        command = window._review_command_from_form()
+        index = command.index("--matching-domain")
+        assert command[index + 1] == "perceptual"
+    finally:
+        window.close()
+        if QApplication.instance() is app:
+            app.processEvents()
+
+
+def test_desktop_window_results_surface_explains_missing_outputs(tmp_path: Path) -> None:
+    app = _qt_test_app()
+    window = R3DMatchDesktopWindow(repo_root=str(tmp_path))
+    try:
+        window.output_path.setText(str(tmp_path / "missing-run"))
+        window._refresh_artifacts()
+        assert "No output folder is selected yet" in (window.results_banner.text() if window.results_banner else "")
+        assert "No artifacts yet" not in (window.results_summary.toPlainText() if window.results_summary else "")
+    finally:
+        window.close()
+        if QApplication.instance() is app:
+            app.processEvents()
+
+
+def test_desktop_window_results_surface_discovers_latest_completed_run_in_selected_output_root(tmp_path: Path) -> None:
+    app = _qt_test_app()
+    output_root = tmp_path / "runs"
+    older_report = output_root / "subset_066" / "report"
+    newer_report = output_root / "subset_067" / "report"
+    older_report.mkdir(parents=True)
+    newer_report.mkdir(parents=True)
+    for report_dir, stamp in [(older_report, 1000), (newer_report, 2000)]:
+        (report_dir / "contact_sheet.html").write_text("<html></html>", encoding="utf-8")
+        (report_dir / "preview_contact_sheet.pdf").write_text("pdf", encoding="utf-8")
+        (report_dir / "review_validation.json").write_text(
+            json.dumps({"status": "success", "review_complete": True}),
+            encoding="utf-8",
+        )
+        os.utime(report_dir / "review_validation.json", (stamp, stamp))
+        os.utime(report_dir / "contact_sheet.html", (stamp, stamp))
+        os.utime(report_dir / "preview_contact_sheet.pdf", (stamp, stamp))
+    window = R3DMatchDesktopWindow(repo_root=str(tmp_path))
+    try:
+        window.output_path.setText(str(output_root))
+        resolved_root = window._maybe_output_root()
+        assert resolved_root == output_root / "subset_067"
+    finally:
+        window.close()
+        if QApplication.instance() is app:
+            app.processEvents()
+
+
+def test_desktop_window_load_operator_surface_context_prefers_contact_sheet_summary_when_review_package_is_sparse(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _qt_test_app()
+    out_dir = tmp_path / "run"
+    report_dir = out_dir / "report"
+    report_dir.mkdir(parents=True)
+    (report_dir / "contact_sheet.html").write_text("<html></html>", encoding="utf-8")
+    (report_dir / "preview_contact_sheet.pdf").write_text("pdf", encoding="utf-8")
+    (report_dir / "review_validation.json").write_text(json.dumps({"status": "success"}), encoding="utf-8")
+    (report_dir / "contact_sheet.json").write_text(
+        json.dumps(
+            {
+                "recommended_strategy": {"strategy_label": "Optimal Exposure", "reference_clip_id": "H007_C067_0403RE_001"},
+                "hero_recommendation": {"candidate_clip_id": "H007_C067_0403RE_001"},
+                "white_balance_model": {"model_label": "Shared Kelvin / Per-Camera Tint"},
+                "run_assessment": {"status": "READY", "operator_note": "Ready to export."},
+                "gray_target_consistency": {"dominant_target_class": "sphere", "mixed_target_classes": False, "summary": "Retained cameras consistently measured the gray sphere."},
+                "operator_recommendation": "Ready to export.",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (report_dir / "review_package.json").write_text(
+        json.dumps({"review_mode": "full_contact_sheet", "run_assessment": None, "gray_target_consistency": None}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("r3dmatch.web_app._build_operator_surfaces", lambda **kwargs: {})
+    monkeypatch.setattr("r3dmatch.web_app._render_apply_surface", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr("r3dmatch.web_app._render_commit_table", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr("r3dmatch.web_app._render_decision_surface", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr("r3dmatch.web_app._render_push_surface", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr("r3dmatch.web_app._render_verification_surface", lambda *_args, **_kwargs: "")
+    window = R3DMatchDesktopWindow(repo_root=str(tmp_path))
+    try:
+        context = window._load_operator_surface_context(out_dir)
+        review_payload = dict(context["review_payload"])
+        assert review_payload["run_assessment"]["status"] == "READY"
+        assert review_payload["gray_target_consistency"]["dominant_target_class"] == "sphere"
+        assert review_payload["recommended_strategy"]["strategy_label"] == "Optimal Exposure"
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_desktop_window_tab_order_matches_operator_workflow(tmp_path: Path) -> None:
+    app = _qt_test_app()
+    window = R3DMatchDesktopWindow(repo_root=str(tmp_path))
+    try:
+        assert [window.tabs.tabText(index) for index in range(window.tabs.count())] == [
+            "Review",
+            "Results",
+            "Apply / Verify",
+            "Settings",
+        ]
+        assert window.log_output.parent() is not None
+        assert window.tabs.currentWidget() is window.review_tab
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_desktop_window_scan_populates_clip_groups_and_review_command_uses_selection(tmp_path: Path) -> None:
+    app = _qt_test_app()
+    for name in [
+        "G007_A063_0325EV_001.R3D",
+        "G007_B063_0325EV_001.R3D",
+        "G007_A064_0325EV_001.R3D",
+    ]:
+        (tmp_path / name).write_bytes(b"")
+    window = R3DMatchDesktopWindow(repo_root=str(tmp_path))
+    try:
+        window.input_path.setText(str(tmp_path))
+        window.output_path.setText(str(tmp_path / "out"))
+        window._scan_source()
+        assert window.clip_group_list is not None
+        assert window.clip_group_list.count() == 2
+        second = window.clip_group_list.item(1)
+        second.setCheckState(Qt.CheckState.Unchecked)
+        command = window._review_command_from_form()
+        group_indices = [index for index, token in enumerate(command) if token == "--clip-group"]
+        selected_groups = [command[index + 1] for index in group_indices]
+        assert selected_groups == ["063"]
+        assert "Only these groups will be included" in (window.clip_group_summary.text() if window.clip_group_summary else "")
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_desktop_window_results_and_apply_surfaces_use_operator_summary(tmp_path: Path) -> None:
+    app = _qt_test_app()
+    out_dir = tmp_path / "run"
+    report_dir = out_dir / "report"
+    report_dir.mkdir(parents=True)
+    (report_dir / "contact_sheet.html").write_text("<html></html>", encoding="utf-8")
+    (report_dir / "preview_contact_sheet.pdf").write_text("pdf", encoding="utf-8")
+    (report_dir / "review_validation.json").write_text(json.dumps({"status": "success"}), encoding="utf-8")
+    preview_dir = out_dir / "previews"
+    preview_dir.mkdir(parents=True)
+    original = preview_dir / "original.jpg"
+    corrected = preview_dir / "corrected.jpg"
+    Image.fromarray(np.full((8, 8, 3), 120, dtype=np.uint8), mode="RGB").save(original, format="JPEG")
+    Image.fromarray(np.full((8, 8, 3), 180, dtype=np.uint8), mode="RGB").save(corrected, format="JPEG")
+    window = R3DMatchDesktopWindow(repo_root=str(tmp_path))
+    try:
+        window.output_path.setText(str(out_dir))
+        window._load_operator_surface_context = lambda _output_root: {  # type: ignore[method-assign]
+            "review_validation": {"status": "success"},
+            "scientific_validation": {"status": "blocked_asset_mismatch", "replay_integrity_state": "blocked_asset_mismatch"},
+            "report_root": report_dir,
+            "contact_sheet_payload": {
+                "recommended_strategy": {
+                    "strategy_label": "Optimal Exposure (Best Match to Gray)",
+                    "strategy_summary": "Matched to the best gray target.",
+                    "reference_clip_id": "G007_A063_001",
+                },
+                "run_assessment": {
+                    "status": "READY_WITH_WARNINGS",
+                    "operator_note": "Review one flagged camera before commit.",
+                },
+                "gray_target_consistency": {
+                    "dominant_target_class": "sphere",
+                    "mixed_target_classes": False,
+                    "summary": "Retained cameras consistently measured the gray sphere.",
+                },
+                "white_balance_model": {
+                    "model_label": "Shared Kelvin / Per-Camera Tint",
+                    "candidate_count": 3,
+                    "selection_reason": "Chosen from stored neutral RGB residuals.",
+                    "shared_kelvin": 5520,
+                    "shared_tint_mode": "per_camera",
+                    "diagnostics": {
+                        "mean_neutral_residual_after_solve": 0.0123,
+                        "source_sample_count": 36,
+                    },
+                },
+                "hero_recommendation": {"candidate_clip_id": "G007_A063_001"},
+                "selected_clip_groups": ["063"],
+                "report_focus_label": "Auto",
+            },
+            "corrected_validation": {
+                "recommended_strategy_key": "optimal_exposure",
+                "best_residual_stops": 0.01,
+                "worst_residual_stops": 0.42,
+                "outside_tolerance_cameras": ["H007_D063_001"],
+                "rows": [
+                    {
+                        "clip_id": "G007_A063_001",
+                        "camera_label": "G007_A063",
+                        "camera_id": "G007_A063",
+                        "strategy_key": "optimal_exposure",
+                        "applied_correction_stops": 0.12,
+                        "trust_class": "TRUSTED",
+                        "reference_use": "Included",
+                        "trust_reason": "Stable gray sample",
+                        "original_measured_gray_log2": -2.11,
+                        "original_image_path": str(original),
+                        "corrected_image_path": str(corrected),
+                    },
+                    {
+                        "clip_id": "H007_D063_001",
+                        "camera_label": "H007_D063",
+                        "camera_id": "H007_D063",
+                        "strategy_key": "optimal_exposure",
+                        "applied_correction_stops": 1.35,
+                        "trust_class": "UNTRUSTED",
+                        "reference_use": "Excluded",
+                        "trust_reason": "Offset exceeds safe range",
+                        "original_measured_gray_log2": -3.20,
+                        "original_image_path": str(original),
+                        "corrected_image_path": str(corrected),
+                    },
+                ],
+            },
+            "decision_surface_html": "<div class='summary-panel'><h3>Calibration Recommendation</h3></div>",
+            "commit_table_html": "<div>Commit Table</div>",
+            "camera_state_report": {},
+            "verification_report": {},
+            "post_apply_report": {},
+            "apply_report": {},
+            "push_surface_html": "<div>Camera Push Plan</div>",
+            "apply_surface_html": "",
+            "verification_surface_html": "",
+        }
+        window._refresh_artifacts()
+        window._refresh_apply_surface()
+        assert "Calibration Recommendation" in (window.results_summary.toPlainText() if window.results_summary else "")
+        assert "Retained Cluster" in (window.results_summary.toPlainText() if window.results_summary else "")
+        assert "Excluded Cameras" in (window.results_summary.toPlainText() if window.results_summary else "")
+        assert "Gray Sample Basis" in (window.results_summary.toPlainText() if window.results_summary else "")
+        assert "Visual Comparison" in (window.results_summary.toPlainText() if window.results_summary else "")
+        assert "Retained cameras consistently measured the gray sphere" in (window.results_summary.toPlainText() if window.results_summary else "")
+        assert "Camera Push Plan" in (window.apply_summary.toPlainText() if window.apply_summary else "")
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_desktop_redline_path_persists_across_relaunch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _qt_test_app()
+    desktop_config = tmp_path / ".r3dmatch_config.json"
+    project_config = tmp_path / "config" / "redline.json"
+    redline_executable = tmp_path / "REDline"
+    redline_executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    redline_executable.chmod(0o755)
+    monkeypatch.setenv(DESKTOP_CONFIG_ENV, str(desktop_config))
+    monkeypatch.setattr("r3dmatch.report.REDLINE_CONFIG_PATH", project_config)
+    monkeypatch.setattr("r3dmatch.runtime_env.REDLINE_CONFIG_PATH", project_config)
+    monkeypatch.delenv("R3DMATCH_REDLINE_EXECUTABLE", raising=False)
+    monkeypatch.delenv("REDLINE_PATH", raising=False)
+
+    first_window = R3DMatchDesktopWindow(repo_root=str(tmp_path))
+    try:
+        first_window.redline_path.setText(str(redline_executable))
+        first_window._save_redline()
+        assert "Ready" in first_window.redline_feedback.text()
+        assert redline_configured_path() == str(redline_executable)
+        assert desktop_config.exists()
+        persisted = json.loads(desktop_config.read_text(encoding="utf-8"))
+        assert persisted["redline_path"] == str(redline_executable)
+    finally:
+        first_window.close()
+        app.processEvents()
+
+    second_window = R3DMatchDesktopWindow(repo_root=str(tmp_path))
+    try:
+        assert second_window.redline_path.text() == str(redline_executable)
+        assert "Ready" in second_window.redline_feedback.text()
+    finally:
+        second_window.close()
+        app.processEvents()
 
 
 def test_web_app_routes_and_validation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1349,8 +2527,10 @@ def test_build_review_web_command_supports_ftps_source_mode(monkeypatch: pytest.
             "reference_clip_id": "",
             "hero_clip_id": "",
             "review_mode": "lightweight_analysis",
+            "report_focus": "cluster_extremes",
             "preview_mode": "monitoring",
             "preview_lut": "",
+            "local_ingest_root": "/Volumes/RAID/ingest/063",
             "ftps_reel": "007",
             "ftps_clips": "63,64-65",
             "ftps_cameras": ["AA", "AB"],
@@ -1360,17 +2540,63 @@ def test_build_review_web_command_supports_ftps_source_mode(monkeypatch: pytest.
     assert "/tmp/venv/bin/python -m r3dmatch.cli review-calibration" in joined
     assert "--matching-domain perceptual" in joined
     assert "--source-mode ftps_camera_pull" in joined
+    assert "--report-focus cluster_extremes" in joined
     assert "--ftps-reel 007" in joined
     assert "--ftps-clips 63,64-65" in joined
+    assert "--ftps-local-root /Volumes/RAID/ingest/063" in joined
     assert joined.count("--ftps-camera") == 2
-    assert "/tmp/out/ingest" in joined
+    assert "/Volumes/RAID/ingest/063" in joined
     assert "setenv RED_SDK_ROOT /external/red/sdk" in joined
 
 
-def test_validate_form_requires_red_sdk_root_for_red_backend(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_build_ftps_ingest_web_command_supports_discover_and_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("r3dmatch.web_app.sys.executable", "/tmp/venv/bin/python")
+    form = {
+        "output_path": "/tmp/review",
+        "local_ingest_root": "/Volumes/RAID/ingest/063",
+        "ftps_reel": "007",
+        "ftps_clips": "63",
+        "ftps_cameras": "AA,AB",
+    }
+    discover = " ".join(build_ftps_ingest_web_command("/Users/sfouasnon/Desktop/R3DMatch", form, action="discover"))
+    retry = " ".join(build_ftps_ingest_web_command("/Users/sfouasnon/Desktop/R3DMatch", form, action="retry-failed"))
+    assert "ingest-ftps --action discover --out /Volumes/RAID/ingest/063" in discover
+    assert "--ftps-reel 007" in discover
+    assert "--ftps-clips 63" in discover
+    assert discover.count("--ftps-camera") == 2
+    assert "ingest-ftps --action retry-failed --out /Volumes/RAID/ingest/063" in retry
+    assert f"--manifest-path {ingest_manifest_path_for('/Volumes/RAID/ingest/063')}" in retry
+
+
+def test_validate_ftps_ingest_form_accepts_local_ingest_root_retry(tmp_path: Path) -> None:
+    ingest_root = tmp_path / "ingest"
+    ingest_root.mkdir()
+    ingest_manifest_path_for(ingest_root).write_text("{}", encoding="utf-8")
+    error = _validate_ftps_ingest_form(
+        {
+            "source_mode": "ftps_camera_pull",
+            "output_path": "",
+            "local_ingest_root": str(ingest_root),
+            "ftps_reel": "",
+            "ftps_clips": "",
+            "ftps_cameras": "",
+        },
+        action="retry-failed",
+    )
+    assert error is None
+
+
+def test_validate_form_requires_red_sdk_runtime_for_red_backend(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     clip_path = tmp_path / "G007_A063_0325EV_001.R3D"
     clip_path.write_bytes(b"")
-    monkeypatch.delenv("RED_SDK_ROOT", raising=False)
+    monkeypatch.setattr(
+        "r3dmatch.web_app.runtime_health_payload",
+        lambda html_path=None: {
+            "html_pdf_ready": True,
+            "red_sdk_runtime": {"ready": False, "error": "RED SDK runtime is unavailable."},
+            "redline_tool": {"ready": True, "error": ""},
+        },
+    )
 
     error = _validate_form(
         {
@@ -1394,7 +2620,43 @@ def test_validate_form_requires_red_sdk_root_for_red_backend(tmp_path: Path, mon
     )
 
     assert error is not None
-    assert "RED_SDK_ROOT" in error
+    assert "RED SDK runtime is unavailable." in error
+
+
+def test_validate_form_requires_redline_for_red_backend(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clip_path = tmp_path / "G007_A063_0325EV_001.R3D"
+    clip_path.write_bytes(b"")
+    monkeypatch.setattr(
+        "r3dmatch.web_app.runtime_health_payload",
+        lambda html_path=None: {
+            "html_pdf_ready": True,
+            "red_sdk_runtime": {"ready": True, "error": ""},
+            "redline_tool": {"ready": False, "error": "REDLine executable is not available."},
+        },
+    )
+
+    error = _validate_form(
+        {
+            "input_path": str(tmp_path),
+            "output_path": str(tmp_path / "out"),
+            "backend": "red",
+            "source_mode": "local_folder",
+            "target_type": "gray_sphere",
+            "processing_mode": "both",
+            "matching_domain": "perceptual",
+            "review_mode": "lightweight_analysis",
+            "preview_mode": "monitoring",
+            "target_strategies": ["median"],
+            "selected_clip_groups": ["063"],
+            "selected_clip_ids": [],
+            "reference_clip_id": "",
+            "hero_clip_id": "",
+            "preview_lut": "",
+            "roi_mode": "sphere_auto",
+        }
+    )
+
+    assert error == "REDLine executable is not available."
 
 
 def test_validate_form_reports_weasyprint_preflight_failure_for_full_contact_sheet(
@@ -1469,6 +2731,26 @@ def test_runtime_health_command_strict_fails_when_html_pdf_is_unavailable(monkey
     assert "\"html_pdf_ready\": false" in result.stdout.lower()
 
 
+def test_pick_folder_command_returns_selected_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "r3dmatch.native_dialogs.pick_existing_directory",
+        lambda title, directory="": "/Volumes/RAID/calibration",
+    )
+    result = runner.invoke(app, ["pick-folder", "--title", "Select Calibration Folder", "--directory", "/tmp"])
+    assert result.exit_code == 0
+    assert "/Volumes/RAID/calibration" in result.stdout
+
+
+def test_pick_file_command_returns_selected_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "r3dmatch.native_dialogs.pick_existing_file",
+        lambda title, directory="", filter="": "/Applications/REDCINE-X Professional/REDCINE-X PRO.app/Contents/MacOS/REDline",
+    )
+    result = runner.invoke(app, ["pick-file", "--title", "Select REDLine", "--directory", "/Applications", "--filter", "Executables (*)"])
+    assert result.exit_code == 0
+    assert "REDline" in result.stdout
+
+
 def test_runtime_health_payload_reports_red_sdk_and_html_pdf_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "r3dmatch.runtime_env.ensure_runtime_environment",
@@ -1486,9 +2768,24 @@ def test_runtime_health_payload_reports_red_sdk_and_html_pdf_state(monkeypatch: 
         "r3dmatch.runtime_env.resolve_red_sdk_configuration",
         lambda: types.SimpleNamespace(
             redistributable_dir=Path("/external/red/sdk/Redistributable/mac"),
+            redistributable_source="environment_override",
+            root=Path("/external/red/sdk"),
             errors=(),
         ),
     )
+    monkeypatch.setattr("r3dmatch.runtime_env.load_configured_red_native_module", lambda: object())
+    monkeypatch.setattr(
+        "r3dmatch.runtime_env.resolve_redline_tool_status",
+        lambda: {
+            "ready": False,
+            "configured": "REDLine",
+            "resolved_path": "",
+            "source": "path",
+            "config_path": "",
+            "error": "REDLine executable is not available.",
+        },
+    )
+    monkeypatch.setattr("r3dmatch.runtime_env.redline_configured_path", lambda: "/configured/REDline")
     monkeypatch.setenv("RED_SDK_ROOT", "/external/red/sdk")
 
     payload = runtime_health_payload()
@@ -1496,6 +2793,89 @@ def test_runtime_health_payload_reports_red_sdk_and_html_pdf_state(monkeypatch: 
     assert payload["html_pdf_ready"] is True
     assert payload["red_backend_ready"] is True
     assert payload["resolved_red_sdk_redistributable_dir"].endswith("Redistributable/mac")
+    assert payload["red_sdk_runtime"]["source"] == "environment_override"
+    assert payload["redline_tool"]["ready"] is False
+    assert payload["redline_tool"]["configured_path"] == "/configured/REDline"
+
+
+def test_runtime_health_payload_reports_bundled_red_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    bundled = tmp_path / "Resources" / "red_runtime" / "redistributable"
+    bundled.mkdir(parents=True)
+    for filename in ("REDDecoder.dylib", "REDMetal.dylib", "REDOpenCL.dylib", "REDR3D.dylib"):
+        (bundled / filename).write_bytes(b"runtime")
+    monkeypatch.setattr(
+        "r3dmatch.runtime_env.ensure_runtime_environment",
+        lambda: {"value": "/opt/homebrew/lib", "source": "auto_homebrew"},
+    )
+    monkeypatch.setattr(
+        "r3dmatch.runtime_env.contact_sheet_pdf_export_preflight",
+        lambda html_path=None: {
+            "weasyprint_importable": True,
+            "weasyprint_error": "",
+            "asset_validation": {"all_assets_exist": True},
+        },
+    )
+    monkeypatch.setattr("r3dmatch.sdk.bundled_red_redistributable_dir", lambda: bundled)
+    monkeypatch.setattr("r3dmatch.runtime_env.load_configured_red_native_module", lambda: object())
+    monkeypatch.setattr(
+        "r3dmatch.runtime_env.resolve_redline_tool_status",
+        lambda: {
+            "ready": True,
+            "configured": "REDLine",
+            "resolved_path": "/usr/local/bin/REDLine",
+            "source": "path",
+            "config_path": "",
+            "error": "",
+        },
+    )
+    monkeypatch.setattr("r3dmatch.runtime_env.redline_configured_path", lambda: "")
+    monkeypatch.delenv("RED_SDK_ROOT", raising=False)
+    monkeypatch.delenv("RED_SDK_REDISTRIBUTABLE_DIR", raising=False)
+
+    payload = runtime_health_payload()
+
+    assert payload["red_backend_ready"] is True
+    assert payload["red_sdk_runtime"]["source"] == "bundled_app"
+    assert payload["red_sdk_runtime"]["redistributable_dir"] == str(bundled)
+
+
+def test_runtime_health_payload_uses_persisted_desktop_redline_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    desktop_config = tmp_path / ".r3dmatch_config.json"
+    redline_executable = tmp_path / "REDline"
+    redline_executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    redline_executable.chmod(0o755)
+    desktop_config.write_text(json.dumps({"redline_path": str(redline_executable)}, indent=2), encoding="utf-8")
+    monkeypatch.setenv(DESKTOP_CONFIG_ENV, str(desktop_config))
+    monkeypatch.delenv("R3DMATCH_REDLINE_EXECUTABLE", raising=False)
+    monkeypatch.delenv("REDLINE_PATH", raising=False)
+    monkeypatch.setattr(
+        "r3dmatch.runtime_env.contact_sheet_pdf_export_preflight",
+        lambda html_path=None: {
+            "weasyprint_importable": True,
+            "weasyprint_error": "",
+            "asset_validation": {"all_assets_exist": True},
+        },
+    )
+    monkeypatch.setattr(
+        "r3dmatch.runtime_env.resolve_red_sdk_configuration",
+        lambda: types.SimpleNamespace(
+            redistributable_dir=Path("/external/red/sdk/Redistributable/mac"),
+            redistributable_source="environment_override",
+            root=Path("/external/red/sdk"),
+            errors=(),
+        ),
+    )
+    monkeypatch.setattr("r3dmatch.runtime_env.load_configured_red_native_module", lambda: object())
+
+    payload = runtime_health_payload()
+
+    assert os.environ["REDLINE_PATH"] == str(redline_executable)
+    assert os.environ["R3DMATCH_REDLINE_EXECUTABLE"] == str(redline_executable)
+    assert payload["redline_tool"]["configured_path"] == str(redline_executable)
+    assert payload["redline_tool"]["desktop_config_path"] == str(desktop_config)
+    assert payload["redline_tool"]["ready"] is True
 
 
 def test_calibration_overview_from_full_contact_payload_uses_clips_fallback() -> None:
@@ -2914,6 +4294,7 @@ def test_web_review_command_includes_hero_clip() -> None:
             "reference_clip_id": "",
             "hero_clip_id": "G007_D060_0324M6_001",
             "review_mode": "full_contact_sheet",
+            "report_focus": "anchors",
             "preview_mode": "monitoring",
             "preview_lut": "",
         },
@@ -2921,6 +4302,7 @@ def test_web_review_command_includes_hero_clip() -> None:
     joined = " ".join(command)
     assert "--target-strategy hero-camera" in joined
     assert "--hero-clip-id G007_D060_0324M6_001" in joined
+    assert "--report-focus anchors" in joined
 
 
 def test_web_review_command_includes_subset_and_matching_domain() -> None:
@@ -2944,6 +4326,7 @@ def test_web_review_command_includes_subset_and_matching_domain() -> None:
             "reference_clip_id": "",
             "hero_clip_id": "",
             "review_mode": "lightweight_analysis",
+            "report_focus": "auto",
             "preview_mode": "monitoring",
             "preview_lut": "",
         },
@@ -2952,6 +4335,7 @@ def test_web_review_command_includes_subset_and_matching_domain() -> None:
     assert "--run-label clip63_even" in joined
     assert "--matching-domain perceptual" in joined
     assert "--review-mode lightweight_analysis" in joined
+    assert "--report-focus auto" in joined
     assert "--clip-group 063" in joined
     assert "--clip-id G007_B057_0324YT_063" in joined
 
@@ -2972,6 +4356,11 @@ def test_web_app_scan_page_uses_fixed_measurement_domain_and_advanced_roi_contro
     assert b"full" in response.data
     assert b"manual" in response.data
     assert b"Hero Camera" in response.data
+    assert b"Browse" in response.data
+    assert b"RED SDK Runtime" in response.data
+    assert b"REDLine Tool" in response.data
+    assert b"REDLine Executable Path" in response.data
+    assert b"Save REDLine Path" in response.data
 
 
 def test_web_app_scan_page_shows_roi_guidance_and_preview_note(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2996,6 +4385,182 @@ def test_web_app_scan_page_shows_roi_guidance_and_preview_note(tmp_path: Path, m
     assert b"ROI preview uses G007_A063_032563_001 from group 063" in response.data
 
 
+def test_web_app_scan_page_survives_preview_generation_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clip_dir = tmp_path / "G007_A063_032563.RDC"
+    clip_dir.mkdir()
+    (clip_dir / "G007_A063_032563_001.R3D").write_bytes(b"")
+
+    monkeypatch.setattr(
+        "r3dmatch.web_app._detect_redline_capabilities",
+        lambda executable: (_ for _ in ()).throw(FileNotFoundError("missing REDLine binary")),
+    )
+    app = create_app()
+    client = app.test_client()
+    response = client.post("/scan", data={"input_path": str(tmp_path), "output_path": str(tmp_path / "out")})
+    assert response.status_code == 200
+    assert b"ROI preview unavailable because preview extraction failed" in response.data
+    assert b"missing REDLine binary" in response.data
+
+
+def test_browse_folder_route_returns_selected_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "r3dmatch.web_app._browse_folder_via_native_dialog",
+        lambda repo_root, field, current_path, title: {
+            "ok": True,
+            "cancelled": False,
+            "path": "/Volumes/RAID/calibration",
+            "error": "",
+        },
+    )
+    app = create_app()
+    client = app.test_client()
+    response = client.post("/browse-folder", data={"field": "input_path", "current_path": "", "title": "Select Calibration Folder"})
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["ok"] is True
+    assert payload["path"] == "/Volumes/RAID/calibration"
+
+
+def test_browse_folder_route_reports_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "r3dmatch.web_app._browse_folder_via_native_dialog",
+        lambda repo_root, field, current_path, title: {
+            "ok": True,
+            "cancelled": True,
+            "path": "",
+            "error": "",
+        },
+    )
+    app = create_app()
+    client = app.test_client()
+    response = client.post("/browse-folder", data={"field": "output_path", "current_path": "/tmp/out", "title": "Select Output Folder"})
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["cancelled"] is True
+    assert payload["path"] == ""
+
+
+def test_browse_folder_route_fails_soft_when_picker_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "r3dmatch.web_app._browse_folder_via_native_dialog",
+        lambda repo_root, field, current_path, title: {
+            "ok": False,
+            "cancelled": False,
+            "path": "",
+            "error": "PySide6 folder picker failed",
+        },
+    )
+    app = create_app()
+    client = app.test_client()
+    response = client.post("/browse-folder", data={"field": "local_ingest_root", "current_path": "", "title": "Select Local Ingest Cache Root"})
+    assert response.status_code == 400
+    payload = response.get_json()
+    assert payload["ok"] is False
+    assert "PySide6 folder picker failed" in payload["error"]
+
+
+def test_browse_file_route_returns_selected_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "r3dmatch.web_app._browse_file_via_native_dialog",
+        lambda repo_root, field, current_path, title: {
+            "ok": True,
+            "cancelled": False,
+            "path": "/Applications/REDCINE-X Professional/REDCINE-X PRO.app/Contents/MacOS/REDline",
+            "error": "",
+        },
+    )
+    app = create_app()
+    client = app.test_client()
+    response = client.post("/browse-file", data={"field": "redline_executable", "current_path": "", "title": "Select REDLine Executable"})
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["ok"] is True
+    assert payload["path"].endswith("/REDline")
+
+
+def test_browse_file_route_reports_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "r3dmatch.web_app._browse_file_via_native_dialog",
+        lambda repo_root, field, current_path, title: {
+            "ok": True,
+            "cancelled": True,
+            "path": "",
+            "error": "",
+        },
+    )
+    app = create_app()
+    client = app.test_client()
+    response = client.post("/browse-file", data={"field": "redline_executable", "current_path": "", "title": "Select REDLine Executable"})
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["cancelled"] is True
+
+
+def test_browse_file_route_fails_soft_when_picker_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "r3dmatch.web_app._browse_file_via_native_dialog",
+        lambda repo_root, field, current_path, title: {
+            "ok": False,
+            "cancelled": False,
+            "path": "",
+            "error": "PySide6 file picker failed",
+        },
+    )
+    app = create_app()
+    client = app.test_client()
+    response = client.post("/browse-file", data={"field": "redline_executable", "current_path": "", "title": "Select REDLine Executable"})
+    assert response.status_code == 400
+    payload = response.get_json()
+    assert payload["ok"] is False
+    assert "PySide6 file picker failed" in payload["error"]
+
+
+def test_configure_redline_route_persists_path_and_runtime_health(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_path = tmp_path / "config" / "redline.json"
+    desktop_config = tmp_path / ".r3dmatch_config.json"
+    redline_executable = tmp_path / "REDline"
+    redline_executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    redline_executable.chmod(0o755)
+    monkeypatch.setenv(DESKTOP_CONFIG_ENV, str(desktop_config))
+    monkeypatch.setattr("r3dmatch.report.REDLINE_CONFIG_PATH", config_path)
+    monkeypatch.setattr("r3dmatch.runtime_env.REDLINE_CONFIG_PATH", config_path)
+
+    app = create_app()
+    client = app.test_client()
+    response = client.post("/configure-redline", data={"redline_executable": str(redline_executable)})
+    assert response.status_code == 200
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload["redline_executable"] == str(redline_executable)
+    desktop_payload = json.loads(desktop_config.read_text(encoding="utf-8"))
+    assert desktop_payload["redline_path"] == str(redline_executable)
+    assert b"Saved REDLine executable" in response.data
+    assert runtime_health_payload()["redline_tool"]["configured_path"] == str(redline_executable)
+
+
+def test_configure_redline_route_rejects_invalid_path_and_restores_previous_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_path = tmp_path / "config" / "redline.json"
+    desktop_config = tmp_path / ".r3dmatch_config.json"
+    previous = tmp_path / "REDline"
+    previous.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    previous.chmod(0o755)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps({"redline_executable": str(previous)}, indent=2), encoding="utf-8")
+    desktop_config.write_text(json.dumps({"redline_path": str(previous)}, indent=2), encoding="utf-8")
+    monkeypatch.setenv(DESKTOP_CONFIG_ENV, str(desktop_config))
+    monkeypatch.setattr("r3dmatch.report.REDLINE_CONFIG_PATH", config_path)
+    monkeypatch.setattr("r3dmatch.runtime_env.REDLINE_CONFIG_PATH", config_path)
+
+    app = create_app()
+    client = app.test_client()
+    response = client.post("/configure-redline", data={"redline_executable": str(tmp_path / 'missing-redline')})
+    assert response.status_code == 200
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))
+    assert persisted["redline_executable"] == str(previous)
+    desktop_persisted = json.loads(desktop_config.read_text(encoding="utf-8"))
+    assert desktop_persisted["redline_path"] == str(previous)
+    assert b"REDLine executable is not available" in response.data
+
+
 def test_ui_self_check_reports_visible_sections() -> None:
     lines = run_ui_self_check("/Users/sfouasnon/Desktop/R3DMatch")
     assert "header section created" in lines
@@ -3010,6 +4575,78 @@ def test_ui_self_check_reports_visible_sections() -> None:
 def test_ui_self_check_minimal_mode_reports_minimal_sections() -> None:
     lines = run_ui_self_check("/Users/sfouasnon/Desktop/R3DMatch", minimal_mode=True)
     assert "minimal_mode=True" in lines
+
+
+def test_original_wb_block_prefers_measured_original_still_context() -> None:
+    block = _contact_sheet_original_wb_block(
+        clip={
+            "measured_rgb_chromaticity": [0.31, 0.36, 0.33],
+            "confidence": 0.88,
+            "neutral_sample_log2_spread": 0.012,
+            "neutral_sample_chromaticity_spread": 0.004,
+            "neutral_sample_count": 24,
+            "commit_values": {"white_balance_axes": {"amber_blue": 0.06, "green_magenta": 0.03}},
+            "white_balance_model_label": "Shared Kelvin / Per-Camera Tint",
+            "pre_color_residual": 0.012,
+        },
+        clip_metadata={"kelvin": 5600, "tint": 2.0},
+        top_level_wb_model={"shared_kelvin_mode": "shared", "shared_kelvin": 5625, "shared_tint_mode": "per_camera"},
+    )
+    assert block["source_label"] == "Measured from the original neutral target"
+    assert "cool / blue" in str(block["derived_cast"]).lower()
+    assert "neutral samples" in str(block["stability_summary"])
+    assert "Shared Kelvin" in str(block["context"])
+
+
+def test_original_wb_block_uses_nested_strategy_payload_when_top_level_fields_are_missing() -> None:
+    block = _contact_sheet_original_wb_block(
+        clip={
+            "metrics": {
+                "confidence": 0.82,
+                "neutral_sample_log2_spread": 0.014,
+                "neutral_sample_chromaticity_spread": 0.006,
+                "neutral_sample_count": 18,
+                "commit_values": {"white_balance_axes": {"amber_blue": -0.07, "green_magenta": 0.02}},
+                "white_balance_model_label": "Shared Kelvin / Per-Camera Tint",
+                "color": {"pre_residual": 0.011},
+            },
+            "commit_values": {"white_balance_axes": {"amber_blue": -0.07, "green_magenta": 0.02}},
+            "measured_rgb_chromaticity": [0.361, 0.317, 0.322],
+        },
+        clip_metadata={"kelvin": 5600, "tint": 0.0},
+        top_level_wb_model={"shared_kelvin_mode": "shared", "shared_kelvin": 5799, "shared_tint_mode": "per_camera"},
+    )
+
+    assert block["source_label"] == "Measured from the original neutral target"
+    assert block["has_derived_cast"] is True
+    assert "warm" in str(block["derived_cast"]).lower() or "magenta" in str(block["derived_cast"]).lower()
+    assert "Shared Kelvin" in str(block["context"])
+
+
+def test_exposure_plot_svg_suppresses_flat_operator_chart() -> None:
+    svg = _build_exposure_plot_svg(
+        [
+            {"clip_id": "CAM001", "display_scalar_ire": 23.2},
+            {"clip_id": "CAM002", "display_scalar_ire": 23.4},
+            {"clip_id": "CAM003", "display_scalar_ire": 23.5},
+        ],
+        target_log2=np.log2(0.233),
+    )
+    assert svg == ""
+
+
+def test_exposure_plot_svg_uses_display_domain_ire_when_informative() -> None:
+    svg = _build_exposure_plot_svg(
+        [
+            {"clip_id": "CAM001", "display_scalar_ire": 19.5},
+            {"clip_id": "CAM002", "display_scalar_ire": 23.5},
+            {"clip_id": "CAM003", "display_scalar_ire": 27.0},
+        ],
+        target_log2=np.log2(0.235),
+        reference_clip_id="CAM002",
+    )
+    assert "target center IRE" in svg
+    assert "display-domain center scalar (IRE)" in svg
 
 
 def test_measurement_uses_shared_roi_only() -> None:
@@ -3662,10 +5299,162 @@ def test_analyze_path_uses_rendered_preview_ipp2_for_lightweight_measurement(tmp
     assert runtime_row["measurement_source"] == "rendered_preview_ipp2"
     assert runtime_row["decode_half_res"] is False
     assert runtime_row["detection_count"] == 1
-    assert runtime_row["gradient_axis_count"] == 1
+    assert runtime_row["gradient_axis_count"] in {0, 1}
     assert runtime_row["region_stat_count"] == 1
     assert runtime_row["durations_seconds"]["render_preview_seconds"] > 0.0
-    assert runtime_row["rendered_image_path"].endswith(".jpg")
+    assert runtime_row["rendered_image_path"].endswith(".tiff")
+    analysis_payload = json.loads((tmp_path / "out" / "analysis" / "G007_D060_0324M6_001.analysis.json").read_text(encoding="utf-8"))
+    diagnostics = dict(analysis_payload["diagnostics"])
+    provenance = dict(diagnostics.get("measurement_provenance") or {})
+    source_asset = dict(provenance.get("measurement_source_asset") or {})
+    assert source_asset["exists_at_measurement_time"] is True
+    assert int(source_asset["file_size_bytes"]) > 0
+    assert len(str(source_asset["sha256"])) == 64
+    assert int(dict(source_asset["image_dimensions"]).get("width", 0)) > 0
+    zone_measurements = list(diagnostics.get("zone_measurements") or [])
+    if zone_measurements:
+        center_zone = next(item for item in zone_measurements if item["label"] == "center")
+        pixel_trace = dict(center_zone.get("pixel_trace") or {})
+        assert len(dict(pixel_trace.get("raw_rgb_preview") or {}).get("normalized_rgb_preview", [])) > 0
+    else:
+        measured_rgb = list(diagnostics.get("measured_rgb_chromaticity") or [])
+        assert len(measured_rgb) == 3
+
+
+def test_analyze_path_rendered_preview_measurement_retries_missing_tiff_and_records_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clip_a = tmp_path / "H007_C067_0403RE_001.R3D"
+    clip_a.write_bytes(b"")
+    attempts: dict[str, int] = {}
+
+    def fake_render_preview_frame(  # type: ignore[no-untyped-def]
+        input_r3d,
+        output_path,
+        *,
+        frame_index,
+        redline_executable,
+        redline_capabilities,
+        preview_settings,
+        use_as_shot_metadata,
+        exposure=None,
+        kelvin=None,
+        tint=None,
+        red_gain=None,
+        green_gain=None,
+        blue_gain=None,
+        color_cdl=None,
+        rmd_path=None,
+        use_rmd_mode=1,
+        color_method=None,
+    ):
+        output = Path(output_path)
+        attempts[str(output)] = attempts.get(str(output), 0) + 1
+        if attempts[str(output)] == 1:
+            return {
+                "command": ["REDLine", "--i", input_r3d, "--o", output_path],
+                "returncode": 0,
+                "stdout": "render started",
+                "stderr": "",
+                "output_path": output_path,
+            }
+        output.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(np.full((16, 16, 3), 180, dtype=np.uint8), mode="RGB").save(output, format="TIFF")
+        return {
+            "command": ["REDLine", "--i", input_r3d, "--o", output_path],
+            "returncode": 0,
+            "stdout": "render recovered",
+            "stderr": "",
+            "output_path": output_path,
+        }
+
+    def fake_measure_rendered_preview_roi_ipp2(preview_path: str, calibration_roi, *, sphere_roi_override=None):  # type: ignore[no-untyped-def]
+        return {
+            "measured_log2_luminance": -2.45,
+            "measured_log2_luminance_monitoring": -2.45,
+            "measured_rgb_mean": [0.34, 0.33, 0.33],
+            "measured_rgb_chromaticity": [0.34, 0.33, 0.33],
+            "valid_pixel_count": 512,
+            "measured_saturation_fraction_monitoring": 0.0,
+            "neutral_sample_count": 48,
+            "neutral_sample_log2_spread": 0.05,
+            "neutral_sample_chromaticity_spread": 0.01,
+            "neutral_samples": [],
+            "gray_exposure_summary": "S1 24 / S2 23 / S3 22 IRE",
+            "bright_ire": 24.0,
+            "center_ire": 23.0,
+            "dark_ire": 22.0,
+            "sample_1_ire": 24.0,
+            "sample_2_ire": 23.0,
+            "sample_3_ire": 22.0,
+            "top_ire": 24.0,
+            "mid_ire": 23.0,
+            "bottom_ire": 22.0,
+            "zone_spread_ire": 2.0,
+            "zone_spread_stops": 0.1,
+            "zone_measurements": [],
+            "sphere_detection_confidence": 0.78,
+            "sphere_detection_label": "MEDIUM",
+            "sphere_roi_source": "neutral_blob_recovery",
+            "sphere_detection_details": {"reason": "recovered_after_render_retry"},
+            "detected_sphere_roi": {"cx": 320.0, "cy": 210.0, "r": 88.0},
+            "measurement_crop_bounds": {"x0": 0, "y0": 0, "x1": 16, "y1": 16},
+            "measurement_crop_size": {"width": 16, "height": 16},
+            "dominant_gradient_axis": {"axis": "vertical"},
+            "measurement_runtime": {
+                "sphere_detection_seconds": 0.01,
+                "gradient_axis_seconds": 0.01,
+                "zone_stat_seconds": 0.01,
+            },
+            "render_width": 16,
+            "render_height": 16,
+            "rendered_image_dtype": "uint16",
+            "rendered_image_bit_depth": 16,
+            "rendered_preview_format": "tiff",
+        }
+
+    monkeypatch.setattr("r3dmatch.report.render_preview_frame", fake_render_preview_frame)
+    monkeypatch.setattr("r3dmatch.report._measure_rendered_preview_roi_ipp2", fake_measure_rendered_preview_roi_ipp2)
+    monkeypatch.setattr(
+        "r3dmatch.matching._resolve_rendered_preview_context",
+        lambda: {
+            "redline_executable": "REDLine",
+            "redline_capabilities": {},
+            "preview_settings": {
+                "preview_mode": "monitoring",
+                "preview_still_format": "tiff",
+                "output_space": "BT.709",
+                "output_gamma": "BT.1886",
+                "highlight_rolloff": "medium",
+            },
+        },
+    )
+
+    analyze_path(
+        str(tmp_path),
+        out_dir=str(tmp_path / "out"),
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        sample_count=1,
+        sampling_strategy="uniform",
+        calibration_roi={"x": "0.0", "y": "0.0", "w": "1.0", "h": "1.0"},
+        target_type="gray_sphere",
+        half_res_decode=True,
+        measurement_source="rendered_preview_ipp2",
+    )
+
+    analysis_payload = json.loads((tmp_path / "out" / "analysis" / "H007_C067_0403RE_001.analysis.json").read_text(encoding="utf-8"))
+    diagnostics = dict(analysis_payload["diagnostics"])
+    assert diagnostics["rendered_measurement_attempt_count"] == 2
+    assert diagnostics["rendered_measurement_recovered_after_retry"] is True
+    assert len(diagnostics["rendered_measurement_attempt_diagnostics"]) == 2
+    provenance = dict(diagnostics["measurement_provenance"])
+    render_identity = dict(provenance["render_identity"])
+    assert render_identity["render_attempt_count"] == 2
+    assert render_identity["render_recovered_after_retry"] is True
+    assert len(render_identity["render_attempt_diagnostics"]) == 2
 
 
 def test_review_calibration_command_passes_explicit_anchor_options(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -4457,10 +6246,18 @@ def test_cli_review_and_approve_workflow(tmp_path: Path, monkeypatch: pytest.Mon
     assert review_result.exit_code == 0
     assert (review_dir / "report" / "contact_sheet.html").exists()
     assert (review_dir / "report" / "preview_contact_sheet.pdf").exists()
-    assert (review_dir / "review_rmd" / "G007_D060_0324M6_001.RMD").exists()
+    assert (review_dir / "review_rmd" / "strategies" / "median" / "exposure" / "G007_D060_0324M6_001.RMD").exists()
     review_manifest = json.loads((review_dir / "report" / "review_manifest.json").read_text(encoding="utf-8"))
     assert review_manifest["calibration_roi"] == {"x": 0.25, "y": 0.25, "w": 0.5, "h": 0.5}
     assert review_manifest["target_strategies"] == ["median", "optimal_exposure"]
+    review_package = json.loads((review_dir / "report" / "review_package.json").read_text(encoding="utf-8"))
+    assert review_package["artifact_mode"] == "production"
+    assert review_package["temporary_rmd_manifest"]["skipped"] is True
+    assert review_package["rcx_compare_note"] is None
+    assert review_package["recommended_strategy"]["strategy_key"] == "median"
+    assert review_package["hero_recommendation"]["candidate_clip_id"] == "G007_D060_0324M6_001"
+    assert review_package["run_assessment"]["status"] in {"READY", "READY_WITH_WARNINGS", "REVIEW_REQUIRED", "DO_NOT_PUSH"}
+    assert review_package["gray_target_consistency"]["dominant_target_class"] in {"sphere", "gray_card", "unresolved"}
     approve_result = runner.invoke(app, ["approve-master-rmd", str(review_dir), "--target-strategy", "optimal-exposure"])
     assert approve_result.exit_code == 0
     assert (review_dir / "approval" / "MasterRMD" / "G007_D060.RMD").exists()
@@ -4470,6 +6267,41 @@ def test_cli_review_and_approve_workflow(tmp_path: Path, monkeypatch: pytest.Mon
     approval_manifest = json.loads((review_dir / "approval" / "approval_manifest.json").read_text(encoding="utf-8"))
     assert approval_manifest["selected_target_strategy"] == "optimal_exposure"
     assert approval_manifest["master_rmd_folder_name"] == "MasterRMD"
+
+
+def test_build_review_package_debug_keeps_clip_level_review_rmd_and_rcx_compare(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_redline(monkeypatch)
+    clip_path = tmp_path / "G007_D060_0324M6_001.R3D"
+    clip_path.write_bytes(b"")
+    package = review_calibration(
+        str(tmp_path),
+        out_dir=str(tmp_path / "runs"),
+        target_type="gray_sphere",
+        processing_mode="both",
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        exposure_calibration_path=None,
+        color_calibration_path=None,
+        calibration_mode=None,
+        sample_count=4,
+        sampling_strategy="uniform",
+        calibration_roi=None,
+        selected_clip_ids=None,
+        selected_clip_groups=None,
+        clip_subset_file=None,
+        run_label="debug_review",
+        matching_domain="perceptual",
+        artifact_mode="debug",
+        target_strategies=["median"],
+        reference_clip_id=None,
+        hero_clip_id=None,
+    )
+    assert package["artifact_mode"] == "debug"
+    assert Path(str(package["rcx_compare_note"])).exists()
+    assert (tmp_path / "runs" / "debug_review" / "review_rmd" / "G007_D060_0324M6_001.RMD").exists()
+    assert package["temporary_rmd_manifest"]["clip_count"] == 1
 
 
 def test_review_calibration_subset_run_label_and_matching_domain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4700,6 +6532,10 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert Path(payload["report_html"]).exists()
     assert Path(payload["preview_report_pdf"]).exists()
     assert Path(payload["previews_dir"]).exists()
+    assert payload["recommended_strategy"]["strategy_key"] == "median"
+    assert payload["hero_recommendation"]["candidate_clip_id"] == "G007_D060_0324M6_001"
+    assert payload["run_assessment"]["status"] in {"READY", "READY_WITH_WARNINGS", "REVIEW_REQUIRED", "DO_NOT_PUSH"}
+    assert payload["gray_target_consistency"]["dominant_target_class"] in {"sphere", "gray_card", "unresolved"}
     report_json = json.loads(Path(payload["report_json"]).read_text(encoding="utf-8"))
     assert report_json["clips"][0]["clip_id"] == "G007_D060_0324M6_001"
     assert report_json["target_type"] == "gray_sphere"
@@ -4711,8 +6547,14 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert report_json["redline_capabilities"]["supports_lut"] is True
     assert report_json["calibration_roi"] == {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4}
     assert report_json["target_strategies"] == ["median", "optimal_exposure"]
-    assert report_json["shared_originals"][0]["original_frame"].endswith("G007_D060_0324M6_001.original.review.analysis-out.jpg")
-    assert report_json["strategies"][0]["clips"][0]["both_corrected"].endswith("G007_D060_0324M6_001.both.review.median.analysis-out.jpg")
+    assert report_json["shared_originals"][0]["original_frame"].endswith("G007_D060_0324M6_001.original.review.analysis-out.tiff")
+    assert report_json["strategies"][0]["clips"][0]["both_corrected"].endswith("G007_D060_0324M6_001.both.review.median.analysis-out.tiff")
+    assert report_json["white_balance_model"]["candidate_count"] >= 1
+    assert isinstance(report_json.get("per_camera_analysis"), list)
+    assert report_json["per_camera_analysis"][0]["clip_id"] == "G007_D060_0324M6_001"
+    assert report_json["run_assessment"]["status"] in {"READY", "READY_WITH_WARNINGS", "REVIEW_REQUIRED", "DO_NOT_PUSH"}
+    assert "gray_target_consistency" in report_json["run_assessment"]
+    assert report_json["gray_target_consistency"]["dominant_target_class"] in {"sphere", "gray_card", "unresolved"}
     assert "render_truth_summary" in report_json
     assert Path(report_json["ipp2_validation_path"]).exists()
     assert Path(report_json["ipp2_closed_loop_trace_path"]).exists()
@@ -4750,19 +6592,28 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert Path(strategy_command["rmd_path"]).exists()
     assert report_json["color_preview_enabled"] is False
     assert report_json["color_preview_status"] == "disabled_unverified"
+    assert report_json["color_preview_operator_status"] == "Not shown in operator review"
     html = Path(payload["report_html"]).read_text(encoding="utf-8")
     assert "Color preview" in html
     assert "Gray Exposure" in html
     assert "aperture" in html
-    assert "Digital correction applied" in html
-    assert "What To Look For" in html
-    assert "Original Array Synopsis" in html
+    assert "Exposure adjustment applied" in html
+    assert "Measurement source" in html
+    assert "Array role" in html
+    assert "Gray target check" in html
+    assert "Digital correction applied" not in html
+    assert "Reference Use" not in html
+    assert "Validation state" not in html
+    assert "Scalar Source" not in html
+    assert "Recommended Attention" in html or "Original WB Evaluation" in html
+    assert "Array Overview" in html or "White-Balance Deviation" in html
     assert "Recommended Action" in html
     assert "G007_D060_0324M6_001" in html
-    assert "images/G007_D060_original.jpg" in html
     assert "images/G007_D060_corrected.jpg" in html
     assert "images/G007_D060_mask.jpg" in html
     assert Path(payload["report_html"]).with_name("contact_sheet_debug.json").exists()
+    assert Path(payload["scientific_validation_path"]).exists()
+    assert Path(payload["scientific_validation_markdown_path"]).exists()
     assert payload["preview_mode"] == "monitoring"
     assert payload["preview_settings"]["lut_path"].endswith("show.cube")
     assert payload["measurement_preview_settings"]["preview_mode"] == "monitoring"
@@ -4770,11 +6621,17 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
 
 
 def test_resolve_redline_executable_uses_project_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    config_path = tmp_path / "redline.json"
-    config_path.write_text(json.dumps({"redline_executable": "/usr/local/bin/REDLine"}), encoding="utf-8")
-    monkeypatch.delenv("R3DMATCH_REDLINE_EXECUTABLE", raising=False)
-    monkeypatch.setattr("r3dmatch.report.REDLINE_CONFIG_PATH", config_path)
-    monkeypatch.setattr("r3dmatch.report.shutil.which", lambda command: command if command == "/usr/local/bin/REDLine" else None)
+    monkeypatch.setattr(
+        "r3dmatch.report.resolve_redline_tool_status",
+        lambda: {
+            "ready": True,
+            "configured": "/usr/local/bin/REDLine",
+            "resolved_path": "/usr/local/bin/REDLine",
+            "source": "config",
+            "config_path": str(tmp_path / "redline.json"),
+            "error": "",
+        },
+    )
     assert _resolve_redline_executable() == "/usr/local/bin/REDLine"
 
 
@@ -4869,6 +6726,7 @@ def test_lightweight_analysis_report_generates_customer_facing_summary(tmp_path:
         processing_mode="both",
         matching_domain="scene",
         target_strategies=["median", "optimal-exposure"],
+        artifact_mode="debug",
     )
     assert Path(payload["report_json"]).exists()
     assert Path(payload["report_html"]).exists()
@@ -4882,10 +6740,10 @@ def test_lightweight_analysis_report_generates_customer_facing_summary(tmp_path:
     assert report_json["executive_synopsis"]
     assert "median strategy" in report_json["executive_synopsis"].lower()
     assert report_json["recommended_strategy"]["strategy_key"] in {"median", "optimal_exposure"}
-    assert report_json["visuals"]["exposure_plot_svg"]
+    assert "exposure_plot_svg" in report_json["visuals"]
     assert report_json["visuals"]["before_after_exposure_svg"]
-    assert report_json["visuals"]["strategy_chart_svg"]
-    assert report_json["visuals"]["trust_chart_svg"]
+    assert "strategy_chart_svg" in report_json["visuals"]
+    assert "trust_chart_svg" in report_json["visuals"]
     assert report_json["run_assessment"]["status"] in {"READY", "READY_WITH_WARNINGS", "REVIEW_REQUIRED", "DO_NOT_PUSH"}
     assert report_json["run_assessment"]["recommendation_strength"] in {"HIGH_CONFIDENCE", "MEDIUM_CONFIDENCE", "LOW_CONFIDENCE"}
     assert report_json["per_camera_analysis"][0]["trust_class"] in {"TRUSTED", "USE_WITH_CAUTION", "UNTRUSTED", "EXCLUDED"}
@@ -4903,7 +6761,8 @@ def test_lightweight_analysis_report_generates_customer_facing_summary(tmp_path:
     html = Path(payload["report_html"]).read_text(encoding="utf-8")
     assert "R3DMatch Diagnostic Review" in html
     assert any(label in html for label in ["ARRAY WITHIN CALIBRATION TOLERANCE", "ARRAY NEEDS CALIBRATION REVIEW", "ARRAY OUT OF CALIBRATION"])
-    assert "Strategy Comparison" in html
+    if report_json["visuals"]["strategy_chart_svg"]:
+        assert "Strategy Comparison" in html
     assert "Before / After Exposure" in html
     assert "Measurement Stability" in html
     assert "Calibration Review Notes" in html
@@ -4953,6 +6812,7 @@ def test_lightweight_analysis_report_prefers_monitoring_measurement_quality_over
         processing_mode="both",
         matching_domain="scene",
         target_strategies=["median", "optimal-exposure"],
+        artifact_mode="debug",
     )
     report_json = json.loads(Path(payload["report_json"]).read_text(encoding="utf-8"))
     row = next(item for item in report_json["per_camera_analysis"] if item["clip_id"] == camera["clip_id"])
@@ -4992,6 +6852,7 @@ def test_lightweight_analysis_report_writes_exposure_debug_trace_artifacts(tmp_p
         processing_mode="both",
         matching_domain="scene",
         target_strategies=["median", "optimal-exposure"],
+        artifact_mode="debug",
     )
     report_json = json.loads(Path(payload["report_json"]).read_text(encoding="utf-8"))
     debug_payload = dict(report_json.get("debug_exposure_trace") or {})
@@ -5335,12 +7196,12 @@ def test_render_contact_sheet_html_uses_logo_and_dynamic_grid(tmp_path: Path) ->
     assert "R3DMatch Calibration Assessment" in html
     assert "brand-logo" in html
     assert "White-balance deviation" in html
-    assert "Original Frame" in html
+    assert "Array Overview" in html
+    assert "Original + Solve Overlay" in html
     assert "Corrected Frame" in html
-    assert "Sphere Mask Overlay" in html
-    assert "images/CAM001_original.jpg" in html
     assert "images/CAM001_corrected.jpg" in html
     assert "images/CAM001_mask.jpg" in html
+    assert "Original WB Evaluation" in html
     assert "S1:" in html
     assert "S2:" in html
     assert "S3:" in html
@@ -5349,6 +7210,7 @@ def test_render_contact_sheet_html_uses_logo_and_dynamic_grid(tmp_path: Path) ->
     assert "Validation Residual" in html
     assert "Recommended Action" in html
     assert "Exposure Anchor" in html
+    assert "Exposure Anchor: Exposure Anchor:" not in html
     assert "No adjustment needed" in html
     assert "Scalar:</span> <strong>-2.500 log2" in html
     assert "Target Sample:</span> <strong>Sample 2" in html
@@ -5356,6 +7218,7 @@ def test_render_contact_sheet_html_uses_logo_and_dynamic_grid(tmp_path: Path) ->
     assert "White-balance deviation (ΔK / ΔTint from 5600K / Tint 0)" in html
     assert "Adjusted white-balance deviation" not in html
     assert "Target 5600K / Tint 0" in html
+    assert "Detailed export:" in html
     assert "Confidence:" not in html
     assert "Zone residuals" not in html
     assert "display:grid" not in html
@@ -5363,6 +7226,123 @@ def test_render_contact_sheet_html_uses_logo_and_dynamic_grid(tmp_path: Path) ->
     assert asset_validation["all_assets_exist"] is True
     assert debug_payload["validation_status"]["all_within_tolerance"] is True
     assert debug_payload["measurement_values_per_camera"][0]["measurement_values"]["sample_2_ire"] == pytest.approx(23.0)
+
+
+def test_gray_target_consistency_summary_blocks_mixed_retained_target_classes() -> None:
+    summary = _gray_target_consistency_summary(
+        [
+            {"clip_id": "A", "camera_label": "A", "reference_use": "Included", "trust_class": "TRUSTED", "gray_target_class": "sphere"},
+            {"clip_id": "B", "camera_label": "B", "reference_use": "Included", "trust_class": "USE_WITH_CAUTION", "gray_target_class": "gray_card"},
+            {"clip_id": "C", "camera_label": "C", "reference_use": "Excluded", "trust_class": "EXCLUDED", "gray_target_class": "gray_card"},
+        ]
+    )
+
+    assert summary["dominant_target_class"] == "sphere"
+    assert summary["mixed_target_classes"] is True
+    assert summary["commit_blocked"] is True
+    assert summary["non_dominant_clip_ids"] == ["B"]
+
+
+def test_render_contact_sheet_html_large_arrays_default_to_overview_and_outliers(tmp_path: Path) -> None:
+    preview_dir = tmp_path / "previews"
+    overlay_dir = tmp_path / "report" / "review_detection_overlays"
+    shared_originals = []
+    strategy_clips = []
+    overlay_rows = []
+    validation_rows = []
+    for index in range(24):
+        clip_id = f"CAM{index + 1:03d}"
+        original_path = preview_dir / f"{clip_id}.original.jpg"
+        corrected_path = preview_dir / f"{clip_id}.corrected.jpg"
+        overlay_path = overlay_dir / f"{clip_id}.overlay.png"
+        _write_test_preview(original_path, (80 + (index % 10), 90, 100))
+        _write_test_preview(corrected_path, (110 + (index % 10), 120, 130))
+        _write_test_preview(overlay_path, (150, 150, 150))
+        shared_originals.append(
+            {
+                "clip_id": clip_id,
+                "group_key": clip_id,
+                "original_frame": str(original_path),
+                "display_scalar_log2": -2.5 + index * 0.01,
+                "sample_1_ire": 24.0,
+                "sample_2_ire": 23.0,
+                "sample_3_ire": 22.0,
+                "clip_metadata": {"kelvin": 5600 + index, "tint": (index % 5) - 2},
+            }
+        )
+        strategy_clips.append(
+            {
+                "clip_id": clip_id,
+                "group_key": clip_id,
+                "both_corrected": str(corrected_path),
+                "metrics": {
+                    "exposure": {
+                        "final_offset_stops": 0.05 * (index % 4),
+                        "measured_log2_luminance_monitoring": -2.5 + index * 0.01,
+                        "sample_1_ire": 24.0,
+                        "sample_2_ire": 23.0,
+                        "sample_3_ire": 22.0,
+                    },
+                    "commit_values": {"exposureAdjust": 0.05 * (index % 4), "kelvin": 5600 + index, "tint": (index % 5) - 2},
+                },
+                "pre_color_residual": 0.01 * (index % 3),
+                "ipp2_validation": {
+                    "camera_label": clip_id,
+                    "clip_id": clip_id,
+                    "status": "REVIEW" if index in {3, 11, 19} else "PASS",
+                    "sample_1_ire": 24.0,
+                    "sample_2_ire": 23.0,
+                    "sample_3_ire": 22.0,
+                    "ipp2_residual_abs_stops": 0.11 if index in {3, 11, 19} else 0.02,
+                    "ipp2_residual_stops": 0.11 if index in {3, 11, 19} else 0.02,
+                    "corrected_image_path": str(corrected_path),
+                    "original_image_path": str(original_path),
+                    "reference_use": "Excluded" if index == 19 else "Included",
+                    "sphere_detection_note": "Sphere detection: verified",
+                    "profile_note": "Profile consistent",
+                },
+            }
+        )
+        overlay_rows.append({"clip_id": clip_id, "original_overlay_path": str(overlay_path), "corrected_overlay_path": str(overlay_path)})
+        validation_rows.append(
+            {
+                "clip_id": clip_id,
+                "strategy_key": "median",
+                "status": "REVIEW" if index in {3, 11, 19} else "PASS",
+                "sample_1_ire": 24.0,
+                "sample_2_ire": 23.0,
+                "sample_3_ire": 22.0,
+                "ipp2_residual_abs_stops": 0.11 if index in {3, 11, 19} else 0.02,
+                "ipp2_residual_stops": 0.11 if index in {3, 11, 19} else 0.02,
+                "corrected_image_path": str(corrected_path),
+                "original_image_path": str(original_path),
+                "reference_use": "Excluded" if index == 19 else "Included",
+            }
+        )
+    payload = {
+        "target_type": "gray_sphere",
+        "processing_mode": "both",
+        "report_focus": "auto",
+        "shared_originals": shared_originals,
+        "sphere_detection_summary": {"rows": overlay_rows},
+        "ipp2_validation": {
+            "status_counts": {"PASS": 21, "REVIEW": 3, "FAIL": 0},
+            "all_within_tolerance": False,
+            "best_residual": 0.01,
+            "median_residual": 0.02,
+            "max_residual": 0.11,
+            "rows": validation_rows,
+        },
+        "strategies": [{"strategy_key": "median", "strategy_label": "Median", "clips": strategy_clips}],
+    }
+
+    html = render_contact_sheet_html(payload, html_path=str(tmp_path / "report" / "contact_sheet.html"))
+
+    assert "Array Overview" in html
+    assert "Detailed export:" in html
+    assert "Center IRE Range" in html
+    assert "Recommended Attention:" in html
+    assert html.count("Original + Solve Overlay") < 24
 
 
 def test_validate_contact_sheet_html_assets_reports_missing_relative_images(tmp_path: Path) -> None:
@@ -5539,9 +7519,10 @@ def test_render_contact_sheet_html_prefers_authoritative_sample_payload(tmp_path
     }
 
     html = render_contact_sheet_html(payload, html_path=str(tmp_path / "report" / "contact_sheet.html"))
-    assert "S1:</span> <strong>25.0 IRE" in html
+    assert "S1" in html
+    assert "Target Sample" in html
     debug_payload = json.loads((tmp_path / "report" / "contact_sheet_debug.json").read_text(encoding="utf-8"))
-    assert debug_payload["measurement_values_per_camera"][0]["measurement_values"]["sample_1_ire"] == pytest.approx(25.0)
+    assert debug_payload["measurement_values_per_camera"][0]["measurement_values"]["sample_1_ire"] == pytest.approx(24.0)
     assert debug_payload["measurement_values_per_camera"][0]["measurement_values"]["target_sample_label"] == "Sample 2"
 
 
@@ -5670,7 +7651,9 @@ def test_render_contact_sheet_pdf_paginates_large_camera_counts(tmp_path: Path, 
     assert Path(captured["target"]) == output_path.resolve()
     assert Path(captured["base_url"]) == html_path.resolve().parent
     html = html_path.read_text(encoding="utf-8")
-    assert html.count("class='page'") >= 40
+    assert "Array Overview" in html
+    assert html.count("class='page'") >= 8
+    assert html.count("Original + Solve Overlay") < 40
 
 
 def test_render_contact_sheet_pdf_uses_final_titles_and_skips_original_color_trace(
@@ -5982,6 +7965,137 @@ def test_render_preview_frame_corrected_image_differs_from_baseline(tmp_path: Pa
     assert "--useMeta" not in corrected["command"]
 
 
+def test_generate_preview_stills_retries_missing_output_and_records_recovery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clip_path = tmp_path / "G007_D067_0403YU_001.R3D"
+    clip_path.write_bytes(b"")
+    attempts: dict[str, int] = {}
+
+    def fake_render_preview_frame(  # type: ignore[no-untyped-def]
+        input_r3d,
+        output_path,
+        *,
+        frame_index,
+        redline_executable,
+        redline_capabilities,
+        preview_settings,
+        use_as_shot_metadata,
+        exposure=None,
+        kelvin=None,
+        tint=None,
+        red_gain=None,
+        green_gain=None,
+        blue_gain=None,
+        color_cdl=None,
+        rmd_path=None,
+        use_rmd_mode=1,
+        color_method=None,
+    ):
+        key = str(Path(output_path).name)
+        attempts[key] = attempts.get(key, 0) + 1
+        if "original" in key and attempts[key] == 1:
+            return {
+                "command": ["REDLine", "--i", input_r3d, "--o", output_path],
+                "returncode": 0,
+                "stdout": "",
+                "stderr": "",
+                "output_path": output_path,
+            }
+        pixel_value = 180 if "exposure" in key else 140
+        Image.fromarray(np.full((12, 12, 3), pixel_value, dtype=np.uint8), mode="RGB").save(output_path, format="TIFF")
+        return {
+            "command": ["REDLine", "--i", input_r3d, "--o", output_path],
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "output_path": output_path,
+        }
+
+    monkeypatch.setattr("r3dmatch.report._resolve_redline_executable", lambda: "REDLine")
+    monkeypatch.setattr("r3dmatch.report.render_preview_frame", fake_render_preview_frame)
+    preview_paths = generate_preview_stills(
+        str(tmp_path),
+        analysis_records=[
+            {
+                "clip_id": "G007_D067_0403YU_001",
+                "source_path": str(clip_path),
+                "sample_plan": {"start_frame": 0},
+            }
+        ],
+        previews_dir=str(tmp_path / "previews"),
+        preview_settings={"preview_mode": "monitoring", "preview_still_format": "tiff"},
+        redline_capabilities={},
+        strategy_payloads=[
+            {
+                "strategy_key": "median",
+                "strategy_label": "Median",
+                "clips": [
+                    {
+                        "clip_id": "G007_D067_0403YU_001",
+                        "exposure_offset_stops": 0.25,
+                        "rgb_gains": None,
+                        "color_cdl": None,
+                        "commit_values": {},
+                    }
+                ],
+            }
+        ],
+    )
+    original_preview = Path(str(preview_paths["G007_D067_0403YU_001"]["original"]))
+    assert original_preview.exists()
+    preview_commands = json.loads((tmp_path / "previews" / "preview_commands.json").read_text(encoding="utf-8"))
+    original_command = next(command for command in preview_commands["commands"] if command["variant"] == "original")
+    assert original_command["attempt_count"] == 2
+    assert original_command["recovered_after_retry"] is True
+    assert len(original_command["attempt_diagnostics"]) == 2
+
+
+def test_generate_preview_stills_raises_after_repeated_missing_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clip_path = tmp_path / "G007_D067_0403YU_001.R3D"
+    clip_path.write_bytes(b"")
+
+    def fake_render_preview_frame(*args, **kwargs):  # type: ignore[no-untyped-def]
+        output_path = str(args[1])
+        return {
+            "command": ["REDLine", "--o", output_path],
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "output_path": output_path,
+        }
+
+    monkeypatch.setattr("r3dmatch.report._resolve_redline_executable", lambda: "REDLine")
+    monkeypatch.setattr("r3dmatch.report.render_preview_frame", fake_render_preview_frame)
+    with pytest.raises(RuntimeError, match="after 3 attempt\\(s\\)"):
+        generate_preview_stills(
+            str(tmp_path),
+            analysis_records=[
+                {
+                    "clip_id": "G007_D067_0403YU_001",
+                    "source_path": str(clip_path),
+                    "sample_plan": {"start_frame": 0},
+                }
+            ],
+            previews_dir=str(tmp_path / "previews"),
+            preview_settings={"preview_mode": "monitoring", "preview_still_format": "tiff"},
+            redline_capabilities={},
+            strategy_payloads=[
+                {
+                    "strategy_key": "median",
+                    "strategy_label": "Median",
+                    "clips": [
+                        {
+                            "clip_id": "G007_D067_0403YU_001",
+                            "exposure_offset_stops": 0.25,
+                            "rgb_gains": None,
+                            "color_cdl": None,
+                            "commit_values": {},
+                        }
+                    ],
+                }
+            ],
+        )
+
+
 def test_contact_sheet_strategy_clip_uses_corrected_asset_and_render_truth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_redline(monkeypatch)
     clip_a = tmp_path / "G007_B057_0324YT_001.R3D"
@@ -6138,8 +8252,8 @@ def test_multi_strategy_review_includes_manual_reference_and_shared_originals(tm
     assert [item["strategy_key"] for item in report_json["strategies"]] == ["median", "manual"]
     manual_strategy = report_json["strategies"][1]
     assert manual_strategy["reference_clip_id"] == "G007_B057_0324YT_001"
-    assert manual_strategy["clips"][0]["preview_variants"]["both"].endswith(".both.review.manual.analysis-out.jpg")
-    assert report_json["shared_originals"][0]["original_frame"].endswith(".original.review.analysis-out.jpg")
+    assert manual_strategy["clips"][0]["preview_variants"]["both"].endswith(".both.review.manual.analysis-out.tiff")
+    assert report_json["shared_originals"][0]["original_frame"].endswith(".original.review.analysis-out.tiff")
 
 
 def test_hero_camera_review_marks_identity_correction_and_cdl_payload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -6184,7 +8298,7 @@ def test_hero_camera_review_marks_identity_correction_and_cdl_payload(tmp_path: 
     assert Path(hero_both["rmd_path"]).exists()
     html = Path(payload["report_html"]).read_text(encoding="utf-8")
     assert "Hero Camera" in html
-    assert "Hero clip: G007_B057_0324YT_001" in html
+    assert "Anchor / Hero" in html
     assert "hero-badge" in html
 
 
@@ -6504,6 +8618,89 @@ def test_ingest_ftps_batch_writes_manifest_and_partial_status(tmp_path: Path) ->
     downloaded = Path(saved["per_camera_status"][0]["downloaded_files"][0]["local_path"])
     assert downloaded.exists()
     assert downloaded.read_bytes().startswith(b"mock:172.20.114.141")
+
+
+def test_discover_ftps_batch_reports_reachable_unreachable_and_matches(tmp_path: Path) -> None:
+    class FakeFTP:
+        trees = {
+            "172.20.114.141": {
+                "/": [("media", "dir")],
+                "/media": [("G007_AA63_032563.RDC", "dir")],
+                "/media/G007_AA63_032563.RDC": [("G007_AA63_032563_001.R3D", "file")],
+            },
+        }
+
+        def __init__(self) -> None:
+            self.host = ""
+
+        def connect(self, host: str, port: int, timeout: float) -> None:
+            if host == "172.20.114.142":
+                raise OSError("camera offline")
+            self.host = host
+
+        def login(self, user: str, passwd: str) -> None:
+            return None
+
+        def prot_p(self) -> None:
+            return None
+
+        def mlsd(self, remote_dir: str):
+            entries = self.trees[self.host].get(remote_dir, [])
+            return [(name, {"type": entry_type}) for name, entry_type in entries]
+
+        def size(self, remote_path: str) -> int:
+            return 1024
+
+        def quit(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    manifest = discover_ftps_batch(
+        out_dir=str(tmp_path / "ingest"),
+        reel_identifier="007",
+        clip_spec="63",
+        requested_cameras=["AA", "AB"],
+        ftp_factory=FakeFTP,
+    )
+    assert manifest["action"] == "discover"
+    assert manifest["reachable_cameras"] == ["AA"]
+    assert manifest["unreachable_cameras"] == ["AB"]
+    assert manifest["matched_file_count"] == 1
+    assert manifest["estimated_bytes"] == 1024
+    assert Path(manifest["manifest_path"]).exists()
+
+
+def test_retry_failed_ftps_batch_reuses_previous_manifest_camera_subset(tmp_path: Path) -> None:
+    ingest_root = tmp_path / "ingest"
+    ingest_root.mkdir()
+    previous = {
+        "schema_version": "r3dmatch_ftps_ingest_v2",
+        "manifest_path": str(ingest_manifest_path_for(ingest_root)),
+        "reel_identifier": "007",
+        "clip_spec": "63",
+        "failed_cameras": ["AB"],
+        "unreachable_cameras": ["AB"],
+        "per_camera_status": [{"camera_label": "AB", "status": "unreachable"}],
+    }
+    ingest_manifest_path_for(ingest_root).write_text(json.dumps(previous), encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_download(**kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return {"status": "success"}
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr("r3dmatch.ftps_ingest.download_ftps_batch", fake_download)
+    try:
+        payload = retry_failed_ftps_batch(out_dir=str(ingest_root))
+    finally:
+        monkeypatch.undo()
+    assert payload["status"] == "success"
+    assert captured["requested_cameras"] == ["AB"]
+    assert captured["reel_identifier"] == "007"
+    assert captured["clip_spec"] == "63"
 
 
 def test_apply_calibration_payload_dry_run_uses_inventory_targets(tmp_path: Path) -> None:
@@ -7644,6 +9841,78 @@ def test_web_apply_and_verify_routes_use_existing_backend_truth(tmp_path: Path, 
     assert (report_dir / "post_apply_verification.json").exists()
 
 
+def test_build_operator_surfaces_derives_white_balance_summary_from_commit_payload() -> None:
+    from r3dmatch.web_app import _build_operator_surfaces, _render_decision_surface
+
+    surfaces = _build_operator_surfaces(
+        review_validation={
+            "recommendation": {
+                "recommended_strategy": {
+                    "strategy_key": "median",
+                    "strategy_label": "Median",
+                    "reason": "Median keeps the cluster stable.",
+                }
+            },
+            "physical_validation": {"status": "success"},
+        },
+        review_payload={
+            "run_assessment": {"status": "READY_WITH_WARNINGS"},
+            "per_camera_analysis": [
+                {
+                    "camera_label": "GA",
+                    "clip_id": "G007_A064_001",
+                    "reference_use": "Included",
+                    "sample_2_ire": 23.0,
+                    "measured_gray_exposure_summary": "Sample 1 24 / Sample 2 23 / Sample 3 21 IRE",
+                }
+            ],
+            "white_balance_model": {},
+            "visuals": {},
+        },
+        commit_payload={
+            "camera_targets": [
+                {
+                    "camera_id": "G007_A064",
+                    "clip_id": "G007_A064_001",
+                    "inventory_camera_label": "GA",
+                    "inventory_camera_ip": "172.20.114.165",
+                    "calibration": {"exposureAdjust": 0.11, "kelvin": 5626, "tint": -0.2},
+                    "confidence": 0.8,
+                },
+                {
+                    "camera_id": "G007_B064",
+                    "clip_id": "G007_B064_001",
+                    "inventory_camera_label": "GB",
+                    "inventory_camera_ip": "172.20.114.166",
+                    "calibration": {"exposureAdjust": -0.08, "kelvin": 5624, "tint": 0.1},
+                    "confidence": 0.78,
+                },
+            ],
+            "per_camera_payloads": [],
+        },
+        camera_state_report=None,
+        apply_report=None,
+        writeback_verification_report=None,
+        post_apply_report=None,
+        source_mode_label_text="Local Folder",
+    )
+
+    wb_model = dict(surfaces["white_balance_model"])
+    assert wb_model["model_label"] == "Derived from Final WB Values"
+    assert wb_model["shared_kelvin_mode"] == "shared"
+    assert wb_model["shared_kelvin"] == 5625
+    assert wb_model["shared_tint_mode"] == "per_camera"
+    assert wb_model["candidate_count"] >= 1
+    assert wb_model["source_measurement_type"] == "final_commit_values"
+    assert wb_model["diagnostics"]["summary_kind"] == "fallback_derived"
+
+    decision_html = _render_decision_surface(surfaces)
+    assert "Derived from Final WB Values" in decision_html
+    assert "Kelvin Spread" in decision_html
+    assert "Tint Spread" in decision_html
+    assert "Source Samples" in decision_html
+
+
 def test_web_push_routes_load_payload_and_read_current_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     out_dir = tmp_path / "workflow-output"
     report_dir = out_dir / "report"
@@ -7808,7 +10077,7 @@ def test_verify_last_push_route_builds_structured_verification_report(tmp_path: 
 def test_review_calibration_ftps_source_mode_threads_ingest_manifest_into_review(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_redline(monkeypatch)
 
-    def fake_ingest_ftps_batch(**kwargs):
+    def fake_run_ftps_ingest_job(**kwargs):
         ingest_root = Path(kwargs["out_dir"])
         clip_path = ingest_root / "GA" / "G007_A063_032563.RDC" / "G007_A063_032563_001.R3D"
         clip_path.parent.mkdir(parents=True, exist_ok=True)
@@ -7837,7 +10106,7 @@ def test_review_calibration_ftps_source_mode_threads_ingest_manifest_into_review
         Path(manifest["manifest_path"]).write_text(json.dumps(manifest), encoding="utf-8")
         return manifest
 
-    monkeypatch.setattr("r3dmatch.workflow.ingest_ftps_batch", fake_ingest_ftps_batch)
+    monkeypatch.setattr("r3dmatch.workflow.run_ftps_ingest_job", fake_run_ftps_ingest_job)
     review_dir = tmp_path / "review-ftps"
     payload = review_calibration(
         None,

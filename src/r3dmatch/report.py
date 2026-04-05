@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import html
 import json
+import logging
 import math
 import os
 import re
@@ -19,30 +21,49 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
-from skimage import color, feature, transform
+from skimage import color, feature, measure, morphology, transform
+
+try:
+    import cv2
+except Exception:  # pragma: no cover - optional runtime dependency
+    cv2 = None
+
+try:
+    import tifffile
+except Exception:  # pragma: no cover - optional runtime dependency
+    tifffile = None
 
 from .calibration import (
-    extract_center_region,
+    _measure_pixel_cloud_statistics,
+    _sphere_zone_geometries,
+    build_sphere_sampling_mask,
+    compute_luminance,
+    detect_gray_card_roi,
+    extract_rect_pixels,
     load_color_calibration,
     load_exposure_calibration,
     measure_sphere_region_statistics,
     measure_sphere_zone_profile_statistics,
     percentile_clip,
+    trimmed_luminance_measurement,
 )
 from .color import identity_lggs, is_identity_cdl_payload as _color_is_identity_cdl_payload, rgb_gains_to_cdl, solve_cdl_color_model
 from .commit_values import build_commit_values, extract_as_shot_white_balance, solve_white_balance_model_for_records
 from .execution import CancellationError, raise_if_cancelled, run_cancellable_subprocess
 from .ftps_ingest import source_mode_label
 from .matching import _measure_three_sample_statistics
-from .models import SphereROI
+from .models import GrayCardROI, SphereROI
 from .progress import emit_review_progress
 from .rmd import write_rmd_for_clip_with_metadata, write_rmds_from_analysis
+from .sdk import resolve_backend
 
+LOGGER = logging.getLogger(__name__)
 
 PREVIEW_VARIANTS = ("original", "exposure", "color", "both")
 REVIEW_PREVIEW_TRANSFORM = "REDLine IPP2 / BT.709 / BT.1886 / Medium / Medium"
 DEFAULT_REVIEW_TARGET_STRATEGIES = ("median",)
 STRATEGY_ORDER = ["median", "optimal_exposure", "manual", "hero_camera", "manual_target"]
+SPHERE_DETECTION_MAX_DIMENSION = 1280
 # Legacy "calibration" preview mode is now a compatibility alias to the
 # canonical monitoring-domain preview path. We preserve the name only so older
 # CLI/UI inputs do not break.
@@ -53,6 +74,7 @@ DEFAULT_CALIBRATION_PREVIEW = {
     "highlight_rolloff": "medium",
     "shadow_rolloff": "medium",
     "lut_path": None,
+    "preview_still_format": "tiff",
 }
 DEFAULT_MONITORING_PREVIEW = {
     "preview_mode": "monitoring",
@@ -61,6 +83,7 @@ DEFAULT_MONITORING_PREVIEW = {
     "highlight_rolloff": "medium",
     "shadow_rolloff": "medium",
     "lut_path": None,
+    "preview_still_format": "tiff",
 }
 DEFAULT_DISPLAY_REVIEW_PREVIEW = {
     "preview_mode": "monitoring",
@@ -69,7 +92,12 @@ DEFAULT_DISPLAY_REVIEW_PREVIEW = {
     "highlight_rolloff": "medium",
     "shadow_rolloff": "medium",
     "lut_path": None,
+    "preview_still_format": "tiff",
 }
+PREVIEW_STILL_FORMAT_CODES = {"tiff": 1, "jpeg": 3}
+PREVIEW_STILL_FORMAT_EXTENSIONS = {"tiff": "tiff", "jpeg": "jpg"}
+DEFAULT_PREVIEW_STILL_FORMAT = "tiff"
+DEFAULT_ARTIFACT_MODE = "production"
 COLOR_SPACE_CODES = {"BT.709": 13, "REDWideGamutRGB": 25}
 GAMMA_CODES = {"BT.1886": 32, "Log3G10": 34}
 ROLLOFF_CODES = {"none": 0, "hard": 1, "default": 2, "medium": 3, "soft": 4}
@@ -82,6 +110,19 @@ REVIEW_MODE_LABELS = {
     "full_contact_sheet": "Full Contact Sheet",
     "lightweight_analysis": "Lightweight Analysis",
 }
+REPORT_FOCUS_LABELS = {
+    "auto": "Auto",
+    "full": "All Cameras",
+    "outliers": "Outliers Only",
+    "anchors": "Exposure Anchors",
+    "cluster_extremes": "Cluster Extremes",
+}
+ARTIFACT_MODE_LABELS = {
+    "production": "Production",
+    "debug": "Debug",
+}
+LARGE_ARRAY_OVERVIEW_THRESHOLD = 18
+DEFAULT_LARGE_ARRAY_AUTO_FOCUS = "outliers"
 OPTIMAL_EXPOSURE_MIN_CONFIDENCE = 0.45
 OPTIMAL_EXPOSURE_MAX_SAMPLE_LOG2_SPREAD = 0.12
 OPTIMAL_EXPOSURE_MAX_SAMPLE_CHROMA_SPREAD = 0.02
@@ -91,6 +132,9 @@ CAMERA_TRUST_CAUTION_LOG2_SPREAD = 0.08
 SPHERE_DETECTION_HIGH_CONFIDENCE = 0.72
 SPHERE_DETECTION_MEDIUM_CONFIDENCE = 0.50
 SPHERE_DETECTION_LOW_CONFIDENCE = 0.30
+SPHERE_DETECTION_PLAUSIBILITY_MIN = 0.46
+SPHERE_DETECTION_PROFILE_REVIEW = 0.60
+SPHERE_DETECTION_PROFILE_HIGH = 0.78
 CAMERA_TRUST_CAUTION_CHROMA_SPREAD = 0.014
 CAMERA_TRUST_LARGE_CORRECTION = 0.75
 CAMERA_TRUST_EXTREME_CORRECTION = 1.0
@@ -141,6 +185,36 @@ def normalize_review_mode(value: str) -> str:
 
 def review_mode_label(value: str) -> str:
     return REVIEW_MODE_LABELS[normalize_review_mode(value)]
+
+
+def normalize_report_focus(value: Optional[str]) -> str:
+    normalized = str(value or "auto").strip().lower()
+    aliases = {
+        "": "auto",
+        "auto": "auto",
+        "default": "auto",
+        "full": "full",
+        "all": "full",
+        "all_cameras": "full",
+        "all-cameras": "full",
+        "outliers": "outliers",
+        "outliers_only": "outliers",
+        "outliers-only": "outliers",
+        "anchors": "anchors",
+        "references": "anchors",
+        "anchors_references": "anchors",
+        "anchors-references": "anchors",
+        "cluster_extremes": "cluster_extremes",
+        "cluster-extremes": "cluster_extremes",
+        "extremes": "cluster_extremes",
+    }
+    if normalized not in aliases:
+        raise ValueError("report focus must be auto, full, outliers, anchors, or cluster_extremes")
+    return aliases[normalized]
+
+
+def report_focus_label(value: Optional[str]) -> str:
+    return REPORT_FOCUS_LABELS[normalize_report_focus(value)]
 
 
 def _normalize_matching_domain(value: str) -> str:
@@ -415,7 +489,158 @@ def _measurement_preview_settings_for_domain(matching_domain: str) -> Dict[str, 
         preview_highlight_rolloff=str(defaults["highlight_rolloff"]),
         preview_shadow_rolloff=str(defaults["shadow_rolloff"]),
         preview_lut=None,
+        preview_still_format=str(defaults.get("preview_still_format") or DEFAULT_PREVIEW_STILL_FORMAT),
     )
+
+
+def normalize_preview_still_format(value: Optional[str]) -> str:
+    normalized = str(value or DEFAULT_PREVIEW_STILL_FORMAT).strip().lower().replace(".", "")
+    aliases = {
+        "tif": "tiff",
+        "tiff": "tiff",
+        "jpg": "jpeg",
+        "jpeg": "jpeg",
+    }
+    if normalized not in aliases:
+        raise ValueError("preview still format must be tiff or jpeg")
+    return aliases[normalized]
+
+
+def preview_still_extension(preview_still_format: Optional[str]) -> str:
+    return PREVIEW_STILL_FORMAT_EXTENSIONS[normalize_preview_still_format(preview_still_format)]
+
+
+def prepare_manual_sphere_assist_bundle(
+    analysis_root: str,
+    *,
+    out_dir: Optional[str] = None,
+    clip_ids: Optional[List[str]] = None,
+) -> Dict[str, object]:
+    root = Path(analysis_root).expanduser().resolve()
+    report_root = root / "report"
+    analysis_dir = root / "analysis"
+    if not analysis_dir.exists():
+        raise FileNotFoundError(f"Analysis directory is missing: {analysis_dir}")
+    report_payload = {}
+    contact_sheet_path = report_root / "contact_sheet.json"
+    if contact_sheet_path.exists():
+        report_payload = json.loads(contact_sheet_path.read_text(encoding="utf-8"))
+    per_camera_map = {
+        str(item.get("clip_id") or "").strip(): dict(item)
+        for item in list(report_payload.get("per_camera_analysis") or [])
+        if str(item.get("clip_id") or "").strip()
+    }
+    requested_clip_ids = {str(item).strip() for item in (clip_ids or []) if str(item).strip()}
+    assist_root = Path(out_dir).expanduser().resolve() if str(out_dir or "").strip() else report_root / "manual_sphere_assist"
+    previews_dir = assist_root / "previews"
+    previews_dir.mkdir(parents=True, exist_ok=True)
+    resample = getattr(Image, "Resampling", Image).LANCZOS
+    entries: List[Dict[str, object]] = []
+    for analysis_path in sorted(analysis_dir.glob("*.analysis.json")):
+        record = json.loads(analysis_path.read_text(encoding="utf-8"))
+        clip_id = str(record.get("clip_id") or "").strip()
+        if not clip_id:
+            continue
+        if requested_clip_ids and clip_id not in requested_clip_ids:
+            continue
+        per_camera = dict(per_camera_map.get(clip_id) or {})
+        confidence = float(
+            per_camera.get("gray_target_confidence")
+            or per_camera.get("confidence")
+            or record.get("confidence")
+            or 0.0
+        )
+        trust_class = str(per_camera.get("trust_class") or "").strip().upper()
+        reference_use = str(per_camera.get("reference_use") or "").strip()
+        review_required = bool(
+            per_camera.get("gray_target_review_recommended")
+            or record.get("diagnostics", {}).get("gray_target_review_recommended")
+        )
+        selected_for_assist = (
+            not per_camera_map
+            or reference_use == "Excluded"
+            or trust_class in {"EXCLUDED", "UNTRUSTED"}
+            or review_required
+            or confidence < 0.90
+        )
+        if not selected_for_assist:
+            continue
+        diagnostics = dict(record.get("diagnostics") or {})
+        measurement_source_image = Path(
+            str(
+                diagnostics.get("rendered_measurement_preview_path")
+                or ((diagnostics.get("runtime_trace") or {}).get("rendered_image_path"))
+                or ""
+            )
+        ).expanduser().resolve()
+        if not measurement_source_image.exists():
+            continue
+        preview_output = previews_dir / f"{clip_id}.manual_sphere_assist.jpg"
+        with Image.open(measurement_source_image) as image:
+            render_width, render_height = int(image.width), int(image.height)
+            preview = image.convert("RGB")
+            preview.thumbnail((1280, 1280), resample)
+            preview.save(preview_output, format="JPEG", quality=72, optimize=True, progressive=True)
+            preview_width, preview_height = int(preview.width), int(preview.height)
+        detected_roi = dict(diagnostics.get("detected_sphere_roi") or {})
+        estimated_radius_normalized = None
+        estimated_radius_preview_px = None
+        if detected_roi and min(render_width, render_height) > 0:
+            estimated_radius_normalized = float(detected_roi.get("r", 0.0) or 0.0) / float(min(render_width, render_height))
+            estimated_radius_preview_px = float(estimated_radius_normalized) * float(min(preview_width, preview_height))
+        entries.append(
+            {
+                "clip_id": clip_id,
+                "source_path": str(record.get("source_path") or ""),
+                "source_image": str(preview_output),
+                "source_image_hash": _manual_assist_preview_hash(preview_output),
+                "measurement_source_image": str(measurement_source_image),
+                "measurement_source_hash": _manual_assist_preview_hash(measurement_source_image),
+                "preview_width": preview_width,
+                "preview_height": preview_height,
+                "render_width": render_width,
+                "render_height": render_height,
+                "center_preview_px": None,
+                "radius_preview_px": None,
+                "center_normalized": None,
+                "radius_normalized": None,
+                "estimated_radius_preview_px": estimated_radius_preview_px,
+                "estimated_radius_normalized": estimated_radius_normalized,
+                "auto_detected_sphere_roi": detected_roi,
+                "trust_class": trust_class or "UNKNOWN",
+                "reference_use": reference_use or "Included",
+                "gray_target_confidence": confidence,
+                "reason": str(per_camera.get("trust_reason") or "Manual sphere assist requested"),
+            }
+        )
+    manifest = {
+        "schema_version": "r3dmatch_sphere_assist_v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "analysis_root": str(root),
+        "entry_count": len(entries),
+        "entries": entries,
+    }
+    manifest_path = assist_root / "sphere_assist_template.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return {
+        "analysis_root": str(root),
+        "assist_root": str(assist_root),
+        "manifest_path": str(manifest_path),
+        "preview_dir": str(previews_dir),
+        "entry_count": len(entries),
+        "clip_ids": [str(item.get("clip_id") or "") for item in entries],
+    }
+
+
+def normalize_artifact_mode(value: Optional[str]) -> str:
+    normalized = str(value or DEFAULT_ARTIFACT_MODE).strip().lower().replace("-", "_")
+    if normalized not in ARTIFACT_MODE_LABELS:
+        raise ValueError("artifact mode must be production or debug")
+    return normalized
+
+
+def artifact_mode_label(value: Optional[str]) -> str:
+    return ARTIFACT_MODE_LABELS[normalize_artifact_mode(value)]
 
 
 def _log2_from_ire(ire_value: float) -> float:
@@ -520,6 +745,319 @@ def _anchor_summary_line(
     return "Exposure Anchor: Automatic recommendation"
 
 
+def _focus_overlay_path(overlay_root: Path, clip_id: str) -> Path:
+    safe_clip_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(clip_id or "camera"))
+    return overlay_root / f"{safe_clip_id}.focus_validation.jpg"
+
+
+def _write_focus_validation_overlay(
+    *,
+    source_image_path: str,
+    output_path: Path,
+    detection: Dict[str, object],
+) -> str:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(source_image_path) as image:
+        overlay = image.convert("RGB")
+        draw = ImageDraw.Draw(overlay)
+        for box in list(detection.get("cell_boxes") or []):
+            draw.rectangle(
+                [
+                    int(box.get("x0", 0) or 0),
+                    int(box.get("y0", 0) or 0),
+                    int(box.get("x1", 0) or 0),
+                    int(box.get("y1", 0) or 0),
+                ],
+                outline=(48, 196, 106),
+                width=8,
+            )
+        chart_box = dict(detection.get("colorchecker_bbox") or {})
+        if chart_box:
+            draw.rectangle(
+                [
+                    int(chart_box.get("x0", 0) or 0),
+                    int(chart_box.get("y0", 0) or 0),
+                    int(chart_box.get("x1", 0) or 0),
+                    int(chart_box.get("y1", 0) or 0),
+                ],
+                outline=(59, 130, 246),
+                width=10,
+            )
+        roi = dict(detection.get("roi") or {})
+        if roi:
+            draw.rectangle(
+                [
+                    int(roi.get("x0", 0) or 0),
+                    int(roi.get("y0", 0) or 0),
+                    int(roi.get("x1", 0) or 0),
+                    int(roi.get("y1", 0) or 0),
+                ],
+                outline=(245, 158, 11),
+                width=12,
+            )
+        overlay.save(output_path, format="JPEG", quality=88, optimize=True, progressive=True)
+    return str(output_path)
+
+
+def _crop_focus_roi(region: np.ndarray, roi_payload: Dict[str, object]) -> np.ndarray:
+    height, width = region.shape[:2]
+    roi = dict(roi_payload or {})
+    x0 = max(0, min(width - 1, int(roi.get("x0", 0) or 0)))
+    y0 = max(0, min(height - 1, int(roi.get("y0", 0) or 0)))
+    x1 = max(x0 + 1, min(width, int(roi.get("x1", width) or width)))
+    y1 = max(y0 + 1, min(height, int(roi.get("y1", height) or height)))
+    return np.asarray(region[y0:y1, x0:x1, :], dtype=np.float32)
+
+
+def _crop_focus_roi_from_normalized(region: np.ndarray, normalized_roi: Dict[str, object]) -> np.ndarray:
+    height, width = region.shape[:2]
+    roi = dict(normalized_roi or {})
+    x0 = max(0, min(width - 1, int(round(float(roi.get("x", 0.0) or 0.0) * width))))
+    y0 = max(0, min(height - 1, int(round(float(roi.get("y", 0.0) or 0.0) * height))))
+    x1 = max(x0 + 1, min(width, int(round((float(roi.get("x", 0.0) or 0.0) + float(roi.get("w", 1.0) or 1.0)) * width))))
+    y1 = max(y0 + 1, min(height, int(round((float(roi.get("y", 0.0) or 0.0) + float(roi.get("h", 1.0) or 1.0)) * height))))
+    return np.asarray(region[y0:y1, x0:x1, :], dtype=np.float32)
+
+
+def _decode_focus_reference_region(
+    *,
+    source_path: str,
+    normalized_roi: Dict[str, object],
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    backend = resolve_backend("red")
+    decoded = list(backend.decode_frames(str(source_path), start_frame=0, max_frames=1, frame_step=1, half_res=True))
+    if not decoded:
+        raise RuntimeError(f"Unable to decode focus reference frame for {source_path}")
+    _frame_index, _timecode, image = decoded[0]
+    hwc = np.moveaxis(np.asarray(image, dtype=np.float32), 0, -1)
+    cropped = _crop_focus_roi_from_normalized(hwc, normalized_roi)
+    return cropped, {
+        "backend": "red_sdk_half_res",
+        "width": int(hwc.shape[1]),
+        "height": int(hwc.shape[0]),
+    }
+
+
+def _focus_classification_from_ratio(ratio_to_best: float) -> str:
+    value = float(ratio_to_best)
+    if value >= 0.88:
+        return "Sharp"
+    if value >= 0.68:
+        return "Review"
+    return "Soft"
+
+
+def _focus_validation_summary(
+    *,
+    rows: List[Dict[str, object]],
+    reference_rows: List[Dict[str, object]],
+) -> Dict[str, object]:
+    if not rows:
+        return {
+            "enabled": True,
+            "status": "no_rows",
+            "tiff_is_sufficient": False,
+            "reason": "No focus rows were generated.",
+            "confidence": "high",
+            "rows": [],
+        }
+    tiff_scores = [float(row.get("composite_focus_score", 0.0) or 0.0) for row in rows]
+    reference_scores = [float(row.get("composite_focus_score", 0.0) or 0.0) for row in reference_rows] if reference_rows else []
+    tiff_best = max(tiff_scores) if tiff_scores else 1.0
+    reference_best = max(reference_scores) if reference_scores else 1.0
+    reference_map = {str(item.get("clip_id") or ""): dict(item) for item in reference_rows}
+    classification_matches = 0
+    comparable_rows = 0
+    for row in rows:
+        ratio_to_best = float(row.get("composite_focus_score", 0.0) or 0.0) / max(float(tiff_best), 1e-6)
+        row["normalized_focus_ratio"] = float(ratio_to_best)
+        row["focus_classification"] = _focus_classification_from_ratio(ratio_to_best)
+        reference = reference_map.get(str(row.get("clip_id") or ""))
+        if reference:
+            ref_ratio = float(reference.get("composite_focus_score", 0.0) or 0.0) / max(float(reference_best), 1e-6)
+            reference["normalized_focus_ratio"] = float(ref_ratio)
+            reference["focus_classification"] = _focus_classification_from_ratio(ref_ratio)
+            comparable_rows += 1
+            if str(reference["focus_classification"]) == str(row["focus_classification"]):
+                classification_matches += 1
+    rank_corr = _spearman_rank_correlation(tiff_scores, reference_scores) if len(reference_scores) == len(tiff_scores) and len(tiff_scores) >= 2 else 1.0
+    metric_delta_rows = []
+    for row in rows:
+        reference = reference_map.get(str(row.get("clip_id") or ""))
+        if not reference:
+            continue
+        metric_delta_rows.append(
+            {
+                "laplacian_variance": abs(float(row.get("laplacian_variance", 0.0) or 0.0) - float(reference.get("laplacian_variance", 0.0) or 0.0)) / max(abs(float(reference.get("laplacian_variance", 0.0) or 0.0)), 1e-6) * 100.0,
+                "tenengrad": abs(float(row.get("tenengrad", 0.0) or 0.0) - float(reference.get("tenengrad", 0.0) or 0.0)) / max(abs(float(reference.get("tenengrad", 0.0) or 0.0)), 1e-6) * 100.0,
+                "fft_high_frequency_energy": abs(float(row.get("fft_high_frequency_energy", 0.0) or 0.0) - float(reference.get("fft_high_frequency_energy", 0.0) or 0.0)) / max(abs(float(reference.get("fft_high_frequency_energy", 0.0) or 0.0)), 1e-6) * 100.0,
+            }
+        )
+    median_abs_delta_percent = {
+        "laplacian_variance": float(np.median([item["laplacian_variance"] for item in metric_delta_rows])) if metric_delta_rows else 0.0,
+        "tenengrad": float(np.median([item["tenengrad"] for item in metric_delta_rows])) if metric_delta_rows else 0.0,
+        "fft_high_frequency_energy": float(np.median([item["fft_high_frequency_energy"] for item in metric_delta_rows])) if metric_delta_rows else 0.0,
+    }
+    classification_agreement = float(classification_matches) / float(max(comparable_rows, 1))
+    tiff_is_sufficient = bool(rank_corr >= 0.95 and classification_agreement >= 0.99)
+    status = "sufficient" if tiff_is_sufficient else "insufficient"
+    reason = (
+        f"TIFF preserved focus ordering with rank correlation {rank_corr:.3f} and class agreement {classification_agreement:.2%} "
+        "against the available RED SDK half-resolution reference."
+    )
+    return {
+        "enabled": True,
+        "status": status,
+        "rows": rows,
+        "reference_rows": reference_rows,
+        "rank_correlation": float(rank_corr),
+        "classification_agreement": float(classification_agreement),
+        "median_abs_delta_percent": median_abs_delta_percent,
+        "tiff_is_sufficient": bool(tiff_is_sufficient),
+        "reason": reason,
+        "measured_error": (
+            f"rank_correlation={rank_corr:.3f}; class_agreement={classification_agreement:.2%}; "
+            f"median_abs_delta_percent(lap={median_abs_delta_percent['laplacian_variance']:.2f}, "
+            f"ten={median_abs_delta_percent['tenengrad']:.2f}, fft={median_abs_delta_percent['fft_high_frequency_energy']:.2f})"
+        ),
+        "confidence": "high",
+        "reference_basis": "red_sdk_half_res",
+    }
+
+
+def _build_focus_validation_artifacts(
+    *,
+    out_root: Path,
+    per_camera_rows: List[Dict[str, object]],
+    shared_originals: List[Dict[str, object]],
+    progress_path: Optional[str] = None,
+) -> Dict[str, object]:
+    overlay_root = out_root / "focus_validation_overlays"
+    overlay_root.mkdir(parents=True, exist_ok=True)
+    shared_map = {
+        str(item.get("clip_id") or ""): dict(item)
+        for item in list(shared_originals or [])
+        if str(item.get("clip_id") or "").strip()
+    }
+    focus_rows: List[Dict[str, object]] = []
+    reference_rows: List[Dict[str, object]] = []
+    for index, row in enumerate(list(per_camera_rows or []), start=1):
+        clip_id = str(row.get("clip_id") or "")
+        if not clip_id:
+            continue
+        shared = shared_map.get(clip_id) or {}
+        source_image_path = str(shared.get("original_frame") or row.get("original_frame") or "")
+        source_path = str(row.get("source_path") or shared.get("source_path") or "")
+        if not source_image_path or not Path(source_image_path).exists():
+            continue
+        emit_review_progress(
+            progress_path,
+            phase="focus_validation_clip",
+            detail=f"Evaluating focus target for {clip_id}.",
+            stage_label="Focus validation",
+            clip_index=index,
+            clip_count=len(per_camera_rows),
+        )
+        image, metadata = _load_preview_image_as_normalized_rgb(source_image_path)
+        detection = _detect_focus_chart_roi_hwc(image)
+        if not bool(detection.get("found")):
+            focus_rows.append(
+                {
+                    "clip_id": clip_id,
+                    "camera_label": _camera_label_for_reporting(clip_id),
+                    "status": "unresolved",
+                    "focus_classification": "Review",
+                    "detection_method": str(detection.get("method") or "opencv_colorchecker_cluster"),
+                    "detection_confidence": float(detection.get("confidence", 0.0) or 0.0),
+                    "reason": str(detection.get("reason") or "Chart was not detected."),
+                    "source_image": source_image_path,
+                }
+            )
+            continue
+        focus_region = _crop_focus_roi(image, dict(detection.get("roi") or {}))
+        metrics = _focus_metric_bundle(focus_region)
+        overlay_path = _write_focus_validation_overlay(
+            source_image_path=source_image_path,
+            output_path=_focus_overlay_path(overlay_root, clip_id),
+            detection=detection,
+        )
+        row_payload = {
+            "clip_id": clip_id,
+            "camera_label": _camera_label_for_reporting(clip_id),
+            "status": "resolved",
+            "source_image": source_image_path,
+            "source_path": source_path,
+            "overlay_image": overlay_path,
+            "detection_method": str(detection.get("method") or "opencv_colorchecker_cluster"),
+            "detection_confidence": float(detection.get("confidence", 0.0) or 0.0),
+            "focus_roi": dict(detection.get("roi") or {}),
+            "reference_basis": "tiff_preview",
+            "image_width": int(metadata.get("width", image.shape[1])),
+            "image_height": int(metadata.get("height", image.shape[0])),
+            **metrics,
+        }
+        focus_rows.append(row_payload)
+        if source_path:
+            try:
+                reference_region, reference_meta = _decode_focus_reference_region(
+                    source_path=source_path,
+                    normalized_roi=dict((detection.get("roi") or {}).get("normalized") or {}),
+                )
+                reference_metrics = _focus_metric_bundle(reference_region)
+                reference_rows.append(
+                    {
+                        "clip_id": clip_id,
+                        "camera_label": _camera_label_for_reporting(clip_id),
+                        "status": "resolved",
+                        "reference_basis": str(reference_meta.get("backend") or "red_sdk_half_res"),
+                        **reference_metrics,
+                    }
+                )
+            except Exception as exc:
+                row_payload["reference_error"] = str(exc)
+    if focus_rows:
+        for metric_name in ("laplacian_variance", "tenengrad", "fft_high_frequency_energy"):
+            metric_values = [float(item.get(metric_name, 0.0) or 0.0) for item in focus_rows]
+            metric_best = max(metric_values) if metric_values else 1.0
+            for item in focus_rows:
+                item[f"{metric_name}_normalized"] = float(item.get(metric_name, 0.0) or 0.0) / max(float(metric_best), 1e-6)
+        for item in focus_rows:
+            item["composite_focus_score"] = float(
+                np.mean(
+                    [
+                        float(item.get("laplacian_variance_normalized", 0.0) or 0.0),
+                        float(item.get("tenengrad_normalized", 0.0) or 0.0),
+                        float(item.get("fft_high_frequency_energy_normalized", 0.0) or 0.0),
+                    ]
+                )
+            )
+    if reference_rows:
+        for metric_name in ("laplacian_variance", "tenengrad", "fft_high_frequency_energy"):
+            metric_values = [float(item.get(metric_name, 0.0) or 0.0) for item in reference_rows]
+            metric_best = max(metric_values) if metric_values else 1.0
+            for item in reference_rows:
+                item[f"{metric_name}_normalized"] = float(item.get(metric_name, 0.0) or 0.0) / max(float(metric_best), 1e-6)
+        for item in reference_rows:
+            item["composite_focus_score"] = float(
+                np.mean(
+                    [
+                        float(item.get("laplacian_variance_normalized", 0.0) or 0.0),
+                        float(item.get("tenengrad_normalized", 0.0) or 0.0),
+                        float(item.get("fft_high_frequency_energy_normalized", 0.0) or 0.0),
+                    ]
+                )
+            )
+    summary = _focus_validation_summary(rows=focus_rows, reference_rows=reference_rows)
+    summary["overlay_root"] = str(overlay_root)
+    summary["resolved_camera_count"] = int(sum(1 for item in focus_rows if str(item.get("status") or "") == "resolved"))
+    summary["soft_camera_count"] = int(sum(1 for item in focus_rows if str(item.get("focus_classification") or "") == "Soft"))
+    summary["review_camera_count"] = int(sum(1 for item in focus_rows if str(item.get("focus_classification") or "") == "Review"))
+    summary["sharp_camera_count"] = int(sum(1 for item in focus_rows if str(item.get("focus_classification") or "") == "Sharp"))
+    path = out_root / "focus_validation.json"
+    path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return {"summary": summary, "path": str(path), "overlay_root": str(overlay_root)}
+
+
 def _build_anchor_descriptor(
     *,
     strategy_key: str,
@@ -573,6 +1111,927 @@ def _load_array_calibration_payload(input_path: str) -> Optional[Dict[str, objec
     if calibration_path.exists():
         return json.loads(calibration_path.read_text(encoding="utf-8"))
     return None
+
+
+def _scientific_validation_pixel_preview(pixel_array: np.ndarray, *, limit: int = 24) -> Dict[str, object]:
+    values = np.asarray(pixel_array, dtype=np.float32).reshape(-1, 3)
+    preview = values[: min(limit, values.shape[0])]
+    return {
+        "count": int(values.shape[0]),
+        "normalized_rgb_preview": [[float(channel) for channel in row] for row in preview.tolist()],
+        "uint8_rgb_preview": [
+            [int(round(float(np.clip(channel, 0.0, 1.0)) * 255.0)) for channel in row]
+            for row in preview.tolist()
+        ],
+    }
+
+
+def _normalize_preview_image_array(image_array: np.ndarray) -> Tuple[np.ndarray, Dict[str, object]]:
+    array = np.asarray(image_array)
+    if array.ndim == 2:
+        array = np.repeat(array[..., None], 3, axis=2)
+    elif array.ndim == 3 and array.shape[2] >= 3:
+        array = array[..., :3]
+    else:
+        raise RuntimeError(f"Unsupported preview image shape for measurement: {array.shape!r}")
+    dtype_name = str(array.dtype)
+    denominator: Optional[float] = None
+    if array.dtype == np.uint8:
+        denominator = 255.0
+    elif array.dtype == np.uint16:
+        denominator = 65535.0
+    if denominator is not None:
+        normalized = array.astype(np.float32) / float(denominator)
+    elif np.issubdtype(array.dtype, np.floating):
+        normalized = array.astype(np.float32)
+    else:
+        normalized = array.astype(np.float32)
+    normalized = np.clip(normalized, 0.0, 1.0)
+    bit_depth = 16 if array.dtype == np.uint16 else 8 if array.dtype == np.uint8 else None
+    return normalized, {
+        "source_dtype": dtype_name,
+        "bit_depth": bit_depth,
+        "normalization_denominator": denominator,
+    }
+
+
+def _load_preview_image_as_normalized_rgb(preview_path: str | Path) -> Tuple[np.ndarray, Dict[str, object]]:
+    path = Path(preview_path).expanduser().resolve()
+    _wait_for_file_ready(path)
+    last_error: Optional[BaseException] = None
+    max_attempts = 8
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return _load_preview_image_once(path)
+        except OSError as exc:
+            last_error = exc
+            if not _is_retryable_preview_load_error(exc) or attempt >= max_attempts:
+                raise
+            LOGGER.debug(
+                "Preview load retry %s/%s for %s after OSError: %s",
+                attempt,
+                max_attempts,
+                path,
+                exc,
+            )
+            time.sleep(0.25)
+            _wait_for_file_ready(path, max_attempts=6, delay_seconds=0.20)
+        except Exception as exc:
+            last_error = exc
+            if attempt >= max_attempts:
+                raise
+            message = str(exc).lower()
+            if "truncated" not in message and "failed to read" not in message and "cannot identify image file" not in message:
+                raise
+            LOGGER.debug(
+                "Preview load retry %s/%s for %s after decode error: %s",
+                attempt,
+                max_attempts,
+                path,
+                exc,
+            )
+            time.sleep(0.25)
+            _wait_for_file_ready(path, max_attempts=6, delay_seconds=0.20)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Failed to load preview image: {path}")
+
+
+def _wait_for_file_ready(path: Path, *, max_attempts: int = 8, delay_seconds: float = 0.20, stable_polls_required: int = 2) -> None:
+    last_size: Optional[int] = None
+    stable_polls = 0
+    for attempt in range(1, max_attempts + 1):
+        if path.exists():
+            size = int(path.stat().st_size)
+            if size > 0 and last_size is not None and size == last_size:
+                stable_polls += 1
+            else:
+                stable_polls = 0
+            if size > 0 and stable_polls >= stable_polls_required:
+                if attempt > 1:
+                    LOGGER.debug("Preview file became ready after %s poll(s): %s", attempt, path)
+                return
+            last_size = size
+        else:
+            last_size = None
+            stable_polls = 0
+        if attempt < max_attempts:
+            LOGGER.debug("Waiting for preview file readiness %s/%s: %s", attempt, max_attempts, path)
+            time.sleep(delay_seconds)
+    if not path.exists():
+        raise FileNotFoundError(f"Preview image does not exist yet: {path}")
+    if int(path.stat().st_size) <= 0:
+        raise OSError(f"Preview image is empty: {path}")
+
+
+def _is_retryable_preview_load_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return (
+        "truncated" in message
+        or "cannot identify image file" in message
+        or "failed to read" in message
+        or "image file is incomplete" in message
+    )
+
+
+def _load_preview_image_once(path: Path) -> Tuple[np.ndarray, Dict[str, object]]:
+    with Image.open(path) as image:
+        mode = str(image.mode or "")
+        width = int(image.width)
+        height = int(image.height)
+        raw_array: Optional[np.ndarray] = None
+        if path.suffix.lower() in {".tif", ".tiff"}:
+            try:
+                if tifffile is not None:
+                    raw_array = np.asarray(tifffile.imread(path))
+                else:
+                    import imageio.v3 as iio
+
+                    raw_array = np.asarray(iio.imread(path))
+            except Exception as exc:
+                if _is_retryable_preview_load_error(exc):
+                    raise OSError(str(exc)) from exc
+                raw_array = None
+        if raw_array is None:
+            image.load()
+            raw_array = np.asarray(image)
+        supports_direct_normalization = (
+            raw_array.ndim == 3
+            and raw_array.shape[2] >= 3
+            and (
+                raw_array.dtype == np.uint8
+                or raw_array.dtype == np.uint16
+                or np.issubdtype(raw_array.dtype, np.floating)
+            )
+        )
+        if supports_direct_normalization:
+            normalized, metadata = _normalize_preview_image_array(raw_array[:, :, :3])
+        else:
+            converted = np.asarray(image.convert("RGB"))
+            normalized, metadata = _normalize_preview_image_array(converted)
+        metadata.update(
+            {
+                "path": str(path),
+                "image_mode": mode,
+                "width": width,
+                "height": height,
+                "preview_format": path.suffix.lstrip(".").lower(),
+            }
+        )
+        return normalized, metadata
+
+
+def _scientific_validation_file_fingerprint(path: Path) -> Dict[str, object]:
+    fingerprint = {
+        "path": str(path.resolve()),
+        "exists": bool(path.exists()),
+        "file_size_bytes": 0,
+        "sha256": "",
+        "image_dimensions": {"width": 0, "height": 0},
+        "image_mode": "",
+        "pixel_dtype": "",
+        "bit_depth": None,
+    }
+    if not path.exists():
+        return fingerprint
+    stat = path.stat()
+    fingerprint["file_size_bytes"] = int(stat.st_size)
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    fingerprint["sha256"] = digest.hexdigest()
+    try:
+        _wait_for_file_ready(path, max_attempts=4, delay_seconds=0.12)
+        with Image.open(path) as image:
+            fingerprint["image_dimensions"] = {"width": int(image.width), "height": int(image.height)}
+            fingerprint["image_mode"] = str(image.mode or "")
+            raw_array: Optional[np.ndarray] = None
+            if path.suffix.lower() in {".tif", ".tiff"}:
+                try:
+                    if tifffile is not None:
+                        raw_array = np.asarray(tifffile.imread(path))
+                    else:
+                        import imageio.v3 as iio
+
+                        raw_array = np.asarray(iio.imread(path))
+                except Exception:
+                    raw_array = None
+            if raw_array is None:
+                raw_array = np.asarray(image)
+            fingerprint["pixel_dtype"] = str(raw_array.dtype)
+            if raw_array.dtype == np.uint16:
+                fingerprint["bit_depth"] = 16
+            elif raw_array.dtype == np.uint8:
+                fingerprint["bit_depth"] = 8
+    except OSError:
+        pass
+    return fingerprint
+
+
+def _scientific_validation_measurement_provenance(diagnostics: Dict[str, object], preview_path: Optional[str]) -> Dict[str, object]:
+    provenance = dict(diagnostics.get("measurement_provenance") or {})
+    stored_asset = dict(provenance.get("measurement_source_asset") or {})
+    resolved_preview_path = Path(preview_path).expanduser().resolve() if preview_path else None
+    current_asset = _scientific_validation_file_fingerprint(resolved_preview_path) if resolved_preview_path else {
+        "path": str(preview_path or ""),
+        "exists": False,
+        "file_size_bytes": 0,
+        "sha256": "",
+        "image_dimensions": {"width": 0, "height": 0},
+    }
+    stored_dimensions = dict(stored_asset.get("image_dimensions") or {})
+    stored_width = int(stored_dimensions.get("width", 0) or 0)
+    stored_height = int(stored_dimensions.get("height", 0) or 0)
+    fingerprint_present = bool(stored_asset.get("sha256")) and int(stored_asset.get("file_size_bytes", 0) or 0) > 0
+    fingerprint_matches = (
+        fingerprint_present
+        and bool(current_asset.get("exists"))
+        and str(stored_asset.get("sha256") or "") == str(current_asset.get("sha256") or "")
+        and int(stored_asset.get("file_size_bytes", 0) or 0) == int(current_asset.get("file_size_bytes", 0) or 0)
+        and stored_width == int(dict(current_asset.get("image_dimensions") or {}).get("width", 0) or 0)
+        and stored_height == int(dict(current_asset.get("image_dimensions") or {}).get("height", 0) or 0)
+    )
+    status = "missing_measurement_fingerprint"
+    reason = "Analysis artifact does not contain a measurement-time asset fingerprint."
+    if fingerprint_present and not bool(current_asset.get("exists")):
+        status = "missing_replay_asset"
+        reason = "The original measurement-time replay asset is no longer present on disk."
+    elif fingerprint_present and fingerprint_matches:
+        status = "fingerprint_match"
+        reason = "Current replay asset matches the measurement-time asset fingerprint."
+    elif fingerprint_present:
+        status = "fingerprint_mismatch"
+        reason = "Current replay asset does not match the measurement-time asset fingerprint."
+    return {
+        "stored": provenance,
+        "stored_asset": stored_asset,
+        "current_asset": current_asset,
+        "fingerprint_present": fingerprint_present,
+        "fingerprint_matches": fingerprint_matches,
+        "status": status,
+        "reason": reason,
+    }
+
+
+def _scientific_validation_crop_bounds(
+    diagnostics: Dict[str, object],
+    *,
+    width: int,
+    height: int,
+) -> Dict[str, int]:
+    stored_width, stored_height = _scientific_validation_stored_frame_size(diagnostics)
+    scale_x = float(width) / float(stored_width) if stored_width and stored_width > 0 else 1.0
+    scale_y = float(height) / float(stored_height) if stored_height and stored_height > 0 else 1.0
+    bounds = dict(diagnostics.get("measurement_crop_bounds") or {})
+    if not bounds:
+        return {"x0": 0, "x1": int(width), "y0": 0, "y1": int(height)}
+    x0 = max(0, min(int(width - 1), int(round(float(bounds.get("x0", 0) or 0) * scale_x))))
+    x1 = max(x0 + 1, min(int(width), int(round(float(bounds.get("x1", width) or width) * scale_x))))
+    y0 = max(0, min(int(height - 1), int(round(float(bounds.get("y0", 0) or 0) * scale_y))))
+    y1 = max(y0 + 1, min(int(height), int(round(float(bounds.get("y1", height) or height) * scale_y))))
+    return {"x0": x0, "x1": x1, "y0": y0, "y1": y1}
+
+
+def _scientific_validation_axis(diagnostics: Dict[str, object]) -> Tuple[float, float]:
+    axis = dict(diagnostics.get("dominant_gradient_axis") or {})
+    axis_x = float(axis.get("x", 0.0) or 0.0)
+    axis_y = float(axis.get("y", -1.0) or -1.0)
+    magnitude = math.hypot(axis_x, axis_y)
+    if magnitude <= 1e-8:
+        return (0.0, -1.0)
+    return (axis_x / magnitude, axis_y / magnitude)
+
+
+def _scientific_validation_stored_frame_size(diagnostics: Dict[str, object]) -> Tuple[Optional[float], Optional[float]]:
+    provenance = dict((dict(diagnostics.get("measurement_provenance") or {})).get("measurement_source_asset") or {})
+    dimensions = dict(provenance.get("image_dimensions") or {})
+    if int(dimensions.get("width", 0) or 0) > 0 and int(dimensions.get("height", 0) or 0) > 0:
+        return float(dimensions["width"]), float(dimensions["height"])
+    width_candidates: List[float] = []
+    height_candidates: List[float] = []
+    for zone in list(diagnostics.get("zone_measurements") or diagnostics.get("neutral_samples") or []):
+        bounds = dict(zone.get("bounds") or {})
+        pixel = dict(bounds.get("pixel") or {})
+        normalized = dict(bounds.get("normalized_within_roi") or {})
+        x0 = float(pixel.get("x0", 0.0) or 0.0)
+        x1 = float(pixel.get("x1", 0.0) or 0.0)
+        y0 = float(pixel.get("y0", 0.0) or 0.0)
+        y1 = float(pixel.get("y1", 0.0) or 0.0)
+        w = max(x1 - x0, 0.0)
+        h = max(y1 - y0, 0.0)
+        nx = float(normalized.get("x", 0.0) or 0.0)
+        ny = float(normalized.get("y", 0.0) or 0.0)
+        nw = float(normalized.get("w", 0.0) or 0.0)
+        nh = float(normalized.get("h", 0.0) or 0.0)
+        if nw > 1e-8:
+            width_candidates.append(w / nw)
+        if nh > 1e-8:
+            height_candidates.append(h / nh)
+        if nx > 1e-8:
+            width_candidates.append(x0 / nx)
+        if ny > 1e-8:
+            height_candidates.append(y0 / ny)
+    stored_width = float(np.median(np.asarray(width_candidates, dtype=np.float32))) if width_candidates else None
+    stored_height = float(np.median(np.asarray(height_candidates, dtype=np.float32))) if height_candidates else None
+    return stored_width, stored_height
+
+
+def _scientific_validation_resolve_report_clip(
+    payload: Dict[str, object],
+    *,
+    strategy_key: str,
+    clip_id: str,
+) -> Dict[str, object]:
+    for strategy in list(payload.get("strategies") or []):
+        if str(strategy.get("strategy_key") or "") != str(strategy_key):
+            continue
+        for clip in list(strategy.get("clips") or []):
+            if str(clip.get("clip_id") or "") == str(clip_id):
+                return dict(clip)
+    for clip in list(payload.get("clips") or []):
+        if str(clip.get("clip_id") or "") == str(clip_id):
+            return dict(clip)
+    return {}
+
+
+def _scientific_validation_report_measurement_reference(
+    payload: Dict[str, object],
+    *,
+    strategy_key: str,
+    clip_id: str,
+) -> Dict[str, object]:
+    report_json_path = str(payload.get("report_json") or "").strip()
+    if report_json_path:
+        debug_path = Path(report_json_path).with_name("contact_sheet_debug.json")
+        if debug_path.exists():
+            try:
+                debug_payload = json.loads(debug_path.read_text(encoding="utf-8"))
+                for row in list(debug_payload.get("measurement_values_per_camera") or []):
+                    if str(row.get("clip_id") or "") != str(clip_id):
+                        continue
+                    measurement_values = dict(row.get("measurement_values") or {})
+                    if measurement_values:
+                        return {
+                            "sample_1_ire": float(measurement_values.get("sample_1_ire", 0.0) or 0.0),
+                            "sample_2_ire": float(measurement_values.get("sample_2_ire", 0.0) or 0.0),
+                            "sample_3_ire": float(measurement_values.get("sample_3_ire", 0.0) or 0.0),
+                            "display_scalar_log2": float(measurement_values.get("display_scalar_log2", 0.0) or 0.0),
+                            "measurement_domain": "display-referred IPP2",
+                            "source": "contact_sheet_debug",
+                        }
+            except (json.JSONDecodeError, OSError, ValueError):
+                pass
+    for item in list(payload.get("shared_originals") or []):
+        if str(item.get("clip_id") or "") != str(clip_id):
+            continue
+        return {
+            "sample_1_ire": float(item.get("sample_1_ire", 0.0) or 0.0),
+            "sample_2_ire": float(item.get("sample_2_ire", 0.0) or 0.0),
+            "sample_3_ire": float(item.get("sample_3_ire", 0.0) or 0.0),
+            "display_scalar_log2": float(
+                item.get("display_scalar_log2", item.get("measured_log2_luminance", 0.0)) or 0.0
+            ),
+            "measurement_domain": str(item.get("display_scalar_domain") or item.get("measurement_domain") or "display-referred IPP2"),
+            "source": "shared_originals",
+        }
+    report_clip = _scientific_validation_resolve_report_clip(
+        payload,
+        strategy_key=strategy_key,
+        clip_id=clip_id,
+    )
+    report_exposure_metrics = dict((report_clip.get("metrics") or {}).get("exposure") or {})
+    return {
+        "sample_1_ire": float(report_exposure_metrics.get("sample_1_ire", 0.0) or 0.0),
+        "sample_2_ire": float(report_exposure_metrics.get("sample_2_ire", 0.0) or 0.0),
+        "sample_3_ire": float(report_exposure_metrics.get("sample_3_ire", 0.0) or 0.0),
+        "display_scalar_log2": float(
+            report_exposure_metrics.get(
+                "display_scalar_log2",
+                report_exposure_metrics.get(
+                    "measured_log2_luminance_monitoring",
+                    report_exposure_metrics.get("measured_log2_luminance", 0.0),
+                ),
+            ) or 0.0
+        ),
+        "measurement_domain": str(report_exposure_metrics.get("measurement_domain") or ""),
+        "source": "strategy_clip_metrics",
+    }
+
+
+def _scientific_validation_resolve_preview_path(
+    diagnostics: Dict[str, object],
+    payload: Dict[str, object],
+    *,
+    strategy_key: str,
+    clip_id: str,
+) -> str:
+    provenance = dict((dict(diagnostics.get("measurement_provenance") or {})).get("measurement_source_asset") or {})
+    provenance_path = str(provenance.get("path") or "").strip()
+    if provenance_path:
+        return provenance_path
+    direct_path = str(diagnostics.get("rendered_measurement_preview_path") or "").strip()
+    if direct_path:
+        return direct_path
+    report_clip = _scientific_validation_resolve_report_clip(
+        payload,
+        strategy_key=strategy_key,
+        clip_id=clip_id,
+    )
+    fallback_candidates = [
+        str(report_clip.get("original_frame") or "").strip(),
+        str((report_clip.get("preview_variants") or {}).get("original") or "").strip(),
+    ]
+    for item in list(payload.get("shared_originals") or []):
+        if str(item.get("clip_id") or "") != str(clip_id):
+            continue
+        fallback_candidates.append(str(item.get("original_frame") or "").strip())
+    for candidate in fallback_candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    return ""
+
+
+def _scientific_validation_recompute_samples(
+    preview_path: str,
+    diagnostics: Dict[str, object],
+) -> Dict[str, object]:
+    image, image_metadata = _load_preview_image_as_normalized_rgb(preview_path)
+    image_height, image_width = image.shape[:2]
+    stored_width, stored_height = _scientific_validation_stored_frame_size(diagnostics)
+    scale_x = float(image_width) / float(stored_width) if stored_width and stored_width > 0 else 1.0
+    scale_y = float(image_height) / float(stored_height) if stored_height and stored_height > 0 else 1.0
+    crop_bounds = _scientific_validation_crop_bounds(
+        diagnostics,
+        width=image_width,
+        height=image_height,
+    )
+    cropped_region = image[crop_bounds["y0"]:crop_bounds["y1"], crop_bounds["x0"]:crop_bounds["x1"], :]
+    if cropped_region.size == 0:
+        raise RuntimeError(f"Scientific validation crop is empty for {preview_path}")
+    detected_roi = _coerce_sphere_roi(dict(diagnostics.get("detected_sphere_roi") or {}))
+    if detected_roi is None:
+        raise RuntimeError(f"Scientific validation requires detected_sphere_roi for {preview_path}")
+    local_roi = SphereROI(
+        cx=(float(detected_roi.cx) * scale_x) - float(crop_bounds["x0"]),
+        cy=(float(detected_roi.cy) * scale_y) - float(crop_bounds["y0"]),
+        r=float(detected_roi.r) * float((scale_x + scale_y) * 0.5),
+    )
+    pixels_chw = np.transpose(cropped_region, (2, 0, 1))
+    sphere_mask, mask_metadata = build_sphere_sampling_mask(
+        pixels_chw,
+        local_roi,
+        sampling_variant="refined",
+    )
+    axis_x, axis_y = _scientific_validation_axis(diagnostics)
+    perpendicular_x = float(-axis_y)
+    perpendicular_y = float(axis_x)
+    height, width = sphere_mask.shape
+    yy, xx = np.meshgrid(np.arange(height, dtype=np.float32), np.arange(width, dtype=np.float32), indexing="ij")
+    interior_radius = max(float(local_roi.r) * 0.78, 1.0)
+    interior_circle = ((xx - local_roi.cx) ** 2 + (yy - local_roi.cy) ** 2) <= interior_radius ** 2
+    zone_results: List[Dict[str, object]] = []
+    for zone_bounds in _sphere_zone_geometries(width, height, local_roi, (axis_x, axis_y)):
+        zone_center = dict(zone_bounds.get("center") or {})
+        center_x = float(zone_center.get("x", local_roi.cx) or local_roi.cx)
+        center_y = float(zone_center.get("y", local_roi.cy) or local_roi.cy)
+        along = ((xx - center_x) * axis_x) + ((yy - center_y) * axis_y)
+        across = ((xx - center_x) * perpendicular_x) + ((yy - center_y) * perpendicular_y)
+        rect_half_width = max(float(local_roi.r) * 0.34, 1.0)
+        rect_half_height = max(float(local_roi.r) * 0.11, 1.0)
+        rect_mask = (np.abs(along) <= rect_half_height) & (np.abs(across) <= rect_half_width)
+        zone_mask = sphere_mask & rect_mask
+        sampling_method = str(mask_metadata.get("sampling_method", "circle_mask"))
+        if not np.any(zone_mask):
+            zone_mask = interior_circle & rect_mask
+            sampling_method = f"{sampling_method}_zone_fallback"
+        if not np.any(zone_mask):
+            zone_mask = interior_circle & (
+                (np.abs(((xx - center_x) * axis_x) + ((yy - center_y) * axis_y)) <= (rect_half_height * 1.25))
+                & (np.abs(((xx - center_x) * perpendicular_x) + ((yy - center_y) * perpendicular_y)) <= (rect_half_width * 1.25))
+            )
+            sampling_method = f"{sampling_method}_expanded_fallback"
+        zone_pixels = cropped_region[zone_mask]
+        rect_area = float(max(np.sum(rect_mask), 1))
+        zone_fraction = float(np.sum(zone_mask)) / rect_area
+        stats = _measure_pixel_cloud_statistics(
+            zone_pixels,
+            sampling_confidence=float(zone_fraction),
+            sampling_method=sampling_method,
+            mask_fraction=float(mask_metadata.get("mask_fraction", 1.0) or 1.0),
+            interior_fraction=float(mask_metadata.get("interior_fraction", 1.0) or 1.0),
+            interior_radius_ratio=float(mask_metadata.get("interior_radius_ratio", 1.0) or 1.0),
+        )
+        raw_pixels = np.asarray(zone_pixels, dtype=np.float32).reshape(-1, 3)
+        valid_mask = np.all((raw_pixels > 0.002) & (raw_pixels < 0.998), axis=1)
+        valid_pixels = raw_pixels[valid_mask]
+        if valid_pixels.size == 0:
+            valid_pixels = raw_pixels
+        luminance = np.clip(
+            valid_pixels[:, 0] * 0.2126 + valid_pixels[:, 1] * 0.7152 + valid_pixels[:, 2] * 0.0722,
+            1e-6,
+            1.0,
+        )
+        trimmed_luminance = percentile_clip(luminance, 5.0, 95.0)
+        low = float(trimmed_luminance.min())
+        high = float(trimmed_luminance.max())
+        trimmed_pixels = valid_pixels[(luminance >= low) & (luminance <= high)]
+        if trimmed_pixels.size == 0:
+            trimmed_pixels = valid_pixels
+        log_values = np.log2(np.clip(trimmed_luminance, 1e-6, 1.0))
+        zone_results.append(
+            {
+                "label": str(zone_bounds.get("label") or ""),
+                "display_label": str(zone_bounds.get("display_label") or ""),
+                "zone_fraction": zone_fraction,
+                "sampling_method": sampling_method,
+                "pixel_preview": _scientific_validation_pixel_preview(raw_pixels),
+                "valid_pixel_preview": _scientific_validation_pixel_preview(valid_pixels),
+                "trimmed_pixel_preview": _scientific_validation_pixel_preview(trimmed_pixels),
+                "luminance_preview": [float(value) for value in luminance[: min(24, luminance.size)].tolist()],
+                "trimmed_luminance_preview": [float(value) for value in trimmed_luminance[: min(24, trimmed_luminance.size)].tolist()],
+                "log2_luminance_preview": [float(value) for value in log_values[: min(24, log_values.size)].tolist()],
+                "computed": {
+                    "luminance_formula": "Y = 0.2126 R + 0.7152 G + 0.0722 B",
+                    "luminance_domain": "display-referred IPP2 RGB normalized to 0-1",
+                    "trim_low_percentile": 5.0,
+                    "trim_high_percentile": 95.0,
+                    "median_trimmed_luminance": float(np.median(trimmed_luminance)),
+                    "median_log2_luminance": float(np.median(log_values)),
+                    "computed_ire": float((2.0 ** float(np.median(log_values))) * 100.0),
+                    "trimmed_luminance_count": int(trimmed_luminance.size),
+                    "retained_fraction": float(trimmed_luminance.size) / float(max(raw_pixels.shape[0], 1)),
+                },
+                "recomputed_zone_measurement": {
+                    "measured_log2_luminance": float(stats["measured_log2_luminance"]),
+                    "measured_ire": float(stats["measured_ire"]),
+                    "measured_rgb_mean": [float(value) for value in list(stats["measured_rgb_mean"])],
+                    "measured_rgb_chromaticity": [float(value) for value in list(stats["measured_rgb_chromaticity"])],
+                    "gray_luminance_distribution": dict(stats["gray_luminance_distribution"]),
+                    "gray_log2_distribution": dict(stats["gray_log2_distribution"]),
+                },
+            }
+        )
+    ordered = _ordered_zone_profile(zone_results)
+    aggregate_log2 = float(np.median(np.asarray([float(item["recomputed_zone_measurement"]["measured_log2_luminance"]) for item in ordered], dtype=np.float32)))
+    aggregate_ire = _ire_from_log2_luminance(aggregate_log2)
+    return {
+        "preview_path": str(preview_path),
+        "image_metadata": image_metadata,
+        "image_width": int(image_width),
+        "image_height": int(image_height),
+        "stored_coordinate_space": {
+            "width": stored_width,
+            "height": stored_height,
+            "scale_x": scale_x,
+            "scale_y": scale_y,
+        },
+        "crop_bounds": crop_bounds,
+        "crop_size": {"width": int(cropped_region.shape[1]), "height": int(cropped_region.shape[0])},
+        "local_sphere_roi": {"cx": float(local_roi.cx), "cy": float(local_roi.cy), "r": float(local_roi.r)},
+        "mask_metadata": {
+            key: float(value) if isinstance(value, (float, int)) else value
+            for key, value in dict(mask_metadata).items()
+        },
+        "axis_vector": {
+            "x": float(axis_x),
+            "y": float(axis_y),
+            "perpendicular_x": float(perpendicular_x),
+            "perpendicular_y": float(perpendicular_y),
+        },
+        "zone_samples": ordered,
+        "aggregate": {
+            "measured_log2_luminance": aggregate_log2,
+            "measured_ire": aggregate_ire,
+            "sample_scalar_display_log2": aggregate_log2,
+            "sample_scalar_display_ire": aggregate_ire,
+        },
+    }
+
+
+def _scientific_validation_report_markdown(summary: Dict[str, object]) -> str:
+    pipeline = dict(summary.get("pipeline") or {})
+    example = dict(summary.get("worked_example") or {})
+    provenance = dict(summary.get("measurement_provenance") or {})
+    stored_asset = dict(provenance.get("stored_asset") or {})
+    current_asset = dict(provenance.get("current_asset") or {})
+    zone_map = _zone_profile_by_label(list((example.get("zone_samples") or [])))
+    sample_2 = dict(zone_map.get("center") or {})
+    sample_2_computed = dict(sample_2.get("computed") or {})
+    sample_2_recomputed = dict(sample_2.get("recomputed_zone_measurement") or {})
+    crop_bounds = dict(example.get("crop_bounds") or {})
+    consistency = dict(summary.get("consistency_validation") or {})
+    lines = [
+        "# Scientific Validation",
+        "",
+        f"- Status: `{summary.get('status')}`",
+        f"- Reason: `{summary.get('reason')}`",
+        "",
+        "## Measurement Provenance",
+        "",
+        f"- Provenance status: `{provenance.get('status')}`",
+        f"- Provenance reason: `{provenance.get('reason')}`",
+        f"- Measurement-time asset path: `{stored_asset.get('path')}`",
+        f"- Measurement-time SHA-256: `{stored_asset.get('sha256')}`",
+        f"- Measurement-time size: `{stored_asset.get('file_size_bytes')}` bytes",
+        f"- Measurement-time dimensions: `{stored_asset.get('image_dimensions')}`",
+        f"- Current replay asset path: `{current_asset.get('path')}`",
+        f"- Current replay SHA-256: `{current_asset.get('sha256')}`",
+        f"- Current replay size: `{current_asset.get('file_size_bytes')}` bytes",
+        f"- Current replay dimensions: `{current_asset.get('image_dimensions')}`",
+        "",
+        "## Measurement Entry Point",
+        "",
+        f"- Pixel loader: `{pipeline.get('image_reader_function')}`",
+        f"- Library: `{pipeline.get('image_reader_library')}`",
+        f"- Input format: `{pipeline.get('pixel_input_format')}`",
+        f"- Normalized format: `{pipeline.get('pixel_normalized_format')}`",
+        f"- Measurement domain: `{pipeline.get('measurement_domain')}`",
+        "",
+        "## Sphere Detection + Sampling Geometry",
+        "",
+        f"- Detection library: `{pipeline.get('sphere_detection_library')}`",
+        f"- Detection function: `{pipeline.get('sphere_detection_function')}`",
+        f"- Edge detector: `{pipeline.get('edge_detector')}`",
+        f"- Circle estimator: `{pipeline.get('circle_estimator')}`",
+        f"- Mask refinement: `{pipeline.get('mask_refinement')}`",
+        f"- Sample geometry: `{pipeline.get('sample_geometry')}`",
+        "",
+        "## Measurement Formulas",
+        "",
+        "- Luminance: `Y = 0.2126 R + 0.7152 G + 0.0722 B`",
+        "- Trim: retain 5th to 95th percentile luminance values after clipping guard",
+        "- Log2 scalar: `median(log2(trimmed_luminance))`",
+        "- IRE mapping: `IRE = (2 ** measured_log2_luminance) * 100`",
+        "- Note: these are computed display-domain IRE values, not waveform instrument readings",
+        "",
+        "## Worked Example",
+        "",
+        f"- Clip: `{example.get('clip_id')}`",
+        f"- Preview image: `{example.get('preview_path')}`",
+        f"- Crop bounds: `{crop_bounds}`",
+        f"- Sphere ROI (local crop): `{example.get('local_sphere_roi')}`",
+        "",
+        "### Sample 2 Proof Block",
+        "",
+        f"- Raw RGB preview (normalized): `{(sample_2.get('pixel_preview') or {}).get('normalized_rgb_preview', [])[:10]}`",
+        f"- Luminance preview: `{list((sample_2.get('luminance_preview') or [])[:10])}`",
+        f"- Trimmed luminance preview: `{list((sample_2.get('trimmed_luminance_preview') or [])[:10])}`",
+        f"- Log2 preview: `{list((sample_2.get('log2_luminance_preview') or [])[:10])}`",
+        f"- Median trimmed luminance: `{sample_2_computed.get('median_trimmed_luminance')}`",
+        f"- Median log2 luminance: `{sample_2_computed.get('median_log2_luminance')}`",
+        f"- Computed IRE: `{sample_2_computed.get('computed_ire')}`",
+        f"- Recomputed stored log2: `{sample_2_recomputed.get('measured_log2_luminance')}`",
+        f"- Recomputed stored IRE: `{sample_2_recomputed.get('measured_ire')}`",
+        "",
+        "## Consistency Validation",
+        "",
+        f"- Analysis match: `{consistency.get('analysis_matches_recomputed')}`",
+        f"- IPP2 validation match: `{consistency.get('ipp2_validation_matches_analysis')}`",
+        f"- Report metrics match: `{consistency.get('report_matches_analysis')}`",
+        f"- Validation status: `{consistency.get('status')}`",
+        f"- Replay asset fingerprint match: `{provenance.get('fingerprint_matches')}`",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _build_scientific_validation_artifacts(
+    *,
+    out_root: Path,
+    analysis_records: List[Dict[str, object]],
+    payload: Dict[str, object],
+    fail_on_analysis_drift: bool = False,
+) -> Dict[str, object]:
+    out_root.mkdir(parents=True, exist_ok=True)
+    if not analysis_records:
+        raise RuntimeError("Scientific validation requires at least one analysis record.")
+    recommended_strategy = dict(payload.get("recommended_strategy") or {})
+    recommended_strategy_key = str(recommended_strategy.get("strategy_key") or "median")
+    ipp2_rows = list((payload.get("ipp2_validation") or {}).get("rows") or [])
+    example_row = next(
+        (
+            dict(row)
+            for row in ipp2_rows
+            if str(row.get("strategy_key") or "") == recommended_strategy_key and str(row.get("clip_id") or "").strip()
+        ),
+        dict(ipp2_rows[0]) if ipp2_rows else {},
+    )
+    example_clip_id = str(example_row.get("clip_id") or analysis_records[0].get("clip_id") or "")
+    analysis_record = next(
+        (dict(record) for record in analysis_records if str(record.get("clip_id") or "") == example_clip_id),
+        dict(analysis_records[0]),
+    )
+    diagnostics = dict(analysis_record.get("diagnostics") or {})
+    preview_path = _scientific_validation_resolve_preview_path(
+        diagnostics,
+        payload,
+        strategy_key=recommended_strategy_key,
+        clip_id=example_clip_id,
+    )
+    if (
+        not preview_path
+        or not Path(preview_path).exists()
+        or not dict(diagnostics.get("detected_sphere_roi") or {})
+        or not list(diagnostics.get("zone_measurements") or diagnostics.get("neutral_samples") or [])
+    ):
+        summary = {
+            "status": "unavailable",
+            "reason": "stored run data does not contain full sphere replay prerequisites",
+            "clip_id": example_clip_id,
+            "recommended_strategy_key": recommended_strategy_key,
+            "available_fields": {
+                "preview_path": preview_path,
+                "preview_exists": bool(preview_path and Path(preview_path).exists()),
+                "detected_sphere_roi": bool(dict(diagnostics.get("detected_sphere_roi") or {})),
+                "zone_measurements": bool(list(diagnostics.get("zone_measurements") or diagnostics.get("neutral_samples") or [])),
+            },
+        }
+        json_path = out_root / "scientific_validation.json"
+        markdown_path = out_root / "scientific_validation.md"
+        json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        markdown_path.write_text(_scientific_validation_report_markdown(summary), encoding="utf-8")
+        return {
+            "path": str(json_path),
+            "markdown_path": str(markdown_path),
+            "summary": summary,
+        }
+    provenance = _scientific_validation_measurement_provenance(diagnostics, preview_path)
+    recomputed = _scientific_validation_recompute_samples(preview_path, diagnostics)
+    analysis_zone_profile = _ordered_zone_profile(list(diagnostics.get("zone_measurements") or diagnostics.get("neutral_samples") or []))
+    if not analysis_zone_profile:
+        raise RuntimeError(f"Scientific validation requires zone_measurements for {example_clip_id}")
+    report_reference = _scientific_validation_report_measurement_reference(
+        payload,
+        strategy_key=recommended_strategy_key,
+        clip_id=example_clip_id,
+    )
+    ipp2_original_profile = _ordered_zone_profile(list(example_row.get("ipp2_original_zone_profile") or []))
+    if not ipp2_original_profile:
+        ipp2_original_profile = analysis_zone_profile
+
+    analysis_sample_ires = _sample_ire_fields_from_profile(analysis_zone_profile)
+    analysis_scalar = _sample_scalar_display_from_profile(analysis_zone_profile)
+    recomputed_zone_map = _zone_profile_by_label(list(recomputed.get("zone_samples") or []))
+    analysis_zone_map = _zone_profile_by_label(analysis_zone_profile)
+    ipp2_zone_map = _zone_profile_by_label(ipp2_original_profile)
+
+    per_zone_checks: List[Dict[str, object]] = []
+    for label in SPHERE_PROFILE_ZONE_ORDER:
+        recomputed_zone = dict(recomputed_zone_map.get(label) or {})
+        analysis_zone = dict(analysis_zone_map.get(label) or {})
+        ipp2_zone = dict(ipp2_zone_map.get(label) or {})
+        recomputed_measure = dict(recomputed_zone.get("recomputed_zone_measurement") or {})
+        if not recomputed_measure or not analysis_zone:
+            raise RuntimeError(f"Scientific validation missing zone trace for {example_clip_id} / {label}")
+        analysis_delta_log2 = abs(
+            float(recomputed_measure.get("measured_log2_luminance", 0.0) or 0.0)
+            - float(analysis_zone.get("measured_log2_luminance", 0.0) or 0.0)
+        )
+        analysis_delta_ire = abs(
+            float(recomputed_measure.get("measured_ire", 0.0) or 0.0)
+            - float(analysis_zone.get("measured_ire", 0.0) or 0.0)
+        )
+        ipp2_delta_ire = abs(
+            float(analysis_zone.get("measured_ire", 0.0) or 0.0)
+            - float(ipp2_zone.get("measured_ire", analysis_zone.get("measured_ire", 0.0)) or 0.0)
+        )
+        per_zone_checks.append(
+            {
+                "label": label,
+                "display_label": SPHERE_PROFILE_ZONE_DISPLAY[label],
+                "analysis_delta_log2": analysis_delta_log2,
+                "analysis_delta_ire": analysis_delta_ire,
+                "ipp2_delta_ire": ipp2_delta_ire,
+                "analysis_match": analysis_delta_log2 <= 1e-6 and analysis_delta_ire <= 1e-6,
+                "ipp2_match": ipp2_delta_ire <= 1e-6,
+            }
+        )
+    report_sample_1 = float(report_reference.get("sample_1_ire", analysis_sample_ires["sample_1_ire"]) or 0.0)
+    report_sample_2 = float(report_reference.get("sample_2_ire", analysis_sample_ires["sample_2_ire"]) or 0.0)
+    report_sample_3 = float(report_reference.get("sample_3_ire", analysis_sample_ires["sample_3_ire"]) or 0.0)
+    report_scalar = float(report_reference.get("display_scalar_log2", analysis_scalar["sample_scalar_display_log2"]) or 0.0)
+    report_deltas = {
+        "sample_1_ire": abs(report_sample_1 - analysis_sample_ires["sample_1_ire"]),
+        "sample_2_ire": abs(report_sample_2 - analysis_sample_ires["sample_2_ire"]),
+        "sample_3_ire": abs(report_sample_3 - analysis_sample_ires["sample_3_ire"]),
+        "scalar_log2": abs(report_scalar - analysis_scalar["sample_scalar_display_log2"]),
+    }
+    report_matches_analysis = all(value <= 1e-6 for value in report_deltas.values())
+
+    analysis_matches_recomputed = all(bool(item.get("analysis_match")) for item in per_zone_checks)
+    ipp2_matches_analysis = all(bool(item.get("ipp2_match")) for item in per_zone_checks)
+    validation_status = "fully_reconciled"
+    validation_reason = "Stored analysis, report values, and replayed measurement asset fully reconcile."
+    if not report_matches_analysis or not ipp2_matches_analysis:
+        validation_status = "analysis_drift"
+        validation_reason = "Stored analysis truth diverges from report-visible or validation-visible values."
+    elif not bool(provenance.get("fingerprint_matches")) or not analysis_matches_recomputed:
+        validation_status = "blocked_asset_mismatch"
+        if str(provenance.get("status") or "") == "fingerprint_mismatch":
+            validation_reason = "Stored analysis/report values reconcile, but the current replay asset does not match the measurement-time fingerprint."
+        elif str(provenance.get("status") or "") == "missing_replay_asset":
+            validation_reason = "Stored analysis/report values reconcile, but the original replay asset is missing."
+        elif str(provenance.get("status") or "") == "missing_measurement_fingerprint":
+            validation_reason = "Stored analysis/report values reconcile, but the archived analysis artifact does not contain a measurement-time fingerprint and current replay values do not reconcile."
+        else:
+            validation_reason = "Stored analysis/report values reconcile, but replaying the current measurement preview asset does not reproduce the stored analysis measurements."
+    summary = {
+        "status": validation_status,
+        "reason": validation_reason,
+        "clip_id": example_clip_id,
+        "recommended_strategy_key": recommended_strategy_key,
+        "pipeline": {
+            "image_reader_function": "r3dmatch.report._measure_rendered_preview_roi_ipp2",
+            "image_reader_library": "Pillow -> numpy float32",
+            "pixel_input_format": "uint8 RGB JPEG/PNG preview",
+            "pixel_normalized_format": "float32 RGB normalized to 0-1",
+            "measurement_domain": "display-referred IPP2 / BT.709 / BT.1886",
+            "sphere_detection_library": "scikit-image",
+            "sphere_detection_function": "r3dmatch.report._detect_sphere_candidates_in_region_hwc",
+            "edge_detector": "skimage.feature.canny",
+            "circle_estimator": "skimage.transform.hough_circle + hough_circle_peaks",
+            "mask_refinement": "build_sphere_sampling_mask -> remove_small_objects -> binary_opening -> binary_closing -> regionprops selection",
+            "sample_geometry": "three gradient-aligned rectangular bands intersected with refined sphere mask",
+            "luminance_formula": "Y = 0.2126 R + 0.7152 G + 0.0722 B",
+            "statistical_reduction": "clip 0.002-0.998 -> 5th-95th percentile trim -> median(log2(trimmed_luminance))",
+            "ire_mapping": "IRE = (2 ** measured_log2_luminance) * 100",
+            "ire_note": "Computed display-domain IRE values, not waveform readings",
+        },
+        "worked_example": {
+            "clip_id": example_clip_id,
+            **recomputed,
+        },
+        "measurement_provenance": provenance,
+        "stored_analysis_reference": {
+            "analysis_path": str(analysis_record.get("analysis_path") or ""),
+            "preview_path": preview_path,
+            "sample_1_ire": analysis_sample_ires["sample_1_ire"],
+            "sample_2_ire": analysis_sample_ires["sample_2_ire"],
+            "sample_3_ire": analysis_sample_ires["sample_3_ire"],
+            "display_scalar_log2": float(analysis_scalar["sample_scalar_display_log2"]),
+            "gray_exposure_summary": str(diagnostics.get("gray_exposure_summary") or ""),
+            "zone_measurements": analysis_zone_profile,
+        },
+        "report_reference": {
+            "report_clip_id": example_clip_id,
+            "source": str(report_reference.get("source") or ""),
+            "report_sample_1_ire": report_sample_1,
+            "report_sample_2_ire": report_sample_2,
+            "report_sample_3_ire": report_sample_3,
+            "report_scalar_log2": report_scalar,
+            "report_measurement_domain": str(report_reference.get("measurement_domain") or ""),
+        },
+        "ipp2_validation_reference": {
+            "clip_id": example_clip_id,
+            "ipp2_original_value_log2": float(
+                example_row.get("ipp2_original_value_log2", diagnostics.get("measured_log2_luminance", 0.0)) or 0.0
+            ),
+            "ipp2_original_zone_profile": ipp2_original_profile,
+        },
+        "consistency_validation": {
+            "status": validation_status,
+            "per_zone_checks": per_zone_checks,
+            "analysis_matches_recomputed": analysis_matches_recomputed,
+            "ipp2_validation_matches_analysis": ipp2_matches_analysis,
+            "report_matches_analysis": report_matches_analysis,
+            "report_deltas": report_deltas,
+        },
+    }
+    if fail_on_analysis_drift and validation_status == "analysis_drift":
+        raise RuntimeError(
+            "Scientific validation detected report IRE/scalar drift from stored measurement payload "
+            f"for {example_clip_id}: {report_deltas}"
+        )
+    json_path = out_root / "scientific_validation.json"
+    markdown_path = out_root / "scientific_validation.md"
+    json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    markdown_path.write_text(_scientific_validation_report_markdown(summary), encoding="utf-8")
+    return {
+        "path": str(json_path),
+        "markdown_path": str(markdown_path),
+        "summary": summary,
+    }
+
+
+def build_scientific_validation_report(
+    input_path: str,
+    *,
+    out_dir: Optional[str] = None,
+) -> Dict[str, object]:
+    analysis_records = _load_analysis_records(input_path)
+    root = Path(input_path).expanduser().resolve()
+    report_root = Path(out_dir).expanduser().resolve() if out_dir else (root / "report" if (root / "report").exists() else root)
+    contact_sheet_path = report_root / "contact_sheet.json"
+    payload = json.loads(contact_sheet_path.read_text(encoding="utf-8")) if contact_sheet_path.exists() else {}
+    return _build_scientific_validation_artifacts(
+        out_root=report_root,
+        analysis_records=analysis_records,
+        payload=payload,
+    )
 
 
 def _quality_by_clip(array_calibration_payload: Optional[Dict[str, object]]) -> Dict[str, Dict[str, object]]:
@@ -646,9 +2105,9 @@ def preview_filename_for_clip_id(
     *,
     strategy: Optional[str] = None,
     run_id: Optional[str] = None,
-    extension: str = "jpg",
+    extension: Optional[str] = None,
 ) -> str:
-    suffix = extension.lstrip(".")
+    suffix = (extension or preview_still_extension(DEFAULT_PREVIEW_STILL_FORMAT)).lstrip(".")
     if strategy is None:
         return f"{clip_id}.{variant}.review.{run_id}.{suffix}" if run_id else f"{clip_id}.{variant}.review.{suffix}"
     return (
@@ -711,21 +2170,61 @@ def clear_preview_cache(
 
 
 def _resolve_redline_executable() -> str:
-    executable = str(os.environ.get("R3DMATCH_REDLINE_EXECUTABLE", "") or "").strip()
-    if not executable and REDLINE_CONFIG_PATH.exists():
+    status = resolve_redline_tool_status()
+    if status["ready"]:
+        return str(status["resolved_path"])
+    raise RuntimeError(str(status["error"] or "REDLine not found — real validation required"))
+
+
+def resolve_redline_tool_status() -> Dict[str, object]:
+    configured = str(os.environ.get("R3DMATCH_REDLINE_EXECUTABLE", "") or "").strip()
+    source = "environment" if configured else "path"
+    config_path = ""
+    if not configured and REDLINE_CONFIG_PATH.exists():
         try:
             config_payload = json.loads(REDLINE_CONFIG_PATH.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
-            raise RuntimeError(f"Invalid REDLine config JSON: {REDLINE_CONFIG_PATH}") from exc
-        executable = str(config_payload.get("redline_executable") or config_payload.get("redline_path") or "").strip()
-    executable = executable or "REDLine"
+            return {
+                "ready": False,
+                "configured": "",
+                "resolved_path": "",
+                "source": "config_error",
+                "config_path": str(REDLINE_CONFIG_PATH),
+                "error": f"Invalid REDLine config JSON: {REDLINE_CONFIG_PATH}: {exc}",
+            }
+        configured = str(config_payload.get("redline_executable") or config_payload.get("redline_path") or "").strip()
+        if configured:
+            source = "config"
+            config_path = str(REDLINE_CONFIG_PATH)
+    executable = configured or "REDLine"
     resolved = shutil.which(executable)
     if resolved:
-        return resolved
+        return {
+            "ready": True,
+            "configured": executable,
+            "resolved_path": str(Path(resolved).resolve()),
+            "source": source if configured else "path",
+            "config_path": config_path,
+            "error": "",
+        }
     candidate = Path(executable).expanduser()
     if candidate.exists():
-        return str(candidate.resolve())
-    raise RuntimeError("REDLine not found — real validation required")
+        return {
+            "ready": True,
+            "configured": executable,
+            "resolved_path": str(candidate.resolve()),
+            "source": "explicit_path" if configured else "path",
+            "config_path": config_path,
+            "error": "",
+        }
+    return {
+        "ready": False,
+        "configured": executable,
+        "resolved_path": "",
+        "source": source,
+        "config_path": config_path,
+        "error": "REDLine executable is not available. Configure R3DMATCH_REDLINE_EXECUTABLE, add REDLine to PATH, or provide a valid config/redline.json entry.",
+    }
 
 
 def _is_real_red_source_path(source_path: str) -> bool:
@@ -905,6 +2404,7 @@ def _normalize_preview_settings(
     preview_highlight_rolloff: Optional[str],
     preview_shadow_rolloff: Optional[str],
     preview_lut: Optional[str],
+    preview_still_format: Optional[str] = None,
 ) -> Dict[str, object]:
     requested_mode = (preview_mode or "monitoring").lower()
     if requested_mode not in {"calibration", "monitoring"}:
@@ -915,6 +2415,9 @@ def _normalize_preview_settings(
     output_gamma = preview_output_gamma or str(defaults["output_gamma"])
     highlight_rolloff = (preview_highlight_rolloff or str(defaults["highlight_rolloff"])).lower()
     shadow_rolloff = (preview_shadow_rolloff or str(defaults["shadow_rolloff"])).lower()
+    resolved_preview_still_format = normalize_preview_still_format(
+        preview_still_format or str(defaults.get("preview_still_format") or DEFAULT_PREVIEW_STILL_FORMAT)
+    )
     if output_space not in COLOR_SPACE_CODES:
         raise ValueError(f"unsupported preview output space: {output_space}")
     if output_gamma not in GAMMA_CODES:
@@ -933,6 +2436,9 @@ def _normalize_preview_settings(
         "shadow_rolloff": shadow_rolloff,
         "lut_path": lut_path,
         "output_tonemap": "medium",
+        "preview_still_format": resolved_preview_still_format,
+        "preview_still_extension": preview_still_extension(resolved_preview_still_format),
+        "preview_still_redline_format_code": int(PREVIEW_STILL_FORMAT_CODES[resolved_preview_still_format]),
     }
     if requested_mode == "calibration":
         payload["preview_mode_alias"] = "calibration_compatibility_alias_to_monitoring"
@@ -966,6 +2472,7 @@ def _color_preview_policy() -> Dict[str, object]:
     return {
         "enabled": enabled,
         "status": "enabled_unverified_override" if enabled else "disabled_unverified",
+        "operator_status": "Enabled for operator review" if enabled else "Not shown in operator review",
         "note": note,
     }
 
@@ -1012,15 +2519,22 @@ def _extract_preview_corrections(sidecar_payload: Dict[str, object]) -> Dict[str
 
 def _extract_normalized_roi_region_hwc(image: np.ndarray, calibration_roi: Optional[Dict[str, float]]) -> np.ndarray:
     if calibration_roi is None:
-        chw = np.moveaxis(image, -1, 0)
-        centered = extract_center_region(chw, fraction=0.4)
-        return np.moveaxis(centered, 0, -1)
+        return image
     height, width = image.shape[:2]
     x0 = max(0, min(width - 1, int(np.floor(float(calibration_roi["x"]) * width))))
     y0 = max(0, min(height - 1, int(np.floor(float(calibration_roi["y"]) * height))))
     x1 = max(x0 + 1, min(width, int(np.ceil((float(calibration_roi["x"]) + float(calibration_roi["w"])) * width))))
     y1 = max(y0 + 1, min(height, int(np.ceil((float(calibration_roi["y"]) + float(calibration_roi["h"])) * height))))
     return image[y0:y1, x0:x1, :]
+
+
+def _normalized_roi_origin(image: np.ndarray, calibration_roi: Optional[Dict[str, float]]) -> Tuple[int, int]:
+    if calibration_roi is None:
+        return (0, 0)
+    height, width = image.shape[:2]
+    x0 = max(0, min(width - 1, int(np.floor(float(calibration_roi["x"]) * width))))
+    y0 = max(0, min(height - 1, int(np.floor(float(calibration_roi["y"]) * height))))
+    return (x0, y0)
 
 
 def _solver_sampling_measurement_from_hwc_region(region: np.ndarray) -> Dict[str, object]:
@@ -1041,7 +2555,7 @@ def _solver_sampling_measurement_from_hwc_region(region: np.ndarray) -> Dict[str
 
 
 def _measure_rendered_preview_roi(preview_path: str, calibration_roi: Optional[Dict[str, float]]) -> Dict[str, object]:
-    image = np.asarray(Image.open(preview_path).convert("RGB"), dtype=np.float32) / 255.0
+    image, image_metadata = _load_preview_image_as_normalized_rgb(preview_path)
     region = _extract_normalized_roi_region_hwc(image, calibration_roi)
     stats = _solver_sampling_measurement_from_hwc_region(region)
     pixels = region.reshape(-1, 3)
@@ -1049,6 +2563,13 @@ def _measure_rendered_preview_roi(preview_path: str, calibration_roi: Optional[D
     return {
         **stats,
         "measured_saturation_fraction_monitoring": saturation_fraction,
+        "render_width": int(image_metadata.get("width", image.shape[1])),
+        "render_height": int(image_metadata.get("height", image.shape[0])),
+        "rendered_image_dtype": str(image_metadata.get("source_dtype") or ""),
+        "rendered_image_mode": str(image_metadata.get("image_mode") or ""),
+        "rendered_image_bit_depth": image_metadata.get("bit_depth"),
+        "rendered_image_normalization_denominator": image_metadata.get("normalization_denominator"),
+        "rendered_preview_format": str(image_metadata.get("preview_format") or ""),
     }
 
 
@@ -1167,6 +2688,82 @@ def _zone_containment_score(roi: SphereROI, width: int, height: int) -> float:
     return float(np.mean(np.asarray(scores, dtype=np.float32))) if scores else 0.0
 
 
+def _dedupe_sphere_candidates(candidates: List[Dict[str, object]], *, distance_factor: float = 0.40) -> List[Dict[str, object]]:
+    if not candidates:
+        return []
+    kept: List[Dict[str, object]] = []
+    for candidate in sorted(candidates, key=lambda item: float(item.get("confidence", 0.0) or 0.0), reverse=True):
+        roi_payload = dict(candidate.get("roi") or {})
+        radius = float(roi_payload.get("r", 0.0) or 0.0)
+        cx = float(roi_payload.get("cx", 0.0) or 0.0)
+        cy = float(roi_payload.get("cy", 0.0) or 0.0)
+        if radius <= 0.0:
+            continue
+        duplicate = False
+        for existing in kept:
+            existing_roi = dict(existing.get("roi") or {})
+            existing_radius = float(existing_roi.get("r", 0.0) or 0.0)
+            distance = math.hypot(
+                cx - float(existing_roi.get("cx", 0.0) or 0.0),
+                cy - float(existing_roi.get("cy", 0.0) or 0.0),
+            )
+            if distance <= max(radius, existing_radius) * float(distance_factor) and abs(radius - existing_radius) <= max(radius, existing_radius) * 0.25:
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(candidate)
+    return kept
+
+
+def _resize_region_for_sphere_detection(region: np.ndarray) -> Tuple[np.ndarray, float]:
+    height, width = region.shape[:2]
+    max_dimension = max(height, width)
+    if max_dimension <= SPHERE_DETECTION_MAX_DIMENSION:
+        return region, 1.0
+    scale = float(SPHERE_DETECTION_MAX_DIMENSION) / float(max_dimension)
+    resized_height = max(64, int(round(float(height) * scale)))
+    resized_width = max(64, int(round(float(width) * scale)))
+    resized = transform.resize(
+        region,
+        (resized_height, resized_width, region.shape[2]),
+        order=1,
+        mode="reflect",
+        anti_aliasing=True,
+        preserve_range=True,
+    ).astype(np.float32)
+    return np.clip(resized, 0.0, 1.0), float(scale)
+
+
+def _rescale_sphere_candidates(candidates: List[Dict[str, object]], scale: float) -> List[Dict[str, object]]:
+    if not candidates or math.isclose(float(scale), 1.0, rel_tol=1e-9, abs_tol=1e-9):
+        return [copy.deepcopy(dict(candidate)) for candidate in candidates]
+    factor = 1.0 / float(scale)
+    rescaled: List[Dict[str, object]] = []
+    for candidate in candidates:
+        item = copy.deepcopy(dict(candidate))
+        roi_payload = dict(item.get("roi") or {})
+        if roi_payload:
+            roi_payload["cx"] = float(roi_payload.get("cx", 0.0) or 0.0) * factor
+            roi_payload["cy"] = float(roi_payload.get("cy", 0.0) or 0.0) * factor
+            roi_payload["r"] = float(roi_payload.get("r", 0.0) or 0.0) * factor
+            item["roi"] = roi_payload
+        item["detection_resize_scale"] = float(scale)
+        rescaled.append(item)
+    return rescaled
+
+
+def _plateau_score(value: float, low: float, high: float, falloff: float) -> float:
+    numeric_value = float(value)
+    numeric_low = float(low)
+    numeric_high = float(high)
+    numeric_falloff = max(float(falloff), 1e-6)
+    if numeric_value < numeric_low:
+        return max(0.0, 1.0 - ((numeric_low - numeric_value) / numeric_falloff))
+    if numeric_value > numeric_high:
+        return max(0.0, 1.0 - ((numeric_value - numeric_high) / numeric_falloff))
+    return 1.0
+
+
 def _evaluate_detected_sphere_roi(
     region: np.ndarray,
     *,
@@ -1174,6 +2771,8 @@ def _evaluate_detected_sphere_roi(
     edge_map: np.ndarray,
     accumulator: float,
     detection_source: str,
+    shape_circularity: Optional[float] = None,
+    aspect_ratio: Optional[float] = None,
 ) -> Dict[str, object]:
     height, width = region.shape[:2]
     yy, xx = np.meshgrid(np.arange(height, dtype=np.float32), np.arange(width, dtype=np.float32), indexing="ij")
@@ -1181,41 +2780,61 @@ def _evaluate_detected_sphere_roi(
     distance = np.sqrt((xx - float(roi.cx)) ** 2 + (yy - float(roi.cy)) ** 2)
     interior_mask = distance <= radius * 0.92
     ring_mask = (distance >= radius * 1.02) & (distance <= radius * 1.20)
+    edge_band = np.abs(distance - radius) <= 2.5
+    center_core_mask = distance <= radius * 0.35
+    inner_shell_mask = (distance >= radius * 0.52) & (distance <= radius * 0.82)
+    edge_band_pixels = int(np.count_nonzero(edge_band))
+    edge_support = float(np.count_nonzero(edge_map[edge_band])) / float(max(edge_band_pixels, 1))
     luminance = np.clip(region[..., 0] * 0.2126 + region[..., 1] * 0.7152 + region[..., 2] * 0.0722, 1e-6, 1.0)
     interior_values = luminance[interior_mask]
     ring_values = luminance[ring_mask]
+    center_core_values = luminance[center_core_mask]
+    inner_shell_values = luminance[inner_shell_mask]
     interior_stddev = float(np.std(interior_values)) if interior_values.size else 1.0
     interior_mean = float(np.mean(interior_values)) if interior_values.size else 0.0
     ring_mean = float(np.mean(ring_values)) if ring_values.size else interior_mean
+    center_core_mean = float(np.mean(center_core_values)) if center_core_values.size else interior_mean
+    inner_shell_mean = float(np.mean(inner_shell_values)) if inner_shell_values.size else interior_mean
     contrast = abs(interior_mean - ring_mean)
+    internal_shading = abs(center_core_mean - inner_shell_mean)
     radius_ratio = radius / float(max(min(height, width), 1))
     radius_score = 1.0 - min(abs(radius_ratio - 0.22) / 0.14, 1.0)
     center_x_ratio = float(roi.cx) / float(max(width, 1))
     center_y_ratio = float(roi.cy) / float(max(height, 1))
-    center_x_score = 1.0 - min(abs(center_x_ratio - 0.68) / 0.30, 1.0)
-    center_y_score = 1.0 - min(abs(center_y_ratio - 0.50) / 0.35, 1.0)
-    edge_ring = np.abs(distance - radius) <= 2.5
-    edge_strength = float(np.mean(edge_map[edge_ring])) if np.any(edge_ring) else 0.0
-    edge_score = min(max(float(accumulator), edge_strength) / 0.30, 1.0)
-    consistency_score = 1.0 - min(interior_stddev / 0.12, 1.0)
-    contrast_score = min(contrast / 0.10, 1.0)
+    edge_strength = float(np.mean(edge_map[edge_band])) if np.any(edge_band) else 0.0
+    edge_score = min(max(float(accumulator), edge_strength, edge_support) / 0.30, 1.0)
+    texture_score = _plateau_score(interior_stddev, 0.012, 0.16, 0.08)
+    shading_score = _plateau_score(internal_shading, 0.015, 0.22, 0.10)
+    contrast_score = min(contrast / 0.12, 1.0)
     zone_score = _zone_containment_score(roi, width, height)
-    confidence = float(
-        np.mean(
-            np.asarray(
-                [
-                    radius_score,
-                    center_x_score,
-                    center_y_score,
-                    edge_score,
-                    consistency_score,
-                    contrast_score,
-                    zone_score,
-                ],
-                dtype=np.float32,
-            )
-        )
+    interior_rgb = region[..., :3][interior_mask]
+    interior_rgb_mean = np.mean(interior_rgb, axis=0) if interior_rgb.size else np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+    chroma_range = float(np.max(interior_rgb_mean) - np.min(interior_rgb_mean)) if interior_rgb_mean.size else 1.0
+    neutral_score = _plateau_score(chroma_range, 0.0, 0.06, 0.05)
+    brightness_score = _plateau_score(interior_mean, 0.10, 0.72, 0.22)
+    support_score = min(edge_support / 0.22, 1.0)
+    radius_score = _plateau_score(radius_ratio, 0.08, 0.18, 0.08)
+    shape_score = _plateau_score(float(shape_circularity if shape_circularity is not None else 0.70), 0.28, 1.0, 0.25)
+    aspect_score = _plateau_score(float(aspect_ratio if aspect_ratio is not None else 1.0), 0.0, 1.45, 0.60)
+    target_signature_score = min((contrast * max(interior_mean, 0.0)) / 0.08, 1.0)
+    weighted_terms = np.asarray(
+        [
+            radius_score * 1.10,
+            edge_score * 1.00,
+            support_score * 1.00,
+            texture_score * 0.95,
+            shading_score * 1.15,
+            contrast_score * 1.50,
+            target_signature_score * 1.30,
+            neutral_score * 1.00,
+            brightness_score * 1.00,
+            zone_score * 0.80,
+            shape_score * 0.90,
+            aspect_score * 0.60,
+        ],
+        dtype=np.float32,
     )
+    confidence = float(weighted_terms.sum() / 11.30)
     return {
         "roi": {"cx": float(roi.cx), "cy": float(roi.cy), "r": radius},
         "confidence": confidence,
@@ -1224,17 +2843,26 @@ def _evaluate_detected_sphere_roi(
         "radius_ratio": radius_ratio,
         "center_ratio": {"x": center_x_ratio, "y": center_y_ratio},
         "edge_strength": float(edge_strength),
+        "edge_support": float(edge_support),
         "hough_accumulator": float(accumulator),
         "interior_luminance_mean": interior_mean,
         "interior_luminance_stddev": interior_stddev,
         "surround_luminance_mean": ring_mean,
         "contrast_to_surround": contrast,
+        "internal_shading": float(internal_shading),
+        "neutral_rgb_mean": [float(value) for value in interior_rgb_mean.tolist()],
+        "neutral_rgb_range": float(chroma_range),
         "zone_inside_score": zone_score,
+        "target_signature_score": float(target_signature_score),
+        "shape_circularity": None if shape_circularity is None else float(shape_circularity),
+        "aspect_ratio": None if aspect_ratio is None else float(aspect_ratio),
         "validation": {
-            "radius_sane": 0.10 <= radius_ratio <= 0.30,
-            "center_sane": 0.35 <= center_x_ratio <= 0.90 and 0.15 <= center_y_ratio <= 0.85,
+            "radius_sane": 0.08 <= radius_ratio <= 0.30,
+            "placement_free": True,
             "zones_inside": zone_score >= 0.85,
             "contrast_present": contrast >= 0.015,
+            "interior_neutral": chroma_range <= 0.06,
+            "brightness_sane": 0.08 <= interior_mean <= 0.60,
         },
     }
 
@@ -1277,7 +2905,7 @@ def _detect_sphere_candidates_in_region_hwc(
     accumulators, centers_x, centers_y, detected_radii = transform.hough_circle_peaks(
         hough_space,
         radii,
-        total_num_peaks=8,
+        total_num_peaks=12,
     )
     candidates: List[Dict[str, object]] = []
     for accumulator, center_x, center_y, radius in zip(accumulators, centers_x, centers_y, detected_radii):
@@ -1295,7 +2923,567 @@ def _detect_sphere_candidates_in_region_hwc(
                 detection_source=detection_source,
             )
         )
-    return sorted(candidates, key=lambda item: float(item.get("confidence", 0.0) or 0.0), reverse=True)
+    return _dedupe_sphere_candidates(candidates)
+
+
+def _detect_neutral_blob_candidates_in_region_hwc(
+    region: np.ndarray,
+    *,
+    detection_source: str,
+) -> List[Dict[str, object]]:
+    height, width = region.shape[:2]
+    min_dimension = min(height, width)
+    if min_dimension < 64:
+        return []
+    luminance = np.clip(region[..., 0] * 0.2126 + region[..., 1] * 0.7152 + region[..., 2] * 0.0722, 1e-6, 1.0)
+    saturation = np.clip(np.max(region[..., :3], axis=2) - np.min(region[..., :3], axis=2), 0.0, 1.0)
+    luminance_threshold = min(0.40, max(0.28, float(np.quantile(luminance, 0.72))))
+    saturation_threshold = min(0.12, max(0.08, float(np.quantile(saturation, 0.60) + 0.02)))
+    mask = (luminance >= luminance_threshold) & (saturation <= saturation_threshold)
+    open_radius = max(2, int(round(float(min_dimension) * 0.004)))
+    close_radius = max(4, int(round(float(min_dimension) * 0.007)))
+    mask = morphology.binary_opening(mask, morphology.disk(open_radius))
+    mask = morphology.binary_closing(mask, morphology.disk(close_radius))
+    mask = morphology.remove_small_objects(mask, min_size=max(256, int(round(float(min_dimension * min_dimension) * 0.004))))
+    if not np.any(mask):
+        return []
+    edge_map = feature.canny(
+        np.clip(color.rgb2gray(region), 0.0, 1.0),
+        sigma=2.0,
+        low_threshold=0.03,
+        high_threshold=0.12,
+    )
+    labeled = measure.label(mask)
+    candidates: List[Dict[str, object]] = []
+    image_area = float(max(height * width, 1))
+    for component in measure.regionprops(labeled, intensity_image=luminance):
+        min_row, min_col, max_row, max_col = component.bbox
+        box_width = float(max_col - min_col)
+        box_height = float(max_row - min_row)
+        if box_width <= 0.0 or box_height <= 0.0:
+            continue
+        area_ratio = float(component.area) / image_area
+        if area_ratio >= 0.12:
+            continue
+        touches_borders = int(min_col <= 0) + int(min_row <= 0) + int(max_col >= width) + int(max_row >= height)
+        if touches_borders > 1:
+            continue
+        aspect_ratio = max(box_width / max(box_height, 1.0), box_height / max(box_width, 1.0))
+        if aspect_ratio > 1.7:
+            continue
+        circularity = 0.0
+        if component.perimeter > 1e-6:
+            circularity = float((4.0 * math.pi * float(component.area)) / float(component.perimeter ** 2))
+        if circularity < 0.18:
+            continue
+        equivalent_radius = float(component.equivalent_diameter) * 0.5
+        radius = max(equivalent_radius, min(box_width, box_height) * 0.42)
+        radius_ratio = radius / float(max(min_dimension, 1))
+        if not (0.07 <= radius_ratio <= 0.30):
+            continue
+        roi = SphereROI(cx=float(component.centroid[1]), cy=float(component.centroid[0]), r=float(radius))
+        candidate = _evaluate_detected_sphere_roi(
+            region,
+            roi=roi,
+            edge_map=edge_map,
+            accumulator=0.0,
+            detection_source=detection_source,
+            shape_circularity=circularity,
+            aspect_ratio=aspect_ratio,
+        )
+        candidate["component_area_ratio"] = float(area_ratio)
+        candidate["component_bbox"] = {
+            "x0": int(min_col),
+            "y0": int(min_row),
+            "x1": int(max_col),
+            "y1": int(max_row),
+        }
+        candidates.append(candidate)
+    return _dedupe_sphere_candidates(sorted(candidates, key=lambda item: float(item.get("confidence", 0.0) or 0.0), reverse=True))
+
+
+def _opencv_gray_u8(region: np.ndarray) -> np.ndarray:
+    clipped = np.clip(region[..., :3], 0.0, 1.0)
+    return np.clip(np.round(clipped * 255.0), 0.0, 255.0).astype(np.uint8)
+
+
+def _focus_gray_from_rgb(region: np.ndarray) -> np.ndarray:
+    rgb = np.clip(np.asarray(region, dtype=np.float32)[..., :3], 0.0, 1.0)
+    if rgb.size == 0:
+        return np.zeros((1, 1), dtype=np.float32)
+    if cv2 is not None:
+        gray_u8 = cv2.cvtColor(_opencv_gray_u8(rgb), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    else:
+        gray_u8 = np.clip(color.rgb2gray(rgb), 0.0, 1.0).astype(np.float32)
+    lo = float(np.quantile(gray_u8, 0.01))
+    hi = float(np.quantile(gray_u8, 0.99))
+    if hi > lo + 1e-6:
+        return np.clip((gray_u8 - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+    return gray_u8
+
+
+def _focus_metric_bundle(region: np.ndarray) -> Dict[str, float]:
+    gray = _focus_gray_from_rgb(region)
+    gray64 = np.asarray(gray, dtype=np.float64)
+    if cv2 is not None:
+        lap = cv2.Laplacian(gray64, cv2.CV_64F)
+        laplacian_variance = float(np.var(lap))
+        sobel_x = cv2.Sobel(gray64, cv2.CV_64F, 1, 0, ksize=3)
+        sobel_y = cv2.Sobel(gray64, cv2.CV_64F, 0, 1, ksize=3)
+    else:
+        sobel_x = np.gradient(gray64, axis=1)
+        sobel_y = np.gradient(gray64, axis=0)
+        laplacian_variance = float(np.var(np.gradient(sobel_x, axis=1) + np.gradient(sobel_y, axis=0)))
+    tenengrad = float(np.mean((sobel_x * sobel_x) + (sobel_y * sobel_y)))
+    centered = gray64 - float(np.mean(gray64))
+    spectrum = np.fft.fftshift(np.fft.fft2(centered))
+    power = np.abs(spectrum) ** 2
+    total_power = float(np.sum(power))
+    if total_power <= 1e-12:
+        fft_high_frequency_energy = 0.0
+    else:
+        height, width = gray64.shape
+        yy, xx = np.indices((height, width), dtype=np.float32)
+        cy = (float(height) - 1.0) * 0.5
+        cx = (float(width) - 1.0) * 0.5
+        radius = np.sqrt(((yy - cy) / max(float(height), 1.0)) ** 2 + ((xx - cx) / max(float(width), 1.0)) ** 2)
+        high_mask = radius >= 0.18
+        fft_high_frequency_energy = float(np.sum(power[high_mask]) / total_power)
+    return {
+        "laplacian_variance": laplacian_variance,
+        "tenengrad": tenengrad,
+        "fft_high_frequency_energy": fft_high_frequency_energy,
+    }
+
+
+def _rank_values(values: List[float]) -> List[float]:
+    indexed = sorted(enumerate(values), key=lambda item: float(item[1]))
+    ranks = [0.0] * len(values)
+    index = 0
+    while index < len(indexed):
+        end = index + 1
+        while end < len(indexed) and math.isclose(float(indexed[end][1]), float(indexed[index][1]), abs_tol=1e-9):
+            end += 1
+        average_rank = ((index + 1) + end) / 2.0
+        for item_index in range(index, end):
+            ranks[indexed[item_index][0]] = float(average_rank)
+        index = end
+    return ranks
+
+
+def _spearman_rank_correlation(left: List[float], right: List[float]) -> float:
+    if len(left) != len(right) or len(left) < 2:
+        return 1.0
+    left_rank = np.asarray(_rank_values([float(value) for value in left]), dtype=np.float64)
+    right_rank = np.asarray(_rank_values([float(value) for value in right]), dtype=np.float64)
+    left_centered = left_rank - float(np.mean(left_rank))
+    right_centered = right_rank - float(np.mean(right_rank))
+    denominator = float(np.linalg.norm(left_centered) * np.linalg.norm(right_centered))
+    if denominator <= 1e-12:
+        return 1.0
+    return float(np.clip(np.dot(left_centered, right_centered) / denominator, -1.0, 1.0))
+
+
+def _detect_focus_chart_roi_hwc(image: np.ndarray) -> Dict[str, object]:
+    if cv2 is None:
+        return {"found": False, "reason": "opencv_unavailable", "confidence": 0.0}
+    rgb_u8 = _opencv_gray_u8(image)
+    height, width = rgb_u8.shape[:2]
+    if min(height, width) < 128:
+        return {"found": False, "reason": "image_too_small", "confidence": 0.0}
+    gray = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0.0)
+    edges = cv2.Canny(blurred, 80, 180)
+    contours, _hierarchy = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    cell_candidates: List[Dict[str, float]] = []
+    image_area = float(max(height * width, 1))
+    for contour in contours[:2048]:
+        area = float(cv2.contourArea(contour))
+        if area <= 24.0 or area >= image_area * 0.02:
+            continue
+        perimeter = float(cv2.arcLength(contour, True))
+        if perimeter <= 1e-6:
+            continue
+        approx = cv2.approxPolyDP(contour, 0.04 * perimeter, True)
+        if len(approx) not in {4, 5, 6}:
+            continue
+        x, y, w_box, h_box = cv2.boundingRect(contour)
+        if min(w_box, h_box) < 6:
+            continue
+        aspect = float(w_box) / max(float(h_box), 1.0)
+        fill_ratio = area / max(float(w_box * h_box), 1.0)
+        if not (0.72 <= aspect <= 1.35 and 0.48 <= fill_ratio <= 0.98):
+            continue
+        patch = rgb_u8[y:y + h_box, x:x + w_box, :]
+        if patch.size == 0:
+            continue
+        hsv = cv2.cvtColor(patch, cv2.COLOR_RGB2HSV)
+        saturation_mean = float(np.mean(hsv[..., 1])) / 255.0
+        value_std = float(np.std(hsv[..., 2])) / 255.0
+        cell_candidates.append(
+            {
+                "x": float(x),
+                "y": float(y),
+                "w": float(w_box),
+                "h": float(h_box),
+                "cx": float(x + (w_box * 0.5)),
+                "cy": float(y + (h_box * 0.5)),
+                "area": area,
+                "aspect": aspect,
+                "fill_ratio": fill_ratio,
+                "saturation_mean": saturation_mean,
+                "value_std": value_std,
+            }
+        )
+    if len(cell_candidates) < 8:
+        return {"found": False, "reason": "insufficient_square_cells", "confidence": 0.0, "cell_count": len(cell_candidates)}
+    median_size = float(np.median([max(item["w"], item["h"]) for item in cell_candidates]))
+    distance_limit = max(median_size * 3.6, 18.0)
+    used = [False] * len(cell_candidates)
+    clusters: List[List[int]] = []
+    for start_index in range(len(cell_candidates)):
+        if used[start_index]:
+            continue
+        stack = [start_index]
+        used[start_index] = True
+        component: List[int] = []
+        while stack:
+            current = stack.pop()
+            component.append(current)
+            current_candidate = cell_candidates[current]
+            for neighbor in range(len(cell_candidates)):
+                if used[neighbor]:
+                    continue
+                candidate = cell_candidates[neighbor]
+                distance = math.hypot(float(current_candidate["cx"]) - float(candidate["cx"]), float(current_candidate["cy"]) - float(candidate["cy"]))
+                if distance <= distance_limit:
+                    used[neighbor] = True
+                    stack.append(neighbor)
+        clusters.append(component)
+    best_cluster: Optional[Dict[str, object]] = None
+    for cluster_indices in clusters:
+        if len(cluster_indices) < 8:
+            continue
+        members = [cell_candidates[index] for index in cluster_indices]
+        xs = [float(item["x"]) for item in members]
+        ys = [float(item["y"]) for item in members]
+        x2 = [float(item["x"] + item["w"]) for item in members]
+        y2 = [float(item["y"] + item["h"]) for item in members]
+        bbox_x0 = min(xs)
+        bbox_y0 = min(ys)
+        bbox_x1 = max(x2)
+        bbox_y1 = max(y2)
+        bbox_w = max(bbox_x1 - bbox_x0, 1.0)
+        bbox_h = max(bbox_y1 - bbox_y0, 1.0)
+        bbox_area = bbox_w * bbox_h
+        mean_sat = float(np.mean([float(item["saturation_mean"]) for item in members]))
+        mean_value_std = float(np.mean([float(item["value_std"]) for item in members]))
+        density = float(sum(float(item["area"]) for item in members) / max(bbox_area, 1.0))
+        cluster_score = (
+            float(len(members)) * 1.6
+            + min(density / 0.45, 1.0) * 4.0
+            + min(mean_sat / 0.18, 1.0) * 2.0
+            + min(mean_value_std / 0.10, 1.0) * 1.5
+        )
+        cluster_payload = {
+            "members": members,
+            "bbox": {
+                "x0": int(round(bbox_x0)),
+                "y0": int(round(bbox_y0)),
+                "x1": int(round(bbox_x1)),
+                "y1": int(round(bbox_y1)),
+            },
+            "cluster_score": float(cluster_score),
+            "cell_count": int(len(members)),
+            "density": float(density),
+        }
+        if best_cluster is None or float(cluster_payload["cluster_score"]) > float(best_cluster["cluster_score"]):
+            best_cluster = cluster_payload
+    if best_cluster is None:
+        return {"found": False, "reason": "no_chart_cluster", "confidence": 0.0, "cell_count": len(cell_candidates)}
+    bbox = dict(best_cluster["bbox"])
+    color_w = max(int(bbox["x1"]) - int(bbox["x0"]), 1)
+    color_h = max(int(bbox["y1"]) - int(bbox["y0"]), 1)
+    roi_x0 = max(0, int(round(int(bbox["x0"]) - (color_w * 1.45))))
+    roi_x1 = min(width, int(round(int(bbox["x1"]) + (color_w * 0.18))))
+    roi_y0 = max(0, int(round(int(bbox["y0"]) - (color_h * 0.18))))
+    roi_y1 = min(height, int(round(int(bbox["y1"]) + (color_h * 0.20))))
+    roi_w = max(roi_x1 - roi_x0, 1)
+    roi_h = max(roi_y1 - roi_y0, 1)
+    confidence = min(
+        0.99,
+        0.35
+        + min(float(best_cluster["cell_count"]) / 18.0, 1.0) * 0.35
+        + min(float(best_cluster["density"]) / 0.45, 1.0) * 0.15
+        + min(float(best_cluster["cluster_score"]) / 18.0, 1.0) * 0.15,
+    )
+    return {
+        "found": True,
+        "method": "opencv_colorchecker_cluster",
+        "confidence": float(confidence),
+        "cell_count": int(best_cluster["cell_count"]),
+        "cell_boxes": [
+            {
+                "x0": int(round(float(item["x"]))),
+                "y0": int(round(float(item["y"]))),
+                "x1": int(round(float(item["x"] + item["w"]))),
+                "y1": int(round(float(item["y"] + item["h"]))),
+            }
+            for item in list(best_cluster["members"])
+        ],
+        "colorchecker_bbox": bbox,
+        "roi": {
+            "x0": int(roi_x0),
+            "y0": int(roi_y0),
+            "x1": int(roi_x1),
+            "y1": int(roi_y1),
+            "w": int(roi_w),
+            "h": int(roi_h),
+            "normalized": {
+                "x": float(roi_x0) / float(max(width, 1)),
+                "y": float(roi_y0) / float(max(height, 1)),
+                "w": float(roi_w) / float(max(width, 1)),
+                "h": float(roi_h) / float(max(height, 1)),
+            },
+        },
+    }
+
+
+def _detect_sphere_candidates_opencv_hough_hwc(
+    region: np.ndarray,
+    *,
+    detection_source: str,
+    search_bounds: Optional[Tuple[int, int, int, int]] = None,
+) -> List[Dict[str, object]]:
+    if cv2 is None:
+        return []
+    height, width = region.shape[:2]
+    if search_bounds is None:
+        x0, y0, x1, y1 = 0, 0, width, height
+    else:
+        x0, y0, x1, y1 = search_bounds
+    subregion = region[y0:y1, x0:x1, :]
+    if subregion.size == 0:
+        return []
+    min_dimension = min(subregion.shape[:2])
+    if min_dimension < 64:
+        return []
+    gray = cv2.cvtColor(_opencv_gray_u8(subregion), cv2.COLOR_RGB2GRAY)
+    blurred = cv2.GaussianBlur(gray, (9, 9), 1.8)
+    edge_map_local = cv2.Canny(blurred, 40, 120) > 0
+    edge_map = np.pad(edge_map_local, ((y0, height - y1), (x0, width - x1)), mode="constant")
+    min_radius = max(24, int(round(float(min_dimension) * 0.10)))
+    max_radius = max(min_radius + 4, int(round(float(min_dimension) * 0.30)))
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1.15,
+        minDist=max(float(min_radius) * 1.3, 24.0),
+        param1=100.0,
+        param2=18.0,
+        minRadius=min_radius,
+        maxRadius=max_radius,
+    )
+    if circles is None:
+        return []
+    candidates: List[Dict[str, object]] = []
+    for circle in np.asarray(circles[0], dtype=np.float32)[:16]:
+        center_x, center_y, radius = [float(value) for value in circle.tolist()]
+        roi = SphereROI(cx=center_x + float(x0), cy=center_y + float(y0), r=radius)
+        accumulator = max(0.0, min(1.0, radius / float(max(max_radius, 1))))
+        candidate = _evaluate_detected_sphere_roi(
+            region,
+            roi=roi,
+            edge_map=edge_map,
+            accumulator=accumulator,
+            detection_source=detection_source,
+        )
+        candidate["opencv_hough_circle"] = {
+            "cx": float(roi.cx),
+            "cy": float(roi.cy),
+            "r": float(roi.r),
+        }
+        candidates.append(candidate)
+    return _dedupe_sphere_candidates(sorted(candidates, key=lambda item: float(item.get("confidence", 0.0) or 0.0), reverse=True))
+
+
+def _detect_sphere_candidates_opencv_contours_hwc(
+    region: np.ndarray,
+    *,
+    detection_source: str,
+) -> List[Dict[str, object]]:
+    if cv2 is None:
+        return []
+    height, width = region.shape[:2]
+    min_dimension = min(height, width)
+    if min_dimension < 64:
+        return []
+    rgb_u8 = _opencv_gray_u8(region)
+    gray = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 1.4)
+    luminance = np.clip(region[..., 0] * 0.2126 + region[..., 1] * 0.7152 + region[..., 2] * 0.0722, 0.0, 1.0)
+    saturation = np.clip(np.max(region[..., :3], axis=2) - np.min(region[..., :3], axis=2), 0.0, 1.0)
+    bright_threshold = int(round(np.quantile(gray, 0.70)))
+    bright_threshold = max(72, min(bright_threshold, 208))
+    neutral_threshold = min(0.14, max(0.06, float(np.quantile(saturation, 0.55) + 0.03)))
+    mask = ((gray >= bright_threshold) & (saturation <= neutral_threshold) & (luminance <= 0.85)).astype(np.uint8) * 255
+    kernel_open = max(3, int(round(float(min_dimension) * 0.01)))
+    if kernel_open % 2 == 0:
+        kernel_open += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_open, kernel_open))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    contours, _hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    edge_map = cv2.Canny(blurred, 40, 120) > 0
+    image_area = float(max(height * width, 1))
+    candidates: List[Dict[str, object]] = []
+    for contour in contours[:48]:
+        area = float(cv2.contourArea(contour))
+        if area <= 0.0:
+            continue
+        area_ratio = area / image_area
+        if not (0.004 <= area_ratio <= 0.12):
+            continue
+        perimeter = float(cv2.arcLength(contour, True))
+        if perimeter <= 1e-6:
+            continue
+        circularity = float((4.0 * math.pi * area) / float(perimeter * perimeter))
+        if circularity < 0.18:
+            continue
+        (center_x, center_y), radius = cv2.minEnclosingCircle(contour)
+        radius_ratio = float(radius) / float(max(min_dimension, 1))
+        if not (0.07 <= radius_ratio <= 0.30):
+            continue
+        x, y, w_box, h_box = cv2.boundingRect(contour)
+        aspect_ratio = float(max(float(w_box), float(h_box)) / max(min(float(w_box), float(h_box)), 1.0))
+        if aspect_ratio > 1.75:
+            continue
+        roi = SphereROI(cx=float(center_x), cy=float(center_y), r=float(radius))
+        candidate = _evaluate_detected_sphere_roi(
+            region,
+            roi=roi,
+            edge_map=edge_map,
+            accumulator=min(area_ratio / 0.08, 1.0),
+            detection_source=detection_source,
+            shape_circularity=circularity,
+            aspect_ratio=aspect_ratio,
+        )
+        candidate["opencv_contour"] = {
+            "area_ratio": float(area_ratio),
+            "circularity": float(circularity),
+            "bbox": {"x": int(x), "y": int(y), "w": int(w_box), "h": int(h_box)},
+        }
+        candidates.append(candidate)
+    return _dedupe_sphere_candidates(sorted(candidates, key=lambda item: float(item.get("confidence", 0.0) or 0.0), reverse=True))
+
+
+def _sphere_candidate_profile_plausibility(region: np.ndarray, candidate: Dict[str, object]) -> Dict[str, object]:
+    roi = _coerce_sphere_roi(candidate.get("roi"))
+    if roi is None:
+        return {
+            "score": 0.0,
+            "label": "IMPLAUSIBLE",
+            "review_required": True,
+            "valid": False,
+            "reason": "missing_roi",
+        }
+    try:
+        crop_bounds = _tight_sphere_crop_bounds(region, roi)
+        cropped_region = region[crop_bounds["y0"]:crop_bounds["y1"], crop_bounds["x0"]:crop_bounds["x1"], :]
+        if cropped_region.size == 0:
+            raise ValueError("empty_crop")
+        cropped_roi = SphereROI(
+            cx=float(roi.cx) - float(crop_bounds["x0"]),
+            cy=float(roi.cy) - float(crop_bounds["y0"]),
+            r=float(roi.r),
+        )
+        stats = measure_sphere_zone_profile_statistics(np.transpose(cropped_region, (2, 0, 1)), cropped_roi, sampling_variant="refined")
+    except Exception as exc:
+        return {
+            "score": 0.0,
+            "label": "IMPLAUSIBLE",
+            "review_required": True,
+            "valid": False,
+            "reason": f"profile_probe_failed:{exc}",
+        }
+    sample_1 = float(stats.get("sample_1_ire", stats.get("bright_ire", 0.0)) or 0.0)
+    sample_2 = float(stats.get("sample_2_ire", stats.get("center_ire", 0.0)) or 0.0)
+    sample_3 = float(stats.get("sample_3_ire", stats.get("dark_ire", 0.0)) or 0.0)
+    center_ire = float(stats.get("center_ire", sample_2) or sample_2)
+    zone_spread_ire = float(stats.get("zone_spread_ire", 0.0) or 0.0)
+    valid_pixel_count = int(stats.get("valid_pixel_count", 0) or 0)
+    measured_rgb = np.asarray(stats.get("measured_rgb_chromaticity") or [1.0 / 3.0] * 3, dtype=np.float32)
+    chroma_range = float(np.max(measured_rgb) - np.min(measured_rgb)) if measured_rgb.size else 1.0
+    center_score = _plateau_score(center_ire, 12.0, 75.0, 12.0)
+    spread_score = _plateau_score(zone_spread_ire, 1.5, 42.0, 10.0)
+    neutral_score = _plateau_score(chroma_range, 0.0, 0.08, 0.06)
+    count_score = min(float(valid_pixel_count) / 3200.0, 1.0)
+    measurement_confidence = float(stats.get("confidence", 0.0) or 0.0)
+    center_between = min(sample_1, sample_3) - 1.0 <= sample_2 <= max(sample_1, sample_3) + 1.0
+    monotonic_score = 1.0 if center_between else 0.25
+    plausible_samples = center_ire >= 10.0 and valid_pixel_count >= 1000
+    score = float(
+        np.mean(
+            np.asarray(
+                [
+                    center_score * 1.20,
+                    spread_score * 1.05,
+                    neutral_score * 1.05,
+                    count_score * 0.85,
+                    measurement_confidence * 1.25,
+                    monotonic_score * 0.60,
+                ],
+                dtype=np.float32,
+            )
+        )
+    )
+    if not plausible_samples:
+        score *= 0.58
+    label = (
+        "HIGH"
+        if score >= SPHERE_DETECTION_PROFILE_HIGH
+        else "MEDIUM"
+        if score >= SPHERE_DETECTION_PROFILE_REVIEW
+        else "LOW"
+        if score >= SPHERE_DETECTION_PLAUSIBILITY_MIN
+        else "IMPLAUSIBLE"
+    )
+    return {
+        "score": score,
+        "label": label,
+        "review_required": score < SPHERE_DETECTION_PROFILE_REVIEW,
+        "valid": score >= SPHERE_DETECTION_PLAUSIBILITY_MIN and plausible_samples,
+        "sample_1_ire": sample_1,
+        "sample_2_ire": sample_2,
+        "sample_3_ire": sample_3,
+        "center_ire": center_ire,
+        "zone_spread_ire": zone_spread_ire,
+        "valid_pixel_count": valid_pixel_count,
+        "chroma_range": chroma_range,
+        "measurement_confidence": measurement_confidence,
+        "plausible_samples": bool(plausible_samples),
+    }
+
+
+def _rescore_sphere_candidates_with_profile(region: np.ndarray, candidates: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    rescored: List[Dict[str, object]] = []
+    for candidate in list(candidates or [])[:16]:
+        item = copy.deepcopy(dict(candidate))
+        profile_probe = _sphere_candidate_profile_plausibility(region, item)
+        base_confidence = float(item.get("confidence", 0.0) or 0.0)
+        plausibility_score = float(profile_probe.get("score", 0.0) or 0.0)
+        combined_confidence = float(max(0.0, min(1.0, (base_confidence * 0.62) + (plausibility_score * 0.38))))
+        if not bool(profile_probe.get("valid")):
+            combined_confidence *= 0.55
+        item["geometry_confidence"] = base_confidence
+        item["sample_plausibility"] = str(profile_probe.get("label") or "IMPLAUSIBLE")
+        item["sample_plausibility_score"] = plausibility_score
+        item["sample_review_required"] = bool(profile_probe.get("review_required"))
+        item["profile_probe"] = profile_probe
+        item["confidence"] = combined_confidence
+        item["confidence_label"] = _sphere_detection_label(combined_confidence)
+        rescored.append(item)
+    return sorted(rescored, key=lambda item: float(item.get("confidence", 0.0) or 0.0), reverse=True)
 
 
 def _localized_search_bounds_for_candidate(candidate: Dict[str, object], width: int, height: int) -> Optional[Tuple[int, int, int, int]]:
@@ -1318,60 +3506,264 @@ def _localized_search_bounds_for_candidate(candidate: Dict[str, object], width: 
     return (x0, y0, x1, y1)
 
 
+def _circle_candidate_bbox(roi: SphereROI) -> Tuple[float, float, float, float]:
+    return (
+        float(roi.cx) - float(roi.r),
+        float(roi.cy) - float(roi.r),
+        float(roi.cx) + float(roi.r),
+        float(roi.cy) + float(roi.r),
+    )
+
+
+def _bbox_intersection_area(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
+    x0 = max(float(a[0]), float(b[0]))
+    y0 = max(float(a[1]), float(b[1]))
+    x1 = min(float(a[2]), float(b[2]))
+    y1 = min(float(a[3]), float(b[3]))
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return float((x1 - x0) * (y1 - y0))
+
+
+def _rescore_sphere_candidates_with_gray_card_context(region: np.ndarray, candidates: List[Dict[str, object]]) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+    gray_card = _detect_gray_card_in_region_hwc(region)
+    card_roi = dict(gray_card.get("roi") or {})
+    card_confidence = float(gray_card.get("confidence", 0.0) or 0.0)
+    card_area_fraction = float(gray_card.get("roi_area_fraction", 0.0) or 0.0)
+    card_aspect_ratio = float(gray_card.get("aspect_ratio", 0.0) or 0.0)
+    if (
+        not card_roi
+        or card_confidence < 0.62
+        or card_area_fraction <= 0.02
+        or card_aspect_ratio < 0.78
+    ):
+        return candidates, {"available": False}
+    card_x = float(card_roi.get("x", 0.0) or 0.0)
+    card_y = float(card_roi.get("y", 0.0) or 0.0)
+    card_w = float(card_roi.get("width", 0.0) or 0.0)
+    card_h = float(card_roi.get("height", 0.0) or 0.0)
+    card_scale = max(card_w, card_h, 1.0)
+    card_center_x = card_x + (card_w * 0.5)
+    card_center_y = card_y + (card_h * 0.5)
+    card_bbox = (card_x, card_y, card_x + card_w, card_y + card_h)
+    rescored: List[Dict[str, object]] = []
+    diagnostics: List[Dict[str, object]] = []
+    for candidate in list(candidates or []):
+        item = copy.deepcopy(dict(candidate))
+        roi = _coerce_sphere_roi(item.get("roi"))
+        if roi is None:
+            rescored.append(item)
+            continue
+        candidate_bbox = _circle_candidate_bbox(roi)
+        candidate_area = max(float((candidate_bbox[2] - candidate_bbox[0]) * (candidate_bbox[3] - candidate_bbox[1])), 1.0)
+        overlap_area = _bbox_intersection_area(candidate_bbox, card_bbox)
+        overlap_fraction = float(overlap_area / candidate_area)
+        center_inside_card = card_x <= float(roi.cx) <= (card_x + card_w) and card_y <= float(roi.cy) <= (card_y + card_h)
+        dx_norm = abs(float(roi.cx) - card_center_x) / card_scale
+        dy_norm = abs(float(roi.cy) - card_center_y) / card_scale
+        axis_pair_score = max(
+            _plateau_score(dx_norm, 0.55, 1.75, 0.65) * _plateau_score(dy_norm, 0.0, 0.42, 0.28),
+            _plateau_score(dy_norm, 0.55, 1.75, 0.65) * _plateau_score(dx_norm, 0.0, 0.42, 0.28),
+        )
+        radius_relation_score = _plateau_score(float(roi.r) / card_scale, 0.32, 0.85, 0.20)
+        separation_score = max(0.0, 1.0 - min(overlap_fraction / 0.12, 1.0))
+        context_score = float(np.mean(np.asarray([axis_pair_score * 1.15, radius_relation_score, separation_score], dtype=np.float32)))
+        base_confidence = float(item.get("confidence", 0.0) or 0.0)
+        if center_inside_card or overlap_fraction >= 0.10:
+            adjusted_confidence = base_confidence * 0.18
+        else:
+            adjusted_confidence = float(max(0.0, min(1.0, (base_confidence * 0.78) + (context_score * 0.22))))
+        item["confidence"] = adjusted_confidence
+        item["confidence_label"] = _sphere_detection_label(adjusted_confidence)
+        item["gray_card_context"] = {
+            "card_confidence": card_confidence,
+            "overlap_fraction": overlap_fraction,
+            "center_inside_card": bool(center_inside_card),
+            "axis_pair_score": float(axis_pair_score),
+            "radius_relation_score": float(radius_relation_score),
+            "context_score": float(context_score),
+        }
+        rescored.append(item)
+        diagnostics.append(
+            {
+                "source": str(item.get("source") or ""),
+                "confidence": adjusted_confidence,
+                "roi": dict(item.get("roi") or {}),
+                "overlap_fraction": overlap_fraction,
+                "center_inside_card": bool(center_inside_card),
+                "context_score": float(context_score),
+            }
+        )
+    return sorted(rescored, key=lambda item: float(item.get("confidence", 0.0) or 0.0), reverse=True), {
+        "available": True,
+        "confidence": float(card_confidence),
+        "roi": card_roi,
+        "rescored_candidates": diagnostics[:8],
+    }
+
+
+def _card_adjacent_search_bounds(card_roi: Dict[str, object], width: int, height: int) -> List[Tuple[int, int, int, int]]:
+    card_x = float(card_roi.get("x", 0.0) or 0.0)
+    card_y = float(card_roi.get("y", 0.0) or 0.0)
+    card_w = float(card_roi.get("width", 0.0) or 0.0)
+    card_h = float(card_roi.get("height", 0.0) or 0.0)
+    y0 = max(0, int(math.floor(card_y - (card_h * 1.25))))
+    y1 = min(height, int(math.ceil(card_y + (card_h * 2.0))))
+    bounds: List[Tuple[int, int, int, int]] = []
+    right_x0 = max(0, int(math.floor(card_x + (card_w * 0.45))))
+    right_x1 = min(width, int(math.ceil(card_x + (card_w * 3.10))))
+    left_x0 = max(0, int(math.floor(card_x - (card_w * 2.60))))
+    left_x1 = min(width, int(math.ceil(card_x + (card_w * 0.55))))
+    for x0, x1 in ((right_x0, right_x1), (left_x0, left_x1)):
+        if x1 > x0 and y1 > y0:
+            bounds.append((x0, y0, x1, y1))
+    return bounds
+
+
 def _detect_sphere_roi_in_region_hwc(region: np.ndarray) -> Dict[str, object]:
     height, width = region.shape[:2]
     min_dimension = min(height, width)
     if min_dimension < 64:
         return {"source": "failed", "confidence": 0.0, "confidence_label": "FAILED", "validation": {"reason": "region_too_small"}}
-    primary_candidates = _detect_sphere_candidates_in_region_hwc(
-        region,
-        detection_source="primary_detected",
+    detection_region, detection_scale = _resize_region_for_sphere_detection(region)
+    detection_height, detection_width = detection_region.shape[:2]
+    primary_candidates = _rescale_sphere_candidates(
+        _detect_sphere_candidates_in_region_hwc(
+            detection_region,
+            detection_source="primary_detected",
+        ),
+        detection_scale,
     )
-    if primary_candidates and str(primary_candidates[0].get("confidence_label") or "") in {"HIGH", "MEDIUM"}:
-        return dict(primary_candidates[0])
-    search_bounds = (
-        int(round(width * 0.40)),
-        int(round(height * 0.18)),
-        int(round(width * 0.92)),
-        int(round(height * 0.82)),
+    candidate_summary = {
+        "primary_candidates": primary_candidates[:6],
+        "secondary_candidates": [],
+        "blob_candidates": [],
+        "opencv_hough_candidates": [],
+        "opencv_contour_candidates": [],
+        "localized_candidates": [],
+        "detection_resize_scale": float(detection_scale),
+        "detection_input_size": {"width": int(detection_width), "height": int(detection_height)},
+        "original_region_size": {"width": int(width), "height": int(height)},
+    }
+    search_bounds = (0, 0, detection_width, detection_height)
+    secondary_candidates = _rescale_sphere_candidates(
+        _detect_sphere_candidates_in_region_hwc(
+            detection_region,
+            search_bounds=search_bounds,
+            detection_source="secondary_detected",
+            sigma=1.6,
+            low_threshold=0.02,
+            high_threshold=0.10,
+        ),
+        detection_scale,
     )
-    secondary_candidates = _detect_sphere_candidates_in_region_hwc(
-        region,
-        search_bounds=search_bounds,
-        detection_source="secondary_detected",
-        sigma=1.6,
-        low_threshold=0.02,
-        high_threshold=0.10,
+    candidate_summary["secondary_candidates"] = secondary_candidates[:6]
+    opencv_hough_candidates = _rescale_sphere_candidates(
+        _detect_sphere_candidates_opencv_hough_hwc(
+            detection_region,
+            search_bounds=search_bounds,
+            detection_source="opencv_hough_recovery",
+        ),
+        detection_scale,
     )
-    candidate_pool = [*(primary_candidates[:3]), *(secondary_candidates[:3])]
-    if candidate_pool:
-        best = max(candidate_pool, key=lambda item: float(item.get("confidence", 0.0) or 0.0))
-        if float(best.get("confidence", 0.0) or 0.0) >= SPHERE_DETECTION_LOW_CONFIDENCE:
-            return dict(best)
+    candidate_summary["opencv_hough_candidates"] = opencv_hough_candidates[:6]
+    opencv_contour_candidates = _rescale_sphere_candidates(
+        _detect_sphere_candidates_opencv_contours_hwc(
+            detection_region,
+            detection_source="opencv_contour_recovery",
+        ),
+        detection_scale,
+    )
+    candidate_summary["opencv_contour_candidates"] = opencv_contour_candidates[:6]
+    gray_card_context = _detect_gray_card_in_region_hwc(region)
+    card_adjacent_candidates: List[Dict[str, object]] = []
+    card_roi = dict(gray_card_context.get("roi") or {})
+    if (
+        card_roi
+        and float(gray_card_context.get("confidence", 0.0) or 0.0) >= 0.62
+        and float(gray_card_context.get("roi_area_fraction", 0.0) or 0.0) > 0.02
+        and float(gray_card_context.get("aspect_ratio", 0.0) or 0.0) >= 0.78
+    ):
+        for local_bounds in _card_adjacent_search_bounds(card_roi, width, height):
+            scaled_bounds = (
+                max(0, int(math.floor(float(local_bounds[0]) * detection_scale))),
+                max(0, int(math.floor(float(local_bounds[1]) * detection_scale))),
+                min(detection_width, int(math.ceil(float(local_bounds[2]) * detection_scale))),
+                min(detection_height, int(math.ceil(float(local_bounds[3]) * detection_scale))),
+            )
+            card_adjacent_candidates.extend(
+                _rescale_sphere_candidates(
+                    _detect_sphere_candidates_opencv_hough_hwc(
+                        detection_region,
+                        search_bounds=scaled_bounds,
+                        detection_source="card_adjacent_recovery",
+                    ),
+                    detection_scale,
+                )[:8]
+            )
+    candidate_summary["gray_card_context"] = {
+        "available": bool(card_roi),
+        "confidence": float(gray_card_context.get("confidence", 0.0) or 0.0),
+        "roi": card_roi,
+    }
+    candidate_summary["card_adjacent_candidates"] = card_adjacent_candidates[:8]
+    blob_candidates = _rescale_sphere_candidates(
+        _detect_neutral_blob_candidates_in_region_hwc(
+            detection_region,
+            detection_source="neutral_blob_recovery",
+        ),
+        detection_scale,
+    )
+    candidate_summary["blob_candidates"] = blob_candidates[:6]
+    candidate_pool = _dedupe_sphere_candidates(
+        [
+            *(primary_candidates[:8]),
+            *(secondary_candidates[:8]),
+            *(opencv_hough_candidates[:8]),
+            *(opencv_contour_candidates[:8]),
+            *(card_adjacent_candidates[:8]),
+            *(blob_candidates[:8]),
+        ]
+    )
     localized_candidates: List[Dict[str, object]] = []
     if candidate_pool:
         seed = max(candidate_pool, key=lambda item: float(item.get("confidence", 0.0) or 0.0))
         localized_bounds = _localized_search_bounds_for_candidate(seed, width, height)
         if localized_bounds is not None:
-            localized_candidates = _detect_sphere_candidates_in_region_hwc(
-                region,
-                search_bounds=localized_bounds,
-                detection_source="localized_recovery",
-                sigma=1.2,
-                low_threshold=0.015,
-                high_threshold=0.08,
+            scaled_bounds = (
+                max(0, int(math.floor(float(localized_bounds[0]) * detection_scale))),
+                max(0, int(math.floor(float(localized_bounds[1]) * detection_scale))),
+                min(detection_width, int(math.ceil(float(localized_bounds[2]) * detection_scale))),
+                min(detection_height, int(math.ceil(float(localized_bounds[3]) * detection_scale))),
             )
-            if localized_candidates:
-                localized_best = max(localized_candidates, key=lambda item: float(item.get("confidence", 0.0) or 0.0))
-                if float(localized_best.get("confidence", 0.0) or 0.0) >= SPHERE_DETECTION_LOW_CONFIDENCE:
-                    return dict(localized_best)
-    forced_pool = [*candidate_pool, *(localized_candidates[:3])]
+            localized_candidates = _rescale_sphere_candidates(
+                _detect_sphere_candidates_in_region_hwc(
+                    detection_region,
+                    search_bounds=scaled_bounds,
+                    detection_source="localized_recovery",
+                    sigma=1.2,
+                    low_threshold=0.015,
+                    high_threshold=0.08,
+                ),
+                detection_scale,
+            )
+            candidate_summary["localized_candidates"] = localized_candidates[:6]
+    forced_pool = _dedupe_sphere_candidates([*candidate_pool, *(localized_candidates[:8])])
     if forced_pool:
-        forced_best = max(forced_pool, key=lambda item: float(item.get("confidence", 0.0) or 0.0))
+        rescored_pool = _rescore_sphere_candidates_with_profile(region, forced_pool)
+        rescored_pool, gray_card_context = _rescore_sphere_candidates_with_gray_card_context(region, rescored_pool)
+        candidate_summary["rescored_candidates"] = rescored_pool[:8]
+        candidate_summary["gray_card_context"] = gray_card_context
+        forced_best = rescored_pool[0]
+        if float(forced_best.get("confidence", 0.0) or 0.0) >= SPHERE_DETECTION_LOW_CONFIDENCE and bool((forced_best.get("profile_probe") or {}).get("valid")):
+            selected = dict(forced_best)
+            selected["candidate_diagnostics"] = candidate_summary
+            return selected
         forced_result = dict(forced_best)
         forced_result["source"] = "forced_best_effort"
         forced_result["confidence"] = max(float(forced_result.get("confidence", 0.0) or 0.0), 0.01)
         forced_result["confidence_label"] = "LOW"
+        forced_result["candidate_diagnostics"] = candidate_summary
         validation = dict(forced_result.get("validation") or {})
         validation["forced_best_effort"] = True
         forced_result["validation"] = validation
@@ -1380,6 +3772,7 @@ def _detect_sphere_roi_in_region_hwc(region: np.ndarray) -> Dict[str, object]:
         "source": "failed",
         "confidence": 0.0,
         "confidence_label": "FAILED",
+        "candidate_diagnostics": candidate_summary,
         "validation": {
             "reason": "no_plausible_circle_candidate",
             "primary_candidate_count": len(primary_candidates),
@@ -1401,18 +3794,356 @@ def _coerce_sphere_roi(roi_payload: Optional[Dict[str, float]]) -> Optional[Sphe
     )
 
 
+def _detect_gray_card_in_region_hwc(region: np.ndarray) -> Dict[str, object]:
+    chw_region = np.transpose(region, (2, 0, 1))
+    detected = dict(detect_gray_card_roi(chw_region))
+    roi = detected.get("roi")
+    if not isinstance(roi, GrayCardROI):
+        return {
+            "roi": None,
+            "confidence": 0.0,
+            "confidence_label": "FAILED",
+            "source": "gray_card_failed",
+            "review_recommended": True,
+        }
+    pixels, info = extract_rect_pixels(chw_region, roi)
+    stats = _measure_pixel_cloud_statistics(
+        pixels,
+        sampling_confidence=float(detected.get("confidence", 0.0) or 0.0),
+        sampling_method="gray_card_detected_roi",
+        mask_fraction=float(info.get("area_fraction", 0.0) or 0.0),
+        interior_fraction=float(info.get("area_fraction", 0.0) or 0.0),
+        interior_radius_ratio=1.0,
+    )
+    measured_rgb = np.asarray(stats.get("measured_rgb_chromaticity") or [1.0 / 3.0] * 3, dtype=np.float32)
+    chroma_range = float(np.max(measured_rgb) - np.min(measured_rgb)) if measured_rgb.size else 1.0
+    brightness = float((2.0 ** float(stats.get("measured_log2_luminance", 0.0) or 0.0)))
+    neutrality_score = _plateau_score(chroma_range, 0.0, 0.06, 0.05)
+    brightness_score = _plateau_score(brightness, 0.10, 0.55, 0.18)
+    detection_confidence = float(detected.get("confidence", 0.0) or 0.0)
+    measurement_confidence = float(stats.get("confidence", 0.0) or 0.0)
+    combined_confidence = float(
+        max(
+            0.0,
+            min(
+                1.0,
+                (detection_confidence * 0.45) + (measurement_confidence * 0.35) + (neutrality_score * 0.10) + (brightness_score * 0.10),
+            ),
+        )
+    )
+    roi_dict = {
+        "x": float(roi.x),
+        "y": float(roi.y),
+        "width": float(roi.width),
+        "height": float(roi.height),
+    }
+    region_height = max(int(region.shape[0]), 1)
+    region_width = max(int(region.shape[1]), 1)
+    roi_area_fraction = float((float(roi.width) * float(roi.height)) / float(region_width * region_height))
+    aspect_ratio = float(min(float(roi.width), float(roi.height)) / max(float(roi.width), float(roi.height), 1.0))
+    border_margin_fraction = float(
+        min(
+            float(roi.x),
+            float(roi.y),
+            max(float(region_width) - (float(roi.x) + float(roi.width)), 0.0),
+            max(float(region_height) - (float(roi.y) + float(roi.height)), 0.0),
+        )
+        / float(max(min(region_width, region_height), 1))
+    )
+    area_score = _plateau_score(roi_area_fraction, 0.025, 0.22, 0.08)
+    aspect_score = _plateau_score(aspect_ratio, 0.78, 1.0, 0.18)
+    margin_score = _plateau_score(border_margin_fraction, 0.01, 0.25, 0.05)
+    final_confidence = float(
+        0.0
+        if (
+            detection_confidence < 0.25
+            or roi_area_fraction >= 0.35
+            or roi_area_fraction <= 0.012
+            or border_margin_fraction <= 0.005
+            or aspect_ratio < 0.72
+        )
+        else max(
+            0.0,
+            min(
+                1.0,
+                (combined_confidence * 0.70) + (area_score * 0.15) + (aspect_score * 0.10) + (margin_score * 0.05),
+            ),
+        )
+    )
+    confidence_label = (
+        "HIGH"
+        if final_confidence >= 0.75
+        else "MEDIUM"
+        if final_confidence >= 0.5
+        else "LOW"
+        if final_confidence >= 0.3
+        else "FAILED"
+    )
+    return {
+        "roi": roi_dict,
+        "stats": stats,
+        "confidence": final_confidence,
+        "confidence_label": confidence_label,
+        "source": "gray_card_detected",
+        "review_recommended": final_confidence < 0.5,
+        "neutrality_score": float(neutrality_score),
+        "brightness_score": float(brightness_score),
+        "detection_confidence": detection_confidence,
+        "measurement_confidence": measurement_confidence,
+        "roi_area_fraction": roi_area_fraction,
+        "aspect_ratio": aspect_ratio,
+        "border_margin_fraction": border_margin_fraction,
+        "measured_rgb_chromaticity": [float(value) for value in measured_rgb.tolist()],
+    }
+
+
+def _should_attempt_gray_card_fallback(
+    *,
+    sphere_roi: Optional[SphereROI],
+    detection_source: str,
+    detection_confidence: float,
+    detection_label: str,
+) -> bool:
+    return False
+
+
+def _gray_target_note(
+    *,
+    target_class: str,
+    detection_source: str,
+    detection_label: str,
+    detection_failed: bool = False,
+    fallback_used: bool = False,
+) -> str:
+    normalized_class = str(target_class or "").strip().lower()
+    if detection_failed or normalized_class == "unresolved" or str(detection_source or "") == "failed" or str(detection_label or "") == "FAILED":
+        return "Gray target needs review"
+    if normalized_class == "gray_card":
+        return "Gray card fallback used" if fallback_used else "Gray card verified"
+    if str(detection_source or "") == "forced_best_effort":
+        return "Alternate detection path used — confirm sphere placement"
+    if str(detection_source or "") in {"secondary_detected", "localized_recovery", "neutral_blob_recovery", "opencv_hough_recovery", "opencv_contour_recovery", "reused_from_original"} or str(detection_label or "") == "LOW":
+        return "Alternate detection path used"
+    return "Sphere check verified"
+
+
+def _manual_assist_preview_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _manual_assist_sanitized_entry(entry: Optional[Dict[str, object]]) -> Dict[str, object]:
+    payload = dict(entry or {})
+    if not payload:
+        return {}
+    sanitized: Dict[str, object] = {
+        "clip_id": str(payload.get("clip_id") or "").strip(),
+        "source_path": str(payload.get("source_path") or "").strip(),
+        "source_image": str(payload.get("source_image") or payload.get("preview_image") or "").strip(),
+        "source_image_hash": str(payload.get("source_image_hash") or payload.get("preview_image_hash") or "").strip(),
+        "measurement_source_image": str(payload.get("measurement_source_image") or "").strip(),
+        "measurement_source_hash": str(payload.get("measurement_source_hash") or "").strip(),
+        "center_preview_px": payload.get("center_preview_px"),
+        "radius_preview_px": payload.get("radius_preview_px"),
+        "center_normalized": payload.get("center_normalized"),
+        "radius_normalized": payload.get("radius_normalized"),
+        "estimated_radius_preview_px": payload.get("estimated_radius_preview_px"),
+        "estimated_radius_normalized": payload.get("estimated_radius_normalized"),
+        "preview_width": payload.get("preview_width"),
+        "preview_height": payload.get("preview_height"),
+        "render_width": payload.get("render_width"),
+        "render_height": payload.get("render_height"),
+        "operator_note": str(payload.get("operator_note") or "").strip(),
+    }
+    filtered: Dict[str, object] = {}
+    for key, value in sanitized.items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value:
+            continue
+        if isinstance(value, (list, tuple, dict)) and len(value) == 0:
+            continue
+        filtered[key] = value
+    return filtered
+
+
+def _manual_assist_roi_for_image(
+    entry: Optional[Dict[str, object]],
+    *,
+    image_width: int,
+    image_height: int,
+) -> Optional[Dict[str, float]]:
+    payload = dict(entry or {})
+    if not payload or image_width <= 0 or image_height <= 0:
+        return None
+
+    def _pair(value: object) -> Optional[Tuple[float, float]]:
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            try:
+                return float(value[0]), float(value[1])
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    preview_width = int(payload.get("preview_width", 0) or 0)
+    preview_height = int(payload.get("preview_height", 0) or 0)
+    center_normalized = _pair(payload.get("center_normalized"))
+    center_preview_px = _pair(payload.get("center_preview_px"))
+    if center_normalized is None and center_preview_px is not None and preview_width > 0 and preview_height > 0:
+        center_normalized = (
+            float(center_preview_px[0]) / float(max(preview_width, 1)),
+            float(center_preview_px[1]) / float(max(preview_height, 1)),
+        )
+    if center_normalized is None:
+        return None
+
+    radius_normalized: Optional[float]
+    try:
+        radius_normalized = float(payload.get("radius_normalized")) if payload.get("radius_normalized") is not None else None
+    except (TypeError, ValueError):
+        radius_normalized = None
+    if radius_normalized is None:
+        try:
+            radius_preview_px = float(payload.get("radius_preview_px")) if payload.get("radius_preview_px") is not None else None
+        except (TypeError, ValueError):
+            radius_preview_px = None
+        if radius_preview_px is not None and preview_width > 0 and preview_height > 0:
+            radius_normalized = radius_preview_px / float(max(min(preview_width, preview_height), 1))
+    if radius_normalized is None:
+        try:
+            radius_normalized = float(payload.get("estimated_radius_normalized")) if payload.get("estimated_radius_normalized") is not None else None
+        except (TypeError, ValueError):
+            radius_normalized = None
+    if radius_normalized is None:
+        try:
+            estimated_radius_preview_px = (
+                float(payload.get("estimated_radius_preview_px"))
+                if payload.get("estimated_radius_preview_px") is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            estimated_radius_preview_px = None
+        if estimated_radius_preview_px is not None and preview_width > 0 and preview_height > 0:
+            radius_normalized = estimated_radius_preview_px / float(max(min(preview_width, preview_height), 1))
+    if radius_normalized is None:
+        return None
+
+    cx = float(center_normalized[0]) * float(image_width)
+    cy = float(center_normalized[1]) * float(image_height)
+    radius = float(radius_normalized) * float(min(image_width, image_height))
+    if not (0.0 <= cx <= float(image_width) and 0.0 <= cy <= float(image_height) and radius > 1.0):
+        return None
+    return {
+        "cx": float(cx),
+        "cy": float(cy),
+        "r": float(radius),
+    }
+
+
+def _refine_manual_assist_sphere_roi(
+    image: np.ndarray,
+    manual_roi_payload: Optional[Dict[str, float]],
+) -> Dict[str, object]:
+    manual_roi = _coerce_sphere_roi(manual_roi_payload)
+    if manual_roi is None:
+        return {"refined": False}
+    height, width = image.shape[:2]
+    pad = max(float(manual_roi.r) * 2.3, 180.0)
+    x0 = max(0, int(math.floor(float(manual_roi.cx) - pad)))
+    y0 = max(0, int(math.floor(float(manual_roi.cy) - pad)))
+    x1 = min(width, int(math.ceil(float(manual_roi.cx) + pad)))
+    y1 = min(height, int(math.ceil(float(manual_roi.cy) + pad)))
+    if x1 <= x0 or y1 <= y0:
+        return {"refined": False, "reason": "empty_refinement_crop"}
+    crop = image[y0:y1, x0:x1]
+    detected = dict(_detect_sphere_roi_in_region_hwc(crop))
+    candidate_pool: List[Dict[str, object]] = []
+    for item in list(((detected.get("candidate_diagnostics") or {}).get("rescored_candidates") or [])):
+        candidate = copy.deepcopy(dict(item))
+        roi = _coerce_sphere_roi(candidate.get("roi"))
+        if roi is None:
+            continue
+        global_roi = {
+            "cx": float(roi.cx) + float(x0),
+            "cy": float(roi.cy) + float(y0),
+            "r": float(roi.r),
+        }
+        center_distance = math.hypot(float(global_roi["cx"]) - float(manual_roi.cx), float(global_roi["cy"]) - float(manual_roi.cy))
+        radius_ratio = float(global_roi["r"]) / max(float(manual_roi.r), 1e-6)
+        plausibility = float(candidate.get("sample_plausibility_score", 0.0) or 0.0)
+        confidence = float(candidate.get("confidence", 0.0) or 0.0)
+        if center_distance > max(float(manual_roi.r) * 1.10, 90.0):
+            continue
+        if not (0.45 <= radius_ratio <= 1.70):
+            continue
+        candidate["roi"] = global_roi
+        candidate["_manual_center_distance"] = float(center_distance)
+        candidate["_manual_radius_ratio"] = float(radius_ratio)
+        candidate["_manual_rank"] = float((center_distance / max(float(manual_roi.r), 1.0)) - (confidence * 0.35) - (plausibility * 0.30))
+        candidate_pool.append(candidate)
+    if candidate_pool:
+        detected = min(candidate_pool, key=lambda item: float(item.get("_manual_rank", 0.0) or 0.0))
+    detected_roi = _coerce_sphere_roi(detected.get("roi"))
+    if detected_roi is None:
+        return {
+            "refined": False,
+            "reason": "no_local_circle",
+            "local_bounds": {"x": x0, "y": y0, "width": x1 - x0, "height": y1 - y0},
+            "candidate": detected,
+        }
+    global_roi = {
+        "cx": float(detected_roi.cx) + float(x0),
+        "cy": float(detected_roi.cy) + float(y0),
+        "r": float(detected_roi.r),
+    }
+    center_distance = math.hypot(float(global_roi["cx"]) - float(manual_roi.cx), float(global_roi["cy"]) - float(manual_roi.cy))
+    radius_ratio = float(global_roi["r"]) / max(float(manual_roi.r), 1e-6)
+    candidate = copy.deepcopy(detected)
+    candidate["roi"] = global_roi
+    candidate["local_refinement"] = {
+        "base_roi": {"cx": float(manual_roi.cx), "cy": float(manual_roi.cy), "r": float(manual_roi.r)},
+        "local_bounds": {"x": x0, "y": y0, "width": x1 - x0, "height": y1 - y0},
+        "center_distance": float(center_distance),
+        "radius_ratio": float(radius_ratio),
+    }
+    accept = (
+        float(detected.get("confidence", 0.0) or 0.0) >= SPHERE_DETECTION_LOW_CONFIDENCE
+        and center_distance <= max(float(manual_roi.r) * 0.85, 55.0)
+        and 0.55 <= radius_ratio <= 1.45
+    )
+    return {
+        "refined": bool(accept),
+        "roi": global_roi if accept else {"cx": float(manual_roi.cx), "cy": float(manual_roi.cy), "r": float(manual_roi.r)},
+        "source": str(detected.get("source") or "manual_operator_assist_refinement"),
+        "confidence": float(detected.get("confidence", 0.0) or 0.0),
+        "confidence_label": str(detected.get("confidence_label") or "LOW"),
+        "candidate": candidate,
+        "reason": "accepted_local_refinement" if accept else "manual_seed_retained",
+    }
+
+
 def _measure_rendered_preview_roi_ipp2(
     preview_path: str,
     calibration_roi: Optional[Dict[str, float]],
     *,
     sphere_roi_override: Optional[Dict[str, float]] = None,
+    sphere_roi_source_override: Optional[str] = None,
+    manual_assist_entry: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     measurement_started_at = time.perf_counter()
     phase_started_at = measurement_started_at
-    image = np.asarray(Image.open(preview_path).convert("RGB"), dtype=np.float32) / 255.0
+    image, image_metadata = _load_preview_image_as_normalized_rgb(preview_path)
     image_load_seconds = time.perf_counter() - phase_started_at
     phase_started_at = time.perf_counter()
     region = _extract_normalized_roi_region_hwc(image, calibration_roi)
+    region_origin_x, region_origin_y = _normalized_roi_origin(image, calibration_roi)
+    measurement_region_scope = "calibration_roi" if calibration_roi is not None else "full_frame"
     roi_extract_seconds = time.perf_counter() - phase_started_at
     if region.size == 0:
         stats = _measure_rendered_preview_roi(preview_path, calibration_roi)
@@ -1424,8 +4155,15 @@ def _measure_rendered_preview_roi_ipp2(
             "mask_fraction": 0.0,
             "gray_exposure_summary": "n/a",
             "zone_measurements": [],
-            "render_width": int(image.shape[1]),
-            "render_height": int(image.shape[0]),
+            "render_width": int(image_metadata.get("width", image.shape[1])),
+            "render_height": int(image_metadata.get("height", image.shape[0])),
+            "rendered_image_dtype": str(image_metadata.get("source_dtype") or ""),
+            "rendered_image_mode": str(image_metadata.get("image_mode") or ""),
+            "rendered_image_bit_depth": image_metadata.get("bit_depth"),
+            "rendered_image_normalization_denominator": image_metadata.get("normalization_denominator"),
+            "rendered_preview_format": str(image_metadata.get("preview_format") or ""),
+            "measurement_region_scope": measurement_region_scope,
+            "measurement_region_origin": {"x": int(region_origin_x), "y": int(region_origin_y)},
             "measurement_runtime": {
                 "image_load_seconds": float(image_load_seconds),
                 "roi_extract_seconds": float(roi_extract_seconds),
@@ -1436,27 +4174,221 @@ def _measure_rendered_preview_roi_ipp2(
                 "total_measurement_seconds": float(time.perf_counter() - measurement_started_at),
             },
         }
+    manual_assist_metadata = _manual_assist_sanitized_entry(manual_assist_entry)
     sphere_roi = _coerce_sphere_roi(sphere_roi_override)
-    sphere_roi_source = "reused_from_original" if sphere_roi is not None else "failed"
+    sphere_roi_source = ""
     detection_confidence = 1.0 if sphere_roi is not None else 0.0
     detection_label = "HIGH" if sphere_roi is not None else "FAILED"
     detection_details: Dict[str, object] = {}
+    gray_card_details: Dict[str, object] = {}
+    gray_card_detection_seconds = 0.0
+    if sphere_roi is None and manual_assist_entry:
+        manual_roi_payload = _manual_assist_roi_for_image(
+            manual_assist_entry,
+            image_width=int(image_metadata.get("width", image.shape[1])),
+            image_height=int(image_metadata.get("height", image.shape[0])),
+        )
+        refinement = _refine_manual_assist_sphere_roi(image, manual_roi_payload)
+        sphere_roi = _coerce_sphere_roi(refinement.get("roi") or manual_roi_payload)
+        if sphere_roi is not None:
+            region = image
+            region_origin_x = 0
+            region_origin_y = 0
+            measurement_region_scope = "manual_assist_full_frame"
+            sphere_roi_source = (
+                "manual_operator_assist_refined"
+                if bool(refinement.get("refined"))
+                else "manual_operator_assist"
+            )
+            detection_confidence = (
+                float(refinement.get("confidence", 0.0) or 0.0)
+                if bool(refinement.get("refined"))
+                else 0.92
+            )
+            detection_label = (
+                str(refinement.get("confidence_label") or "HIGH")
+                if bool(refinement.get("refined"))
+                else "HIGH"
+            )
+            detection_details = {
+                "source": str(sphere_roi_source),
+                "roi": {"cx": float(sphere_roi.cx), "cy": float(sphere_roi.cy), "r": float(sphere_roi.r)},
+                "manual_assist": manual_assist_metadata,
+                "manual_refinement": dict(refinement.get("candidate") or {}),
+                "manual_refinement_reason": str(refinement.get("reason") or ""),
+            }
+            manual_assist_metadata["refinement_used"] = bool(refinement.get("refined"))
+            manual_assist_metadata["refinement_reason"] = str(refinement.get("reason") or "")
+    if sphere_roi is not None and sphere_roi_source_override:
+        sphere_roi_source = str(sphere_roi_source_override)
+    elif sphere_roi is not None and manual_assist_entry and not sphere_roi_source:
+        sphere_roi_source = "manual_operator_assist"
+    else:
+        sphere_roi_source = "reused_from_original" if sphere_roi is not None else "failed"
     detection_started_at = time.perf_counter()
     if sphere_roi is None:
-        if calibration_roi is None:
-            detected = _detect_sphere_roi_in_region_hwc(region)
-            detection_details = dict(detected)
-            detection_confidence = float(detected.get("confidence", 0.0) or 0.0)
-            detection_label = str(detected.get("confidence_label") or "FAILED")
-            sphere_roi_source = str(detected.get("source") or "failed")
-            sphere_roi = _coerce_sphere_roi(detected.get("roi"))
-        else:
-            sphere_roi_source = "provided_roi"
-            detection_confidence = 1.0
-            detection_label = "HIGH"
-            sphere_roi = _sphere_roi_for_region_hwc(region)
+        detected = _detect_sphere_roi_in_region_hwc(region)
+        detection_details = dict(detected)
+        detection_confidence = float(detected.get("confidence", 0.0) or 0.0)
+        detection_label = str(detected.get("confidence_label") or "FAILED")
+        sphere_roi_source = str(detected.get("source") or "failed")
+        sphere_roi = _coerce_sphere_roi(detected.get("roi"))
+        region_candidate_valid = bool((detected.get("profile_probe") or {}).get("valid")) and sphere_roi is not None
+        region_plausibility_score = float((detected.get("profile_probe") or {}).get("score", 0.0) or 0.0)
+        if calibration_roi is not None:
+            full_detected = _detect_sphere_roi_in_region_hwc(image)
+            full_confidence = float(full_detected.get("confidence", 0.0) or 0.0)
+            full_candidate_valid = bool((full_detected.get("profile_probe") or {}).get("valid")) and _coerce_sphere_roi(full_detected.get("roi")) is not None
+            full_plausibility_score = float((full_detected.get("profile_probe") or {}).get("score", 0.0) or 0.0)
+            if full_candidate_valid and (
+                not region_candidate_valid
+                or str(sphere_roi_source or "") in {"secondary_detected", "localized_recovery", "neutral_blob_recovery", "forced_best_effort"}
+                or detection_confidence < 0.90
+                or full_confidence >= detection_confidence
+                or full_plausibility_score >= region_plausibility_score + 0.03
+            ):
+                detection_details = dict(full_detected)
+                detection_confidence = full_confidence
+                detection_label = str(full_detected.get("confidence_label") or "FAILED")
+                sphere_roi_source = str(full_detected.get("source") or "failed")
+                sphere_roi = _coerce_sphere_roi(full_detected.get("roi"))
+                region = image
+                region_origin_x = 0
+                region_origin_y = 0
+                measurement_region_scope = "full_frame"
     sphere_detection_seconds = time.perf_counter() - detection_started_at
+    if sphere_roi is not None and manual_assist_entry:
+        detection_details = {
+            "source": str(sphere_roi_source or "manual_operator_assist"),
+            "roi": {"cx": float(sphere_roi.cx), "cy": float(sphere_roi.cy), "r": float(sphere_roi.r)},
+            "manual_assist": manual_assist_metadata,
+        }
+        profile_probe = _sphere_candidate_profile_plausibility(
+            region,
+            {"roi": {"cx": float(sphere_roi.cx), "cy": float(sphere_roi.cy), "r": float(sphere_roi.r)}},
+        )
+        detection_details["profile_probe"] = profile_probe
+        detection_details["sample_plausibility"] = str(profile_probe.get("label") or "IMPLAUSIBLE")
+        detection_details["sample_review_required"] = bool(profile_probe.get("review_required"))
+        detection_confidence = float(max(0.70, min(1.0, profile_probe.get("score", 0.0) or 0.0)))
+        detection_label = _sphere_detection_label(detection_confidence)
+    gray_target_class = "sphere" if sphere_roi is not None else "unresolved"
+    gray_target_detection_method = str(sphere_roi_source or "failed")
+    gray_target_confidence = float(detection_confidence)
+    gray_target_fallback_used = bool(sphere_roi_override) or str(sphere_roi_source or "") in {
+        "secondary_detected",
+        "localized_recovery",
+        "neutral_blob_recovery",
+        "opencv_hough_recovery",
+        "opencv_contour_recovery",
+        "forced_best_effort",
+        "reused_from_original",
+    }
+    sample_plausibility = str((detection_details.get("sample_plausibility") or "IMPLAUSIBLE") if detection_details else ("HIGH" if sphere_roi is not None else "IMPLAUSIBLE"))
+    manual_assist_used = str(sphere_roi_source or "").startswith("manual_") or bool(manual_assist_entry)
+    gray_target_review_recommended = gray_target_confidence < SPHERE_DETECTION_MEDIUM_CONFIDENCE
+    if _should_attempt_gray_card_fallback(
+        sphere_roi=sphere_roi,
+        detection_source=sphere_roi_source,
+        detection_confidence=detection_confidence,
+        detection_label=detection_label,
+    ):
+        gray_card_started_at = time.perf_counter()
+        gray_card_details = _detect_gray_card_in_region_hwc(region)
+        gray_card_detection_seconds = time.perf_counter() - gray_card_started_at
+        gray_card_confidence = float(gray_card_details.get("confidence", 0.0) or 0.0)
+        if gray_card_confidence >= max(0.82, float(detection_confidence or 0.0) + 0.15):
+            gray_target_class = "gray_card"
+            gray_target_detection_method = str(gray_card_details.get("source") or "gray_card_detected")
+            gray_target_confidence = gray_card_confidence
+            gray_target_fallback_used = True
+            gray_target_review_recommended = bool(gray_card_details.get("review_recommended"))
+            sphere_roi = None
+            sphere_roi_source = "gray_card_fallback"
+            detection_label = str(gray_card_details.get("confidence_label") or "MEDIUM")
+            detection_confidence = gray_card_confidence
     if sphere_roi is None:
+        if gray_target_class == "gray_card" and dict(gray_card_details.get("roi") or {}):
+            gray_card_roi = dict(gray_card_details.get("roi") or {})
+            gray_card_stats = dict(gray_card_details.get("stats") or {})
+            measured_log2 = float(gray_card_stats.get("measured_log2_luminance", 0.0) or 0.0)
+            measured_ire = float(gray_card_stats.get("measured_ire", _ire_from_log2_luminance(measured_log2)) or _ire_from_log2_luminance(measured_log2))
+            gray_card_summary = (
+                f"Gray card sample {measured_ire:.1f} IRE"
+                if measured_ire > 0.0
+                else "Gray card sample"
+            )
+            return {
+                "measured_log2_luminance": measured_log2,
+                "measured_log2_luminance_monitoring": measured_log2,
+                "measured_rgb_mean": [float(value) for value in list(gray_card_stats.get("measured_rgb_mean") or [0.0, 0.0, 0.0])[:3]],
+                "measured_rgb_chromaticity": [float(value) for value in list(gray_card_stats.get("measured_rgb_chromaticity") or [1.0 / 3.0] * 3)[:3]],
+                "measured_rgb_chromaticity_monitoring": [float(value) for value in list(gray_card_stats.get("measured_rgb_chromaticity") or [1.0 / 3.0] * 3)[:3]],
+                "valid_pixel_count": int(gray_card_stats.get("valid_pixel_count", 0) or 0),
+                "roi_variance": float(gray_card_stats.get("roi_variance", 0.0) or 0.0),
+                "monitoring_roi_variance": float(gray_card_stats.get("roi_variance", 0.0) or 0.0),
+                "measured_saturation_fraction_monitoring": float(gray_card_stats.get("saturation_fraction", 0.0) or 0.0),
+                "measurement_geometry": "gray_card_rectangular_sample_fallback",
+                "sampling_method": "gray_card_detected_roi",
+                "sampling_confidence": float(gray_target_confidence),
+                "mask_fraction": float(gray_card_stats.get("mask_fraction", 0.0) or 0.0),
+                "interior_radius_ratio": 1.0,
+                "neutral_sample_count": int(gray_card_stats.get("valid_pixel_count", 0) or 0),
+                "neutral_sample_log2_spread": float(gray_card_stats.get("gray_log2_stddev", 0.0) or 0.0),
+                "neutral_sample_chromaticity_spread": float(gray_card_details.get("neutrality_score", 0.0) or 0.0),
+                "neutral_samples": [],
+                "zone_measurements": [],
+                "gray_exposure_summary": gray_card_summary,
+                "bright_ire": measured_ire,
+                "center_ire": measured_ire,
+                "dark_ire": measured_ire,
+                "sample_1_ire": measured_ire,
+                "sample_2_ire": measured_ire,
+                "sample_3_ire": measured_ire,
+                "top_ire": measured_ire,
+                "mid_ire": measured_ire,
+                "bottom_ire": measured_ire,
+                "zone_spread_ire": 0.0,
+                "zone_spread_stops": 0.0,
+                "dominant_gradient_axis": {},
+                "sphere_roi_source": "gray_card_fallback",
+                "sphere_detection_confidence": float(detection_confidence),
+                "sphere_detection_label": str(detection_label or "MEDIUM"),
+                "sphere_detection_details": detection_details,
+                "detected_sphere_roi": {},
+                "detected_gray_card_roi": gray_card_roi,
+                "gray_card_detection_details": gray_card_details,
+                "gray_target_class": gray_target_class,
+                "gray_target_detection_method": gray_target_detection_method,
+                "gray_target_confidence": float(gray_target_confidence),
+                "gray_target_fallback_used": bool(gray_target_fallback_used),
+                "gray_target_review_recommended": bool(gray_target_review_recommended),
+                "manual_assist_used": bool(manual_assist_used),
+                "manual_assist_metadata": manual_assist_metadata,
+                "sample_plausibility": sample_plausibility,
+                "detection_failed": False,
+                "render_width": int(image_metadata.get("width", image.shape[1])),
+                "render_height": int(image_metadata.get("height", image.shape[0])),
+                "rendered_image_dtype": str(image_metadata.get("source_dtype") or ""),
+                "rendered_image_mode": str(image_metadata.get("image_mode") or ""),
+                "rendered_image_bit_depth": image_metadata.get("bit_depth"),
+                "rendered_image_normalization_denominator": image_metadata.get("normalization_denominator"),
+                "rendered_preview_format": str(image_metadata.get("preview_format") or ""),
+                "measurement_region_scope": measurement_region_scope,
+                "measurement_region_origin": {"x": int(region_origin_x), "y": int(region_origin_y)},
+                "measurement_crop_bounds": {},
+                "measurement_crop_size": {},
+                "measurement_runtime": {
+                    "image_load_seconds": float(image_load_seconds),
+                    "roi_extract_seconds": float(roi_extract_seconds),
+                    "sphere_detection_seconds": float(sphere_detection_seconds),
+                    "gray_card_detection_seconds": float(gray_card_detection_seconds),
+                    "gradient_axis_seconds": 0.0,
+                    "zone_stat_seconds": 0.0,
+                    "profile_measurement_seconds": 0.0,
+                    "total_measurement_seconds": float(time.perf_counter() - measurement_started_at),
+                },
+            }
         failed_payload = {
             "measured_log2_luminance": 0.0,
             "measured_log2_luminance_monitoring": 0.0,
@@ -1493,13 +4425,31 @@ def _measure_rendered_preview_roi_ipp2(
             "sphere_detection_label": "FAILED",
             "sphere_detection_details": detection_details,
             "detected_sphere_roi": {},
+            "detected_gray_card_roi": dict(gray_card_details.get("roi") or {}),
+            "gray_card_detection_details": gray_card_details,
+            "gray_target_class": "unresolved",
+            "gray_target_detection_method": "failed",
+            "gray_target_confidence": 0.0,
+            "gray_target_fallback_used": False,
+            "gray_target_review_recommended": True,
+            "manual_assist_used": bool(manual_assist_used),
+            "manual_assist_metadata": manual_assist_metadata,
+            "sample_plausibility": "IMPLAUSIBLE",
             "detection_failed": True,
-            "render_width": int(image.shape[1]),
-            "render_height": int(image.shape[0]),
+            "render_width": int(image_metadata.get("width", image.shape[1])),
+            "render_height": int(image_metadata.get("height", image.shape[0])),
+            "rendered_image_dtype": str(image_metadata.get("source_dtype") or ""),
+            "rendered_image_mode": str(image_metadata.get("image_mode") or ""),
+            "rendered_image_bit_depth": image_metadata.get("bit_depth"),
+            "rendered_image_normalization_denominator": image_metadata.get("normalization_denominator"),
+            "rendered_preview_format": str(image_metadata.get("preview_format") or ""),
+            "measurement_region_scope": measurement_region_scope,
+            "measurement_region_origin": {"x": int(region_origin_x), "y": int(region_origin_y)},
             "measurement_runtime": {
                 "image_load_seconds": float(image_load_seconds),
                 "roi_extract_seconds": float(roi_extract_seconds),
                 "sphere_detection_seconds": float(sphere_detection_seconds),
+                "gray_card_detection_seconds": float(gray_card_detection_seconds),
                 "gradient_axis_seconds": 0.0,
                 "zone_stat_seconds": 0.0,
                 "profile_measurement_seconds": 0.0,
@@ -1568,15 +4518,33 @@ def _measure_rendered_preview_roi_ipp2(
         "sphere_detection_label": detection_label,
         "sphere_detection_details": detection_details,
         "detected_sphere_roi": {"cx": float(sphere_roi.cx), "cy": float(sphere_roi.cy), "r": float(sphere_roi.r)},
+        "detected_gray_card_roi": dict(gray_card_details.get("roi") or {}),
+        "gray_card_detection_details": gray_card_details,
+        "gray_target_class": gray_target_class,
+        "gray_target_detection_method": gray_target_detection_method,
+        "gray_target_confidence": float(gray_target_confidence),
+        "gray_target_fallback_used": bool(gray_target_fallback_used),
+        "gray_target_review_recommended": bool(gray_target_review_recommended),
+        "manual_assist_used": bool(manual_assist_used),
+        "manual_assist_metadata": manual_assist_metadata,
+        "sample_plausibility": sample_plausibility,
         "detection_failed": False,
-        "render_width": int(image.shape[1]),
-        "render_height": int(image.shape[0]),
+        "render_width": int(image_metadata.get("width", image.shape[1])),
+        "render_height": int(image_metadata.get("height", image.shape[0])),
+        "rendered_image_dtype": str(image_metadata.get("source_dtype") or ""),
+        "rendered_image_mode": str(image_metadata.get("image_mode") or ""),
+        "rendered_image_bit_depth": image_metadata.get("bit_depth"),
+        "rendered_image_normalization_denominator": image_metadata.get("normalization_denominator"),
+        "rendered_preview_format": str(image_metadata.get("preview_format") or ""),
+        "measurement_region_scope": measurement_region_scope,
+        "measurement_region_origin": {"x": int(region_origin_x), "y": int(region_origin_y)},
         "measurement_crop_bounds": dict(crop_bounds),
         "measurement_crop_size": {"width": int(cropped_region.shape[1]), "height": int(cropped_region.shape[0])},
         "measurement_runtime": {
             "image_load_seconds": float(image_load_seconds),
             "roi_extract_seconds": float(roi_extract_seconds),
             "sphere_detection_seconds": float(sphere_detection_seconds),
+            "gray_card_detection_seconds": float(gray_card_detection_seconds),
             "crop_seconds": float(crop_seconds),
             "build_mask_seconds": float(timing.get("build_mask_seconds", 0.0) or 0.0),
             "gradient_axis_seconds": float(timing.get("gradient_axis_seconds", 0.0) or 0.0),
@@ -1777,23 +4745,23 @@ def _profile_audit_summary(zone_residuals: List[Dict[str, object]], zone_measure
     worst_abs = float(worst_zone.get("residual_abs_stops", 0.0) or 0.0)
     if worst_abs <= PROFILE_AUDIT_CONSISTENT_STOPS and abs(spread_delta) <= PROFILE_AUDIT_CONSISTENT_SPREAD_IRE:
         status = "PROFILE CONSISTENT"
-        label = "Profile consistent"
-        note = "Profile consistent"
+        label = "Profile aligned"
+        note = "Sample profile aligned"
         tone = "good"
     elif worst_label == "dark_side" and worst_abs <= PROFILE_AUDIT_REVIEW_STOPS and abs(spread_delta) <= PROFILE_AUDIT_REVIEW_SPREAD_IRE:
         status = "PROFILE NEEDS REVIEW"
-        label = "Profile needs review"
-        note = "Sample 3 differs slightly"
+        label = "Profile needs attention"
+        note = "Shadow-side sample differs slightly"
         tone = "warning"
     elif worst_abs <= PROFILE_AUDIT_REVIEW_STOPS and abs(spread_delta) <= PROFILE_AUDIT_REVIEW_SPREAD_IRE:
         status = "PROFILE NEEDS REVIEW"
-        label = "Profile needs review"
-        note = "Profile needs review"
+        label = "Profile needs attention"
+        note = "Sample profile needs review"
         tone = "warning"
     else:
         status = "PROFILE SHAPE MISMATCH"
         label = "Profile mismatch"
-        note = "Profile mismatch — verify T-Stop / lighting / ROI"
+        note = "Sample profile does not match expectation — verify stop, lighting, or ROI"
         tone = "danger"
     return {
         "profile_audit_status": status,
@@ -2454,9 +5422,11 @@ def _run_ipp2_closed_loop_solver(
                             iteration=iteration,
                             correction_stops=next_correction,
                         )
-                        render = render_preview_frame(
+                        render = _render_preview_frame_with_retries(
                             row["source_path"],
                             str(iteration_path),
+                            clip_id=clip_id,
+                            variant=f"closed_loop_{strategy_key}_iter_{iteration}",
                             frame_index=int(row["frame_index"]),
                             redline_executable=redline_executable,
                             redline_capabilities=redline_capabilities,
@@ -2467,12 +5437,8 @@ def _run_ipp2_closed_loop_solver(
                             color_method=None,
                             rmd_path=None,
                             use_rmd_mode=1,
+                            max_attempts=4,
                         )
-                        if int(render["returncode"]) != 0:
-                            raise RuntimeError(
-                                f"Closed-loop IPP2 render failed for {clip_id} ({strategy_key}) at iteration {iteration}. "
-                                f"Command: {shlex.join(render['command'])}. STDERR: {str(render['stderr']).strip()}"
-                            )
                         measured = _measure_rendered_preview_roi_ipp2(
                             str(render["output_path"]),
                             row.get("calibration_roi"),
@@ -3174,10 +6140,16 @@ def _build_ipp2_validation(
                         "ipp2_original_detection_confidence": float(original_measure.get("sphere_detection_confidence", 0.0) or 0.0),
                         "ipp2_original_detection_label": str(original_measure.get("sphere_detection_label") or "FAILED"),
                         "ipp2_original_detected_sphere_roi": dict(original_measure.get("detected_sphere_roi") or {}),
+                        "ipp2_original_measurement_region_scope": str(original_measure.get("measurement_region_scope") or "calibration_roi"),
+                        "ipp2_original_measurement_region_origin": dict(original_measure.get("measurement_region_origin") or {}),
+                        "ipp2_original_sample_plausibility": str(original_measure.get("sample_plausibility") or ""),
                         "ipp2_detection_source": str(corrected_measure.get("sphere_roi_source") or "failed"),
                         "ipp2_detection_confidence": float(corrected_measure.get("sphere_detection_confidence", 0.0) or 0.0),
                         "ipp2_detection_label": str(corrected_measure.get("sphere_detection_label") or "FAILED"),
                         "ipp2_detected_sphere_roi": dict(corrected_measure.get("detected_sphere_roi") or {}),
+                        "ipp2_measurement_region_scope": str(corrected_measure.get("measurement_region_scope") or "calibration_roi"),
+                        "ipp2_measurement_region_origin": dict(corrected_measure.get("measurement_region_origin") or {}),
+                        "ipp2_sample_plausibility": str(corrected_measure.get("sample_plausibility") or ""),
                         "detection_failed": bool(original_measure.get("detection_failed")) or bool(corrected_measure.get("detection_failed")),
                         "corrected_image_path": corrected_frame,
                         "original_image_path": original_frame,
@@ -3881,6 +6853,18 @@ def _build_strategy_payloads(
             clip["shared_kelvin"] = wb_model_solution.get("shared_kelvin")
             clip["shared_tint"] = wb_model_solution.get("shared_tint")
 
+        white_balance_summary = _canonical_white_balance_model_summary(
+            strategy_clips,
+            {
+                "model_key": wb_model_solution.get("model_key"),
+                "model_label": wb_model_solution.get("model_label"),
+                "shared_kelvin": wb_model_solution.get("shared_kelvin"),
+                "shared_tint": wb_model_solution.get("shared_tint"),
+                "metrics": wb_model_solution.get("metrics"),
+                "candidates": wb_model_solution.get("candidates", []),
+            },
+        )
+
         payloads.append(
             {
                 "strategy_key": strategy,
@@ -3902,14 +6886,7 @@ def _build_strategy_payloads(
                 "selection_diagnostics": selection_diagnostics,
                 "matching_domain": resolved_matching_domain,
                 "matching_domain_label": _matching_domain_label(resolved_matching_domain),
-                "white_balance_model": {
-                    "model_key": wb_model_solution.get("model_key"),
-                    "model_label": wb_model_solution.get("model_label"),
-                    "shared_kelvin": wb_model_solution.get("shared_kelvin"),
-                    "shared_tint": wb_model_solution.get("shared_tint"),
-                    "metrics": wb_model_solution.get("metrics"),
-                    "candidates": wb_model_solution.get("candidates", []),
-                },
+                "white_balance_model": white_balance_summary,
                 "clips": strategy_clips,
             }
         )
@@ -4246,20 +7223,36 @@ def _build_exposure_plot_svg(
 ) -> str:
     if not clips:
         return ""
-    ordered = sorted(clips, key=lambda clip: float(clip.get("measured_log2_luminance_monitoring", 0.0) or 0.0), reverse=True)
-    values = [float(clip.get("measured_log2_luminance_monitoring", 0.0) or 0.0) for clip in ordered]
+    def _display_ire_value(clip: Dict[str, object]) -> float:
+        raw_ire = clip.get("display_scalar_ire")
+        if isinstance(raw_ire, (int, float)):
+            return float(raw_ire)
+        raw_log2 = clip.get("display_scalar_log2", clip.get("measured_log2_luminance_monitoring", clip.get("measured_log2_luminance", 0.0)))
+        try:
+            return float((2.0 ** float(raw_log2)) * 100.0)
+        except Exception:
+            return 0.0
+
+    ordered = sorted(clips, key=_display_ire_value, reverse=True)
+    values = [_display_ire_value(clip) for clip in ordered]
+    if len(values) < 2:
+        return ""
     minimum = min(values)
     maximum = max(values)
+    spread = maximum - minimum
+    if spread < 0.5:
+        return ""
     median_value = float(np.median(np.asarray(values, dtype=np.float32)))
-    threshold = float(outlier_threshold or max(0.35, float(np.median(np.abs(np.asarray(values, dtype=np.float32) - median_value))) * 2.0))
+    median_abs_deviation = float(np.median(np.abs(np.asarray(values, dtype=np.float32) - median_value)))
+    threshold = float(outlier_threshold or max(0.75, median_abs_deviation * 1.75, spread * 0.14))
     lower_cluster = median_value - threshold
     upper_cluster = median_value + threshold
     width = 1180
-    height = 500
+    height = 440
     pad_left = 96
     pad_right = 68
     pad_top = 42
-    pad_bottom = 96
+    pad_bottom = 88
     inner_width = width - pad_left - pad_right
     inner_height = height - pad_top - pad_bottom
     scale = (maximum - minimum) or 1.0
@@ -4272,63 +7265,68 @@ def _build_exposure_plot_svg(
     stems: List[str] = []
     for index, clip in enumerate(ordered):
         x = pad_left + step * index
-        value = float(clip.get("measured_log2_luminance_monitoring", 0.0) or 0.0)
+        value = _display_ire_value(clip)
         y = y_for(value)
         points.append(f"{x:.1f},{y:.1f}")
         if target_log2 is not None:
-            target_y = y_for(float(target_log2))
+            target_y = y_for(float((2.0 ** float(target_log2)) * 100.0))
             stems.append(f"<line x1=\"{x:.1f}\" y1=\"{y:.1f}\" x2=\"{x:.1f}\" y2=\"{target_y:.1f}\" stroke=\"#cbd5e1\" stroke-width=\"2\" stroke-dasharray=\"4 4\"/>")
-        labels.append(
-            _svg_wrapped_text(
-                _camera_label_for_reporting(str(clip["clip_id"])),
-                x=x,
-                y=height - 44,
-                width_chars=12,
-                max_lines=2,
-                font_size=11,
-                fill="#475569",
-                anchor="middle",
-                line_height=13,
+        is_anchor = reference_clip_id and str(clip.get("clip_id")) == str(reference_clip_id)
+        is_outlier = abs(value - median_value) > threshold
+        should_label = len(ordered) <= 14 or is_anchor or is_outlier or (len(ordered) <= 24 and index % 2 == 0)
+        if should_label:
+            labels.append(
+                _svg_wrapped_text(
+                    _camera_label_for_reporting(str(clip["clip_id"])),
+                    x=x,
+                    y=height - 44,
+                    width_chars=11,
+                    max_lines=2,
+                    font_size=11,
+                    fill="#475569",
+                    anchor="middle",
+                    line_height=13,
+                )
             )
-        )
     polyline = " ".join(points)
     grid_lines = []
     for tick in range(4):
         y = pad_top + (inner_height / 3.0) * tick
         value = maximum - ((maximum - minimum) / 3.0) * tick
         grid_lines.append(f"<line x1=\"{pad_left}\" y1=\"{y:.1f}\" x2=\"{width - pad_right}\" y2=\"{y:.1f}\" stroke=\"#e2e8f0\" stroke-width=\"1\"/>")
-        grid_lines.append(f"<text x=\"{pad_left - 12}\" y=\"{y + 4:.1f}\" text-anchor=\"end\" font-size=\"11\" fill=\"#64748b\">{value:.2f}</text>")
+        grid_lines.append(f"<text x=\"{pad_left - 12}\" y=\"{y + 4:.1f}\" text-anchor=\"end\" font-size=\"11\" fill=\"#64748b\">{value:.1f}</text>")
     cluster_band = (
         f"<rect x=\"{pad_left}\" y=\"{y_for(upper_cluster):.1f}\" width=\"{inner_width:.1f}\" height=\"{max(y_for(lower_cluster) - y_for(upper_cluster), 6):.1f}\" fill=\"#dbeafe\" opacity=\"0.45\" rx=\"14\"/>"
     )
     cluster_line = f"<line x1=\"{pad_left}\" y1=\"{y_for(median_value):.1f}\" x2=\"{width - pad_right}\" y2=\"{y_for(median_value):.1f}\" stroke=\"#1d4ed8\" stroke-width=\"2\" stroke-dasharray=\"6 5\"/>"
     target_line = (
-        f"<line x1=\"{pad_left}\" y1=\"{y_for(float(target_log2)):.1f}\" x2=\"{width - pad_right}\" y2=\"{y_for(float(target_log2)):.1f}\" stroke=\"#0f766e\" stroke-width=\"2\"/>"
+        f"<line x1=\"{pad_left}\" y1=\"{y_for(float((2.0 ** float(target_log2)) * 100.0)):.1f}\" x2=\"{width - pad_right}\" y2=\"{y_for(float((2.0 ** float(target_log2)) * 100.0)):.1f}\" stroke=\"#0f766e\" stroke-width=\"2\"/>"
         if target_log2 is not None
         else ""
     )
     legend = (
-        f"<text x=\"{pad_left}\" y=\"24\" font-size=\"13\" font-weight=\"700\" fill=\"#1d4ed8\">Blue band: stable cluster</text>"
-        f"<text x=\"{pad_left + 210}\" y=\"24\" font-size=\"13\" font-weight=\"700\" fill=\"#0f766e\">Green line: target</text>"
-        f"<text x=\"{pad_left + 390}\" y=\"24\" font-size=\"13\" font-weight=\"700\" fill=\"#dc2626\">Red point: outlier</text>"
-        f"<text x=\"{pad_left}\" y=\"{max(y_for(median_value) - 10, 40):.1f}\" font-size=\"11\" fill=\"#1d4ed8\">stable cluster band</text>"
+        f"<text x=\"{pad_left}\" y=\"24\" font-size=\"13\" font-weight=\"700\" fill=\"#1d4ed8\">Blue band: retained cluster</text>"
+        f"<text x=\"{pad_left + 220}\" y=\"24\" font-size=\"13\" font-weight=\"700\" fill=\"#0f766e\">Green line: target center IRE</text>"
+        f"<text x=\"{pad_left + 470}\" y=\"24\" font-size=\"13\" font-weight=\"700\" fill=\"#dc2626\">Red point: attention / outlier</text>"
+        f"<text x=\"{pad_left}\" y=\"{max(y_for(median_value) - 10, 40):.1f}\" font-size=\"11\" fill=\"#1d4ed8\">retained cluster range</text>"
         + (
-            f"<text x=\"{width - pad_right - 110}\" y=\"{max(y_for(float(target_log2)) - 10, 40):.1f}\" font-size=\"11\" fill=\"#0f766e\">target exposure</text>"
+            f"<text x=\"{width - pad_right - 170}\" y=\"{max(y_for(float((2.0 ** float(target_log2)) * 100.0)) - 10, 40):.1f}\" font-size=\"11\" fill=\"#0f766e\">target center IRE</text>"
             if target_log2 is not None
             else ""
         )
+        + f"<text x=\"{width - pad_right}\" y=\"24\" font-size=\"12\" text-anchor=\"end\" fill=\"#334155\">display-domain center scalar (IRE)</text>"
     )
     circles = []
     for clip, point in zip(ordered, points):
         x, y = point.split(",")
-        value = float(clip.get("measured_log2_luminance_monitoring", 0.0) or 0.0)
+        value = _display_ire_value(clip)
         is_outlier = abs(value - median_value) > threshold
         is_anchor = reference_clip_id and str(clip.get("clip_id")) == str(reference_clip_id)
         fill = "#f59e0b" if is_anchor else "#dc2626" if is_outlier else "#0f172a"
         radius = 6 if is_anchor else 5
         circles.append(f"<circle cx=\"{x}\" cy=\"{y}\" r=\"{radius}\" fill=\"{fill}\" stroke=\"#ffffff\" stroke-width=\"2\"/>")
     return (
-        f"<svg viewBox=\"0 0 {width} {height}\" role=\"img\" aria-label=\"Per-camera exposure plot\">"
+        f"<svg viewBox=\"0 0 {width} {height}\" role=\"img\" aria-label=\"Per-camera exposure plot in display-domain IRE\">"
         f"{''.join(grid_lines)}"
         f"{cluster_band}"
         f"{cluster_line}"
@@ -4598,6 +7596,66 @@ def _camera_trust_details(
     }
 
 
+def _upgrade_trust_from_ipp2_validation(
+    trust_details: Dict[str, object],
+    *,
+    ipp2_validation: Dict[str, object],
+    gray_target_class: str,
+    sample_plausibility: str,
+) -> Dict[str, object]:
+    upgraded = dict(trust_details or {})
+    normalized_target = str(gray_target_class or "").strip().lower()
+    if normalized_target != "sphere":
+        return upgraded
+    status = str(ipp2_validation.get("status") or "").strip().upper()
+    if status != "PASS":
+        return upgraded
+    current_class = str(upgraded.get("trust_class") or "").strip().upper()
+    if current_class not in {"EXCLUDED", "UNTRUSTED"}:
+        return upgraded
+    profile_label = str(ipp2_validation.get("profile_audit_label") or "").strip().lower()
+    validation_residual = float(
+        ipp2_validation.get(
+            "derived_residual_abs_stops",
+            ipp2_validation.get("validation_residual_stops", ipp2_validation.get("residual_stops", 0.0)),
+        )
+        or 0.0
+    )
+    plausibility = str(sample_plausibility or "").strip().upper()
+    screened_reasons = [
+        str(item).strip()
+        for item in list(upgraded.get("screened_reasons") or [])
+        if str(item).strip()
+    ]
+    cluster_only_reasons = {
+        "Outside primary exposure group",
+        "Outside stable exposure cluster",
+        "outside primary exposure cluster",
+        "outside central exposure cluster",
+    }
+    has_non_cluster_reason = any(reason not in cluster_only_reasons for reason in screened_reasons)
+    if has_non_cluster_reason and validation_residual > CORRECTED_RESIDUAL_PASS_STOPS:
+        return upgraded
+    if profile_label == "profile aligned" and plausibility in {"HIGH", "MEDIUM"}:
+        upgraded["trust_class"] = "TRUSTED"
+        upgraded["trust_score"] = max(float(upgraded.get("trust_score", 0.0) or 0.0), 0.82)
+        upgraded["trust_reason"] = "Recovered on the sphere after corrected-frame validation"
+        upgraded["stability_label"] = "Validated on corrected frame"
+        upgraded["correction_confidence"] = "MEDIUM"
+        upgraded["reference_use"] = "Included"
+    else:
+        upgraded["trust_class"] = "USE_WITH_CAUTION"
+        upgraded["trust_score"] = max(float(upgraded.get("trust_score", 0.0) or 0.0), 0.64)
+        upgraded["trust_reason"] = "Recovered on the sphere after corrected-frame validation"
+        upgraded["stability_label"] = "Validated after correction"
+        upgraded["correction_confidence"] = "MEDIUM"
+        upgraded["reference_use"] = "Included"
+    if "Recovered on corrected-frame validation" not in screened_reasons:
+        screened_reasons.append("Recovered on corrected-frame validation")
+    upgraded["screened_reasons"] = screened_reasons
+    return upgraded
+
+
 def _build_trust_chart_svg(rows: List[Dict[str, object]]) -> str:
     if not rows:
         return ""
@@ -4642,6 +7700,128 @@ def _build_trust_chart_svg(rows: List[Dict[str, object]]) -> str:
         bars.append(f"<rect x=\"{x:.1f}\" y=\"{y:.1f}\" width=\"{bar_width:.1f}\" height=\"{max(bar_height, 4):.1f}\" rx=\"8\" fill=\"{fill}\"/>")
     baseline = f"<line x1=\"{pad_left}\" y1=\"{pad_top + inner_height:.1f}\" x2=\"{width - pad_right}\" y2=\"{pad_top + inner_height:.1f}\" stroke=\"#cbd5e1\" stroke-width=\"1\"/>"
     return f"<svg viewBox=\"0 0 {width} {height}\" role=\"img\" aria-label=\"Per-camera trust chart\">{baseline}{''.join(guides)}{''.join(bars)}{''.join(labels)}</svg>"
+
+
+def _white_balance_mode_from_values(values: List[float], *, tolerance: float) -> Tuple[str, Optional[float]]:
+    if not values:
+        return ("per_camera", None)
+    baseline = float(values[0])
+    if all(math.isclose(float(value), baseline, abs_tol=tolerance) for value in values[1:]):
+        return ("shared", baseline)
+    return ("per_camera", None)
+
+
+def _fallback_white_balance_label(*, kelvin_mode: str, tint_mode: str) -> str:
+    if kelvin_mode == "shared" and tint_mode == "shared":
+        return "Shared Kelvin / Shared Tint"
+    if kelvin_mode == "shared" and tint_mode == "per_camera":
+        return "Shared Kelvin / Per-Camera Tint"
+    if kelvin_mode == "per_camera" and tint_mode == "shared":
+        return "Per-Camera Kelvin / Shared Tint"
+    return "Per-Camera Kelvin / Per-Camera Tint"
+
+
+def _canonical_white_balance_model_summary(
+    strategy_clips: List[Dict[str, object]],
+    raw_summary: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    summary = dict(raw_summary or {})
+    clip_rows = [dict(item) for item in strategy_clips if str(item.get("clip_id") or "").strip()]
+    commit_rows = [dict(item.get("commit_values") or {}) for item in clip_rows if isinstance(item.get("commit_values"), dict)]
+    kelvin_values = [int(row.get("kelvin")) for row in commit_rows if row.get("kelvin") is not None]
+    tint_values = [float(row.get("tint")) for row in commit_rows if row.get("tint") is not None]
+    pre_residuals = [float(row.get("pre_neutral_residual")) for row in commit_rows if row.get("pre_neutral_residual") is not None]
+    post_residuals = [float(row.get("post_neutral_residual")) for row in commit_rows if row.get("post_neutral_residual") is not None]
+    sample_counts = [int(item.get("neutral_sample_count", 0) or 0) for item in clip_rows]
+    candidate_rows = [dict(item) for item in list(summary.get("candidates") or [])]
+    chosen_model_key = str(summary.get("model_key") or "").strip()
+    direct_summary = bool(chosen_model_key or candidate_rows)
+    kelvin_mode, shared_kelvin_value = _white_balance_mode_from_values([float(value) for value in kelvin_values], tolerance=50.0)
+    tint_mode, shared_tint_value = _white_balance_mode_from_values(tint_values, tolerance=0.1)
+    fallback_label = _fallback_white_balance_label(kelvin_mode=kelvin_mode, tint_mode=tint_mode)
+    if direct_summary:
+        model_label = str(summary.get("model_label") or fallback_label)
+        model_key = chosen_model_key or "white_balance_model"
+        selection_reason = str(summary.get("selection_reason") or "")
+        derivation_kind = "direct_solve"
+        source_measurement_type = "neutral_rgb_samples"
+    else:
+        model_label = "Derived from Final WB Values"
+        model_key = "fallback_final_commit_values"
+        selection_reason = (
+            "Derived from final per-camera Kelvin/Tint payloads because no white-balance model comparison summary was serialized."
+            if commit_rows
+            else "No white-balance solution is available."
+        )
+        derivation_kind = "fallback_derived"
+        source_measurement_type = "final_commit_values"
+        if commit_rows:
+            candidate_rows = [
+                {
+                    "model_key": f"fallback_{kelvin_mode}_{tint_mode}",
+                    "model_label": fallback_label,
+                    "score": 0.0,
+                    "metrics": {},
+                    "shared_kelvin": int(round(shared_kelvin_value)) if shared_kelvin_value is not None else None,
+                    "shared_tint": round(float(shared_tint_value), 1) if shared_tint_value is not None else None,
+                }
+            ]
+    if not selection_reason and direct_summary:
+        selection_reason = (
+            f"{model_label} was chosen from {len(candidate_rows)} white-balance candidate model(s) using stored neutral RGB sample residuals."
+            if candidate_rows
+            else f"{model_label} was chosen from the stored white-balance solve."
+        )
+    metrics = dict(summary.get("metrics") or {})
+    diagnostics = {
+        "retained_camera_count": len(clip_rows),
+        "mean_neutral_residual_before_solve": float(np.mean(pre_residuals)) if pre_residuals else 0.0,
+        "mean_neutral_residual_after_solve": float(np.mean(post_residuals)) if post_residuals else 0.0,
+        "max_neutral_residual": float(max(post_residuals)) if post_residuals else 0.0,
+        "kelvin_spread": int(round(max(kelvin_values) - min(kelvin_values))) if len(kelvin_values) >= 2 else 0,
+        "tint_spread": round(float(max(tint_values) - min(tint_values)), 3) if len(tint_values) >= 2 else 0.0,
+        "source_sample_count": int(sum(sample_counts)),
+        "summary_kind": derivation_kind,
+    }
+    diagnostics.update({
+        key: value for key, value in metrics.items()
+        if key in {"weighted_mean_post_neutral_residual", "max_post_neutral_residual", "kelvin_axis_stddev"}
+    })
+    return {
+        "status": "available" if commit_rows else "unavailable",
+        "model_key": model_key,
+        "model_label": model_label,
+        "candidate_count": int(len(candidate_rows) or (1 if commit_rows else 0)),
+        "shared_kelvin_mode": kelvin_mode,
+        "shared_kelvin": int(round(shared_kelvin_value)) if shared_kelvin_value is not None else None,
+        "shared_tint_mode": tint_mode,
+        "shared_tint": round(float(shared_tint_value), 1) if shared_tint_value is not None else None,
+        "selection_reason": selection_reason,
+        "source_measurement_type": source_measurement_type,
+        "candidates": candidate_rows,
+        "diagnostics": diagnostics,
+    }
+
+
+def _strategy_chart_is_informative(strategy_summaries: List[Dict[str, object]]) -> bool:
+    if len(strategy_summaries) < 2:
+        return False
+    mean_offsets = [float((item.get("correction_metrics") or {}).get("mean_abs_offset", 0.0) or 0.0) for item in strategy_summaries]
+    max_offsets = [float((item.get("correction_metrics") or {}).get("max_abs_offset", 0.0) or 0.0) for item in strategy_summaries]
+    mean_confidences = [float((item.get("correction_metrics") or {}).get("mean_confidence", 0.0) or 0.0) for item in strategy_summaries]
+    return (
+        (max(mean_offsets) - min(mean_offsets) >= 0.03)
+        or (max(max_offsets) - min(max_offsets) >= 0.05)
+        or (max(mean_confidences) - min(mean_confidences) >= 0.08)
+    )
+
+
+def _trust_chart_is_informative(rows: List[Dict[str, object]]) -> bool:
+    if len(rows) < 2:
+        return False
+    trust_classes = {str(item.get("trust_class") or "") for item in rows if str(item.get("trust_class") or "").strip()}
+    trust_scores = [float(item.get("trust_score", 0.0) or 0.0) for item in rows]
+    return len(trust_classes) > 1 or ((max(trust_scores) - min(trust_scores)) >= 0.08 if trust_scores else False)
 
 
 def _build_stability_chart_svg(rows: List[Dict[str, object]]) -> str:
@@ -4707,6 +7887,7 @@ def _build_run_assessment(
         float(np.mean([float(row.get("trust_score", 0.0) or 0.0) for row in per_camera_rows])) if per_camera_rows else 0.0,
         4,
     )
+    gray_target_consistency = _gray_target_consistency_summary(per_camera_rows)
     minimum_reference_count = max(3 if total >= 3 else total, int(np.ceil(total * 0.5)) if total >= 6 else 2 if total >= 2 else total)
     recommended_key = str(recommended_payload.get("strategy_key") or "")
     anchor_clip_id = str(recommended_payload.get("reference_clip_id") or "")
@@ -4724,8 +7905,13 @@ def _build_run_assessment(
         gating_reasons.append("The exposure set is fragmented into a stable cluster plus outliers.")
     if average_trust_score < 0.5:
         gating_reasons.append("Overall measurement quality is weak across the set.")
+    if bool(gray_target_consistency.get("mixed_target_classes")):
+        gating_reasons.append("Retained cameras mix gray-sphere and gray-card solves, so a shared safe commit set is blocked.")
 
-    if reference_eligible_count < minimum_reference_count or (anchor_row and anchor_trust_class in {"UNTRUSTED", "EXCLUDED"}):
+    if bool(gray_target_consistency.get("mixed_target_classes")):
+        run_status = "DO_NOT_PUSH"
+        recommendation_strength = "LOW_CONFIDENCE"
+    elif reference_eligible_count < minimum_reference_count or (anchor_row and anchor_trust_class in {"UNTRUSTED", "EXCLUDED"}):
         run_status = "DO_NOT_PUSH"
         recommendation_strength = "LOW_CONFIDENCE"
     elif trusted_count < max(2, min(total, 3)) or fragmented or average_trust_score < 0.58:
@@ -4748,7 +7934,9 @@ def _build_run_assessment(
         selected_strategy_diagnostics = dict((selected_strategy_summary or {}).get("selection_diagnostics") or {})
         anchor_summary = str(selected_strategy_diagnostics.get("anchor_reason") or "A single trustworthy camera anchored the group.")
 
-    if run_status == "READY":
+    if bool(gray_target_consistency.get("mixed_target_classes")):
+        operator_note = "Review is required before commit because retained cameras were measured from mixed gray target classes."
+    elif run_status == "READY":
         operator_note = "This run is strong enough to trust later for push if the camera readback still matches."
     elif run_status == "READY_WITH_WARNINGS":
         operator_note = "This run is usable, but at least one camera should be reviewed before any later push."
@@ -4773,6 +7961,7 @@ def _build_run_assessment(
         "anchor_summary": anchor_summary,
         "gating_reasons": gating_reasons,
         "operator_note": operator_note,
+        "gray_target_consistency": gray_target_consistency,
     }
 
 
@@ -4924,21 +8113,24 @@ def _roi_overlay_svg(
 
 
 def _sphere_detection_note(detection_source: str, detection_label: str, *, detection_failed: bool = False) -> str:
-    if detection_failed or str(detection_source or "") == "failed" or str(detection_label or "") == "FAILED":
-        return "Sphere detection: review needed"
-    if str(detection_source or "") == "forced_best_effort":
-        return "Sphere detection: low-confidence recovery"
-    if str(detection_source or "") in {"secondary_detected", "localized_recovery", "reused_from_original"} or str(detection_label or "") == "LOW":
-        return "Sphere detection: fallback used"
-    return "Sphere detection: verified"
+    return _gray_target_note(
+        target_class="sphere",
+        detection_source=detection_source,
+        detection_label=detection_label,
+        detection_failed=detection_failed,
+        fallback_used=str(detection_source or "") in {"secondary_detected", "localized_recovery", "reused_from_original", "forced_best_effort", "opencv_hough_recovery", "opencv_contour_recovery"},
+    )
 
 
-def _measurement_region_origin(image_size: Tuple[int, int], calibration_roi: Optional[Dict[str, float]]) -> Tuple[int, int]:
+def _measurement_region_origin(
+    image_size: Tuple[int, int],
+    calibration_roi: Optional[Dict[str, float]],
+    *,
+    measurement_region_scope: str = "calibration_roi",
+) -> Tuple[int, int]:
     width, height = image_size
-    if calibration_roi is None:
-        region_width = int(round(width * 0.4))
-        region_height = int(round(height * 0.4))
-        return (max(0, (width - region_width) // 2), max(0, (height - region_height) // 2))
+    if calibration_roi is None or str(measurement_region_scope or "calibration_roi") == "full_frame":
+        return (0, 0)
     x0 = max(0, min(width - 1, int(np.floor(float(calibration_roi["x"]) * width))))
     y0 = max(0, min(height - 1, int(np.floor(float(calibration_roi["y"]) * height))))
     return (x0, y0)
@@ -4955,14 +8147,16 @@ def _draw_detection_overlay(
     detection_source: str,
     detection_label: str,
     detection_confidence: float,
+    measurement_region_scope: str = "calibration_roi",
+    sample_plausibility: str = "",
 ) -> None:
     image = Image.open(image_path).convert("RGB")
     draw = ImageDraw.Draw(image)
     width, height = image.size
-    origin_x, origin_y = _measurement_region_origin((width, height), calibration_roi)
+    origin_x, origin_y = _measurement_region_origin((width, height), calibration_roi, measurement_region_scope=measurement_region_scope)
     if calibration_roi is None:
-        region_width = int(round(width * 0.4))
-        region_height = int(round(height * 0.4))
+        region_width = width
+        region_height = height
     else:
         region_width = max(1, int(np.ceil(float(calibration_roi["w"]) * width)))
         region_height = max(1, int(np.ceil(float(calibration_roi["h"]) * height)))
@@ -5004,6 +8198,8 @@ def _draw_detection_overlay(
     draw.text((28, 52), f"Detection: {detection_source}", fill="#cbd5e1")
     draw.text((28, 76), f"Confidence: {detection_label} ({float(detection_confidence):.2f})", fill="#cbd5e1")
     draw.text((28, 100), _sphere_detection_note(detection_source, detection_label, detection_failed=(detection_label == 'FAILED')), fill="#e2e8f0")
+    if str(sample_plausibility or "").strip():
+        draw.text((28, 122), f"Sample plausibility: {sample_plausibility}", fill="#e2e8f0")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     image.save(output_path)
 
@@ -5031,10 +8227,14 @@ def _build_sphere_detection_artifacts(
         original_detection_label = str(row.get("ipp2_original_detection_label") or "FAILED")
         original_detection_confidence = float(row.get("ipp2_original_detection_confidence", 0.0) or 0.0)
         original_detected_roi = dict(row.get("ipp2_original_detected_sphere_roi") or {})
+        original_measurement_region_scope = str(row.get("ipp2_original_measurement_region_scope") or "calibration_roi")
+        original_sample_plausibility = str(row.get("ipp2_original_sample_plausibility") or "")
         corrected_detection_source = str(row.get("ipp2_detection_source") or "failed")
         corrected_detection_label = str(row.get("ipp2_detection_label") or "FAILED")
         corrected_detection_confidence = float(row.get("ipp2_detection_confidence", 0.0) or 0.0)
         corrected_detected_roi = dict(row.get("ipp2_detected_sphere_roi") or {})
+        corrected_measurement_region_scope = str(row.get("ipp2_measurement_region_scope") or "calibration_roi")
+        corrected_sample_plausibility = str(row.get("ipp2_sample_plausibility") or "")
         if str(row.get("original_image_path") or "").strip():
             _draw_detection_overlay(
                 image_path=str(row.get("original_image_path") or ""),
@@ -5046,6 +8246,8 @@ def _build_sphere_detection_artifacts(
                 detection_source=original_detection_source,
                 detection_label=original_detection_label,
                 detection_confidence=original_detection_confidence,
+                measurement_region_scope=original_measurement_region_scope,
+                sample_plausibility=original_sample_plausibility,
             )
         if str(row.get("corrected_image_path") or "").strip():
             _draw_detection_overlay(
@@ -5058,11 +8260,16 @@ def _build_sphere_detection_artifacts(
                 detection_source=corrected_detection_source,
                 detection_label=corrected_detection_label,
                 detection_confidence=corrected_detection_confidence,
+                measurement_region_scope=corrected_measurement_region_scope,
+                sample_plausibility=corrected_sample_plausibility,
             )
         summary_rows.append(
             {
                 "clip_id": clip_id,
                 "camera_id": str(row.get("camera_id") or ""),
+                "source": corrected_detection_source or original_detection_source,
+                "confidence": corrected_detection_confidence or original_detection_confidence,
+                "confidence_label": corrected_detection_label or original_detection_label,
                 "original_detection_source": original_detection_source,
                 "original_detection_confidence": original_detection_confidence,
                 "original_detection_label": original_detection_label,
@@ -5072,9 +8279,13 @@ def _build_sphere_detection_artifacts(
                 "corrected_detection_label": corrected_detection_label,
                 "corrected_detected_sphere_roi": corrected_detected_roi or original_detected_roi,
                 "corrected_frame_reused_original_roi": corrected_detection_source == "reused_from_original",
-                "fallback_used": original_detection_source in {"secondary_detected", "localized_recovery", "forced_best_effort"}
-                or corrected_detection_source in {"secondary_detected", "localized_recovery", "forced_best_effort", "reused_from_original"},
+                "fallback_used": original_detection_source in {"secondary_detected", "localized_recovery", "neutral_blob_recovery", "forced_best_effort", "opencv_hough_recovery", "opencv_contour_recovery"}
+                or corrected_detection_source in {"secondary_detected", "localized_recovery", "neutral_blob_recovery", "forced_best_effort", "reused_from_original", "opencv_hough_recovery", "opencv_contour_recovery"},
                 "detection_failed": bool(row.get("detection_failed")),
+                "review_recommended": bool(row.get("detection_failed")) or str(corrected_detection_label or original_detection_label) in {"LOW", "FAILED"},
+                "target_class": str(row.get("ipp2_target_class") or "sphere"),
+                "measurement_region_scope": corrected_measurement_region_scope or original_measurement_region_scope,
+                "sample_plausibility": corrected_sample_plausibility or original_sample_plausibility,
                 "original_overlay_path": str(original_overlay_path),
                 "corrected_overlay_path": str(corrected_overlay_path),
             }
@@ -5375,7 +8586,7 @@ def _render_lightweight_analysis_html(payload: Dict[str, object]) -> str:
             residual_stops=offset_value,
             validation_status=validation_status,
         )
-        profile_note = str(row.get("trust_reason") or "Profile consistent")
+        profile_note = str(row.get("trust_reason") or "Sample profile aligned")
         table_rows.append(
             "<tr>"
             f"<td><div class='camera-cell'><strong>{html.escape(str(row['camera_label']))}</strong><span>{html.escape(str(row['clip_id']))}</span></div></td>"
@@ -5386,9 +8597,9 @@ def _render_lightweight_analysis_html(payload: Dict[str, object]) -> str:
             "</tr>"
         )
     color_preview_line = (
-        f"Color preview: {html.escape(str(payload.get('color_preview_status')))} | {html.escape(str(payload.get('color_preview_note')))}"
+        f"Color preview: {html.escape(str(payload.get('color_preview_operator_status') or payload.get('color_preview_status')))} | {html.escape(str(payload.get('color_preview_note')))}"
         if payload.get("color_preview_note")
-        else f"Color preview: {html.escape(str(payload.get('color_preview_status') or 'unknown'))}"
+        else f"Color preview: {html.escape(str(payload.get('color_preview_operator_status') or payload.get('color_preview_status') or 'unknown'))}"
     )
     def chart_frame(title: str, svg: str) -> str:
         return (
@@ -5660,6 +8871,8 @@ def build_lightweight_analysis_report(
     exposure_anchor_mode: Optional[str] = None,
     manual_target_stops: Optional[float] = None,
     manual_target_ire: Optional[float] = None,
+    preview_still_format: str = DEFAULT_PREVIEW_STILL_FORMAT,
+    artifact_mode: str = DEFAULT_ARTIFACT_MODE,
     clear_cache: bool = True,
     progress_path: Optional[str] = None,
 ) -> Dict[str, object]:
@@ -5692,6 +8905,7 @@ def build_lightweight_analysis_report(
         review_mode="lightweight_analysis",
     )
     resolved_source_mode = source_mode
+    resolved_artifact_mode = normalize_artifact_mode(artifact_mode)
     resolved_source_mode_label = source_mode_label_value or source_mode_label(resolved_source_mode)
     resolved_strategies = _ensure_anchor_strategy_list(
         list(target_strategies or list(DEFAULT_REVIEW_TARGET_STRATEGIES)),
@@ -5704,6 +8918,7 @@ def build_lightweight_analysis_report(
     reused_measurement_renders = 0
     array_calibration_payload = _load_array_calibration_payload(str(root))
     measurement_preview_settings = _measurement_preview_settings_for_domain(resolved_matching_domain)
+    measurement_preview_settings["preview_still_format"] = normalize_preview_still_format(preview_still_format)
     if reusable_analysis_measurements:
         emit_review_progress(
             progress_path,
@@ -5740,6 +8955,7 @@ def build_lightweight_analysis_report(
             redline_capabilities=redline_capabilities,
             strategy_payloads=[],
             run_id=resolved_run_label,
+            artifact_mode=resolved_artifact_mode,
         )
         measurement_preview_rendered = len(measurement_preview_paths)
         emit_review_progress(
@@ -5986,6 +9202,7 @@ def build_lightweight_analysis_report(
         "calibration_roi": calibration_roi or (analysis_records[0].get("diagnostics", {}).get("calibration_roi") if analysis_records else None),
         "color_preview_enabled": False,
         "color_preview_status": _color_preview_policy()["status"],
+        "color_preview_operator_status": _color_preview_policy()["operator_status"],
         "color_preview_note": _color_preview_policy()["note"],
         "executive_synopsis": synopsis,
         "subset_label": subset_label,
@@ -5994,6 +9211,7 @@ def build_lightweight_analysis_report(
         "white_balance_model": dict(recommended_payload.get("white_balance_model", {})),
         "recommended_strategy": recommended_strategy,
         "run_assessment": run_assessment,
+        "gray_target_consistency": dict(run_assessment.get("gray_target_consistency") or {}),
         "hero_recommendation": hero_summary,
         "operator_recommendation": operator_recommendation,
         "per_camera_analysis": per_camera_rows,
@@ -6018,16 +9236,20 @@ def build_lightweight_analysis_report(
                 recommended_payload["clips"],
                 target_log2=float(recommended_payload["target_log2_luminance"]),
             ),
-            "strategy_chart_svg": _build_strategy_chart_svg(strategy_summaries),
-            "trust_chart_svg": _build_trust_chart_svg(per_camera_rows),
+            "strategy_chart_svg": _build_strategy_chart_svg(strategy_summaries) if _strategy_chart_is_informative(strategy_summaries) else "",
+            "trust_chart_svg": _build_trust_chart_svg(per_camera_rows) if _trust_chart_is_informative(per_camera_rows) else "",
         },
     }
-    payload["debug_exposure_trace"] = _build_exposure_trace_artifacts(
-        analysis_records=analysis_records,
-        recommended_payload=recommended_payload,
-        strategy_summaries=strategy_summaries,
-        exposure_summary=exposure_summary,
-        out_root=out_root,
+    payload["debug_exposure_trace"] = (
+        _build_exposure_trace_artifacts(
+            analysis_records=analysis_records,
+            recommended_payload=recommended_payload,
+            strategy_summaries=strategy_summaries,
+            exposure_summary=exposure_summary,
+            out_root=out_root,
+        )
+        if resolved_artifact_mode == "debug"
+        else None
     )
     report_json_path = out_root / "contact_sheet.json"
     report_html_path = out_root / "contact_sheet.html"
@@ -6135,7 +9357,7 @@ def _build_redline_preview_command(
         "--o",
         str(Path(output_path).expanduser().resolve()),
         "--format",
-        "3",
+        str(int(preview_settings.get("preview_still_redline_format_code", PREVIEW_STILL_FORMAT_CODES[DEFAULT_PREVIEW_STILL_FORMAT]))),
         "--start",
         str(frame_index),
         "--frameCount",
@@ -6415,6 +9637,169 @@ def render_preview_frame(
     }
 
 
+def _remove_stale_render_targets(output_path: str | Path) -> None:
+    candidate = Path(output_path).expanduser().resolve()
+    stale_paths = {candidate}
+    for path in candidate.parent.glob(f"{candidate.name}.*"):
+        stale_paths.add(path.resolve())
+    for path in stale_paths:
+        try:
+            if path.exists() and path.is_file():
+                path.unlink()
+        except OSError:
+            continue
+
+
+def _validate_rendered_preview_output(path: Path) -> Dict[str, object]:
+    _wait_for_file_ready(path, max_attempts=6, delay_seconds=0.20)
+    _, image_metadata = _load_preview_image_as_normalized_rgb(path)
+    return {
+        "output_path": str(path),
+        "size_bytes": int(path.stat().st_size),
+        "image_metadata": image_metadata,
+    }
+
+
+def _summarize_preview_render_attempts(attempts: List[Dict[str, object]]) -> str:
+    parts: List[str] = []
+    for item in attempts:
+        summary_bits = [
+            f"attempt={int(item.get('attempt', 0) or 0)}",
+            f"returncode={int(item.get('returncode', 0) or 0)}",
+            f"reason={str(item.get('reason') or 'unknown')}",
+        ]
+        output_path = str(item.get("resolved_output_path") or "")
+        if output_path:
+            summary_bits.append(f"output={output_path}")
+        size_bytes = item.get("output_size_bytes")
+        if size_bytes is not None:
+            summary_bits.append(f"size={size_bytes}")
+        error_text = str(item.get("error") or "").strip()
+        if error_text:
+            summary_bits.append(f"error={error_text}")
+        parts.append("[" + ", ".join(summary_bits) + "]")
+    return " ".join(parts)
+
+
+def _render_preview_frame_with_retries(
+    input_r3d: str,
+    output_path: str,
+    *,
+    clip_id: str,
+    variant: str,
+    frame_index: int,
+    redline_executable: str,
+    redline_capabilities: Dict[str, object],
+    preview_settings: Dict[str, object],
+    use_as_shot_metadata: bool,
+    exposure: Optional[float] = None,
+    kelvin: Optional[int] = None,
+    tint: Optional[float] = None,
+    red_gain: Optional[float] = None,
+    green_gain: Optional[float] = None,
+    blue_gain: Optional[float] = None,
+    color_cdl: Optional[Dict[str, object]] = None,
+    rmd_path: Optional[str] = None,
+    use_rmd_mode: int = 1,
+    color_method: Optional[str] = None,
+    max_attempts: int = 3,
+) -> Dict[str, object]:
+    attempts: List[Dict[str, object]] = []
+    requested_output = Path(output_path).expanduser().resolve()
+    for attempt in range(1, max_attempts + 1):
+        _remove_stale_render_targets(requested_output)
+        rendered = render_preview_frame(
+            input_r3d,
+            str(requested_output),
+            frame_index=frame_index,
+            redline_executable=redline_executable,
+            redline_capabilities=redline_capabilities,
+            preview_settings=preview_settings,
+            use_as_shot_metadata=use_as_shot_metadata,
+            exposure=exposure,
+            kelvin=kelvin,
+            tint=tint,
+            red_gain=red_gain,
+            green_gain=green_gain,
+            blue_gain=blue_gain,
+            color_cdl=color_cdl,
+            rmd_path=rmd_path,
+            use_rmd_mode=use_rmd_mode,
+            color_method=color_method,
+        )
+        resolved_output = Path(str(rendered.get("output_path") or requested_output)).expanduser().resolve()
+        attempt_record: Dict[str, object] = {
+            "attempt": attempt,
+            "clip_id": clip_id,
+            "variant": variant,
+            "command": rendered.get("command"),
+            "returncode": int(rendered.get("returncode", 0) or 0),
+            "stdout": str(rendered.get("stdout") or ""),
+            "stderr": str(rendered.get("stderr") or ""),
+            "requested_output_path": str(requested_output),
+            "resolved_output_path": str(resolved_output),
+            "output_exists": bool(resolved_output.exists()),
+            "reason": "",
+        }
+        try:
+            if int(rendered.get("returncode", 0) or 0) != 0:
+                raise RuntimeError(
+                    f"REDLine exited with code {int(rendered.get('returncode', 0) or 0)}. "
+                    f"STDERR: {str(rendered.get('stderr') or '').strip()}"
+                )
+            output_validation = _validate_rendered_preview_output(resolved_output)
+            attempt_record["output_exists"] = True
+            attempt_record["output_size_bytes"] = int(output_validation["size_bytes"])
+            attempt_record["reason"] = "success"
+            attempts.append(attempt_record)
+            rendered["output_path"] = str(resolved_output)
+            rendered["attempt_count"] = attempt
+            rendered["recovered_after_retry"] = attempt > 1
+            rendered["attempt_diagnostics"] = attempts
+            rendered["output_size_bytes"] = int(output_validation["size_bytes"])
+            rendered["image_metadata"] = output_validation["image_metadata"]
+            if attempt > 1:
+                LOGGER.warning(
+                    "Recovered REDLine preview render for %s (%s) after %s attempts",
+                    clip_id,
+                    variant,
+                    attempt,
+                )
+                print(
+                    f"[r3dmatch] recovered preview render clip={clip_id} variant={variant} attempts={attempt} output={resolved_output}"
+                )
+            return rendered
+        except Exception as exc:
+            attempt_record["output_exists"] = bool(resolved_output.exists())
+            attempt_record["output_size_bytes"] = int(resolved_output.stat().st_size) if resolved_output.exists() else 0
+            attempt_record["reason"] = (
+                "nonzero_returncode"
+                if int(rendered.get("returncode", 0) or 0) != 0
+                else "output_missing_or_unreadable"
+            )
+            attempt_record["error"] = str(exc)
+            attempts.append(attempt_record)
+            if attempt >= max_attempts:
+                raise RuntimeError(
+                    f"REDLine preview render failed for {clip_id} ({variant}) after {max_attempts} attempt(s). "
+                    f"Command: {shlex.join(list(rendered.get('command') or []))}. "
+                    f"Attempt diagnostics: {_summarize_preview_render_attempts(attempts)}"
+                ) from exc
+            LOGGER.warning(
+                "Retrying REDLine preview render for %s (%s), attempt %s/%s: %s",
+                clip_id,
+                variant,
+                attempt,
+                max_attempts,
+                exc,
+            )
+            print(
+                f"[r3dmatch] preview render retry clip={clip_id} variant={variant} attempt={attempt}/{max_attempts} reason={exc}"
+            )
+            time.sleep(0.25 * attempt)
+    raise RuntimeError(f"Preview render retry loop exhausted unexpectedly for {clip_id} ({variant})")
+
+
 def _validate_rmd_render(
     *,
     clip_id: str,
@@ -6555,6 +9940,7 @@ def generate_preview_stills(
     strategy_rmd_root: Optional[str] = None,
     render_originals: bool = True,
     original_preview_by_clip: Optional[Dict[str, str]] = None,
+    artifact_mode: str = DEFAULT_ARTIFACT_MODE,
 ) -> Dict[str, Dict[str, object]]:
     raise_if_cancelled("Run cancelled before preview generation.")
     preview_root = Path(previews_dir).expanduser().resolve()
@@ -6566,6 +9952,7 @@ def generate_preview_stills(
     rmd_validation_records: List[Dict[str, object]] = []
     selected_rmd_use_mode = 1
     color_preview_policy = _color_preview_policy()
+    resolved_artifact_mode = normalize_artifact_mode(artifact_mode)
     render_settings = _normalize_preview_settings(
         preview_mode=str(preview_settings.get("preview_mode") or DEFAULT_DISPLAY_REVIEW_PREVIEW["preview_mode"]),
         preview_output_space=str(preview_settings.get("output_space") or DEFAULT_DISPLAY_REVIEW_PREVIEW["output_space"]),
@@ -6573,7 +9960,9 @@ def generate_preview_stills(
         preview_highlight_rolloff=str(preview_settings.get("highlight_rolloff") or DEFAULT_DISPLAY_REVIEW_PREVIEW["highlight_rolloff"]),
         preview_shadow_rolloff=str(preview_settings.get("shadow_rolloff") or DEFAULT_DISPLAY_REVIEW_PREVIEW["shadow_rolloff"]),
         preview_lut=str(preview_settings.get("lut_path")) if preview_settings.get("lut_path") else None,
+        preview_still_format=str(preview_settings.get("preview_still_format") or DEFAULT_DISPLAY_REVIEW_PREVIEW.get("preview_still_format") or DEFAULT_PREVIEW_STILL_FORMAT),
     )
+    preview_extension = str(render_settings.get("preview_still_extension") or preview_still_extension(DEFAULT_PREVIEW_STILL_FORMAT))
 
     resolved_strategy_payloads = strategy_payloads
     if resolved_strategy_payloads is None:
@@ -6608,27 +9997,20 @@ def generate_preview_stills(
         frame_index = int(sample_plan.get("start_frame", 0))
         preview_paths[clip_id] = {"strategies": {}}
 
-        original_path = preview_root / preview_filename_for_clip_id(clip_id, "original", run_id=run_id)
+        original_path = preview_root / preview_filename_for_clip_id(clip_id, "original", run_id=run_id, extension=preview_extension)
         if render_originals:
-            baseline_render = render_preview_frame(
+            baseline_render = _render_preview_frame_with_retries(
                 source_path,
                 str(original_path),
+                clip_id=clip_id,
+                variant="original",
                 frame_index=frame_index,
                 redline_executable=redline_executable,
                 redline_capabilities=redline_capabilities,
                 preview_settings=render_settings,
                 use_as_shot_metadata=True,
             )
-            if int(baseline_render["returncode"]) != 0:
-                raise RuntimeError(
-                    f"REDLine preview render failed for {clip_id} (original). "
-                    f"Command: {shlex.join(baseline_render['command'])}. STDERR: {str(baseline_render['stderr']).strip()}"
-                )
             original_path = Path(str(baseline_render["output_path"]))
-            if not original_path.exists():
-                raise RuntimeError(
-                    f"REDLine preview render did not create expected file for {clip_id} (original): {original_path}"
-                )
             command_records.append(
                 {
                     "clip_id": clip_id,
@@ -6646,6 +10028,9 @@ def generate_preview_stills(
                     "stderr": baseline_render["stderr"],
                     "pixel_diff_from_baseline": 0.0,
                     "pixel_output_changed": False,
+                    "attempt_count": int(baseline_render.get("attempt_count", 1) or 1),
+                    "recovered_after_retry": bool(baseline_render.get("recovered_after_retry")),
+                    "attempt_diagnostics": list(baseline_render.get("attempt_diagnostics") or []),
                     "as_shot_metadata_used": True,
                     "explicit_transform_used": True,
                     "explicit_correction_flags_used": False,
@@ -6674,7 +10059,7 @@ def generate_preview_stills(
             preview_paths[clip_id]["strategies"][strategy_key] = {}
             for variant, variant_settings in variants.items():
                 raise_if_cancelled("Run cancelled while rendering corrected previews.")
-                preview_path = preview_root / preview_filename_for_clip_id(clip_id, variant, strategy=strategy_key, run_id=run_id)
+                preview_path = preview_root / preview_filename_for_clip_id(clip_id, variant, strategy=strategy_key, run_id=run_id, extension=preview_extension)
                 look_metadata_path = None
                 rmd_metadata = None
                 if strategy_rmd_root is not None:
@@ -6756,12 +10141,26 @@ def generate_preview_stills(
                         exposure_preview = preview_paths[clip_id]["strategies"][strategy_key].get("exposure")
                         source_preview_path = Path(str(exposure_preview)) if exposure_preview else original_path
                         output_reused_from_variant = "exposure"
-                    shutil.copyfile(source_preview_path, preview_path)
-                    preview_path = preview_path.resolve()
+                    source_preview_path = Path(source_preview_path).expanduser().resolve()
+                    try:
+                        if preview_path.exists() or preview_path.is_symlink():
+                            preview_path.unlink()
+                        os.link(source_preview_path, preview_path)
+                        preview_path = preview_path.resolve()
+                    except OSError:
+                        try:
+                            if preview_path.exists() or preview_path.is_symlink():
+                                preview_path.unlink()
+                            preview_path.symlink_to(source_preview_path)
+                            preview_path = preview_path.resolve()
+                        except OSError:
+                            preview_path = source_preview_path
                 else:
-                    corrected_render = render_preview_frame(
+                    corrected_render = _render_preview_frame_with_retries(
                         source_path,
                         str(preview_path),
+                        clip_id=clip_id,
+                        variant=variant,
                         frame_index=frame_index,
                         redline_executable=redline_executable,
                         redline_capabilities=redline_capabilities,
@@ -6776,16 +10175,8 @@ def generate_preview_stills(
                         rmd_path=None,
                         use_rmd_mode=selected_rmd_use_mode,
                     )
-                    if int(corrected_render["returncode"]) != 0:
-                        raise RuntimeError(
-                            f"REDLine preview render failed for {clip_id} ({variant}). "
-                            f"Command: {shlex.join(corrected_render['command'])}. STDERR: {str(corrected_render['stderr']).strip()}"
-                        )
                     preview_path = Path(str(corrected_render["output_path"]))
-                    if not preview_path.exists():
-                        raise RuntimeError(
-                            f"REDLine preview render did not create expected file for {clip_id} ({variant}): {preview_path}"
-                        )
+                _validate_rendered_preview_output(preview_path)
 
                 diff_metrics = _compute_image_difference_metrics(original_path, preview_path)
                 mean_diff = diff_metrics["mean_absolute_difference"]
@@ -6868,6 +10259,9 @@ def generate_preview_stills(
                         "pixel_diff_from_baseline": mean_diff,
                         "max_pixel_diff_from_baseline": diff_metrics["max_absolute_difference"],
                         "pixel_output_changed": diff_metrics["pixel_output_changed"],
+                        "attempt_count": int(corrected_render.get("attempt_count", 1) or 1) if corrected_render else 1,
+                        "recovered_after_retry": bool(corrected_render.get("recovered_after_retry")) if corrected_render else False,
+                        "attempt_diagnostics": list(corrected_render.get("attempt_diagnostics") or []) if corrected_render else [],
                         "correction_payload_identity": correction_payload_identity,
                         "cdl_enabled": cdl_enabled,
                         "preview_color_applied": not color_preview_disabled,
@@ -6894,6 +10288,8 @@ def generate_preview_stills(
         "chosen_preview_correction_path": "direct_redline_flags",
         "direct_exposure_parameter": REDLINE_DIRECT_EXPOSURE_PARAMETER,
         "color_preview_policy": color_preview_policy,
+        "preview_still_format": str(render_settings.get("preview_still_format") or DEFAULT_PREVIEW_STILL_FORMAT),
+        "preview_still_extension": preview_extension,
         "pipeline_valid": all(
             bool(item["correction_payload_identity"])
             or bool(item["pixel_output_changed"])
@@ -6905,14 +10301,15 @@ def generate_preview_stills(
         "validation_method": "pixel_diff_from_baseline",
         "validations": rmd_validation_records,
     }
-    (preview_root / "rmd_validation.json").write_text(
-        json.dumps(semantics_payload, indent=2),
-        encoding="utf-8",
-    )
-    (preview_root / "preview_semantics.json").write_text(
-        json.dumps(semantics_payload, indent=2),
-        encoding="utf-8",
-    )
+    if resolved_artifact_mode == "debug":
+        (preview_root / "rmd_validation.json").write_text(
+            json.dumps(semantics_payload, indent=2),
+            encoding="utf-8",
+        )
+        (preview_root / "preview_semantics.json").write_text(
+            json.dumps(semantics_payload, indent=2),
+            encoding="utf-8",
+        )
     return preview_paths
 
 
@@ -6938,6 +10335,9 @@ def build_contact_sheet_report(
     preview_highlight_rolloff: Optional[str] = None,
     preview_shadow_rolloff: Optional[str] = None,
     preview_lut: Optional[str] = None,
+    preview_still_format: str = DEFAULT_PREVIEW_STILL_FORMAT,
+    report_focus: str = "auto",
+    artifact_mode: str = DEFAULT_ARTIFACT_MODE,
     clear_cache: bool = True,
     calibration_roi: Optional[Dict[str, float]] = None,
     target_strategies: Optional[List[str]] = None,
@@ -6947,6 +10347,7 @@ def build_contact_sheet_report(
     manual_target_stops: Optional[float] = None,
     manual_target_ire: Optional[float] = None,
     require_real_redline: bool = False,
+    focus_validation: bool = False,
     progress_path: Optional[str] = None,
 ) -> Dict[str, object]:
     report_started_at = time.perf_counter()
@@ -6977,6 +10378,8 @@ def build_contact_sheet_report(
     )
     requested_matching_domain = _normalize_matching_domain(matching_domain)
     resolved_matching_domain = "perceptual"
+    resolved_report_focus = normalize_report_focus(report_focus)
+    resolved_artifact_mode = normalize_artifact_mode(artifact_mode)
     resolved_source_mode = source_mode
     resolved_source_mode_label = source_mode_label_value or source_mode_label(resolved_source_mode)
     resolved_strategies = _ensure_anchor_strategy_list(
@@ -7015,6 +10418,7 @@ def build_contact_sheet_report(
         preview_highlight_rolloff=preview_highlight_rolloff,
         preview_shadow_rolloff=preview_shadow_rolloff,
         preview_lut=preview_lut,
+        preview_still_format=preview_still_format,
     )
     exposure = load_exposure_calibration(exposure_calibration_path) if exposure_calibration_path else None
     color = load_color_calibration(color_calibration_path) if color_calibration_path else None
@@ -7042,6 +10446,7 @@ def build_contact_sheet_report(
                 redline_capabilities=redline_capabilities,
                 strategy_payloads=[],
                 run_id=run_id,
+                artifact_mode=resolved_artifact_mode,
             )
             for record in analysis_records:
                 raise_if_cancelled("Run cancelled while measuring rendered originals.")
@@ -7099,20 +10504,28 @@ def build_contact_sheet_report(
         elapsed_seconds=time.perf_counter() - report_started_at,
         review_mode="full_contact_sheet",
     )
-    sampling_comparison = _build_sampling_comparison(analysis_records, out_root=out_root)
-    solve_comparison = _build_solve_comparison(
-        analysis_records,
-        target_strategies=resolved_strategies,
-        reference_clip_id=reference_clip_id,
-        hero_clip_id=hero_clip_id,
-        target_type=target_type,
-        matching_domain=resolved_matching_domain,
-        quality_by_clip=quality_by_clip,
-        anchor_target_log2=_anchor_target_log2_from_array_payload(array_calibration_payload),
-        exposure_anchor_mode=exposure_anchor_mode,
-        manual_target_stops=manual_target_stops,
-        manual_target_ire=manual_target_ire,
-        out_root=out_root,
+    sampling_comparison = (
+        _build_sampling_comparison(analysis_records, out_root=out_root)
+        if resolved_artifact_mode == "debug"
+        else None
+    )
+    solve_comparison = (
+        _build_solve_comparison(
+            analysis_records,
+            target_strategies=resolved_strategies,
+            reference_clip_id=reference_clip_id,
+            hero_clip_id=hero_clip_id,
+            target_type=target_type,
+            matching_domain=resolved_matching_domain,
+            quality_by_clip=quality_by_clip,
+            anchor_target_log2=_anchor_target_log2_from_array_payload(array_calibration_payload),
+            exposure_anchor_mode=exposure_anchor_mode,
+            manual_target_stops=manual_target_stops,
+            manual_target_ire=manual_target_ire,
+            out_root=out_root,
+        )
+        if resolved_artifact_mode == "debug"
+        else None
     )
     recommended_strategy_key = str((ipp2_closed_loop.get("summary") or {}).get("recommended_strategy_key") or "")
     recommended_strategy = next(
@@ -7154,6 +10567,7 @@ def build_contact_sheet_report(
         strategy_rmd_root=str(root / "review_rmd" / "strategies"),
         render_originals=False,
         original_preview_by_clip=analysis_original_preview_by_clip,
+        artifact_mode=resolved_artifact_mode,
     )
     for clip_id, original_path in analysis_original_preview_by_clip.items():
         preview_paths.setdefault(str(clip_id), {}).setdefault("strategies", {})
@@ -7197,6 +10611,7 @@ def build_contact_sheet_report(
                 "display_scalar_log2": float(measurement.get("display_scalar_log2", measurement["log2_luminance"]) or 0.0),
                 "display_scalar_domain": "display_ipp2" if resolved_matching_domain == "perceptual" else "scene_analysis",
                 "measured_log2_luminance": measurement["log2_luminance"],
+                "measured_rgb_chromaticity": [float(value) for value in list(measurement.get("measured_rgb_chromaticity") or [])[:3]],
                 "measured_log2_luminance_monitoring": monitoring_measurements_by_clip.get(clip_id, {}).get(
                     "measured_log2_luminance_monitoring",
                     record.get("diagnostics", {}).get("measured_log2_luminance_monitoring"),
@@ -7327,20 +10742,82 @@ def build_contact_sheet_report(
                             else color_entry.sampling_mode if color_entry
                             else None
                         ),
-                        "confidence": strategy_clip["confidence"],
-                        "flags": strategy_clip["flags"],
-                        "measurement_mode": strategy_clip["measurement_mode"],
-                        "neutral_sample_count": strategy_clip.get("neutral_sample_count"),
-                        "neutral_sample_log2_spread": strategy_clip.get("neutral_sample_log2_spread"),
-                        "neutral_sample_chromaticity_spread": strategy_clip.get("neutral_sample_chromaticity_spread"),
-                        "neutral_samples": strategy_clip.get("neutral_samples"),
-                        "commit_values": strategy_clip.get("commit_values"),
+                    "confidence": strategy_clip["confidence"],
+                    "flags": strategy_clip["flags"],
+                    "measurement_mode": strategy_clip["measurement_mode"],
+                    "gray_target_class": str(
+                        strategy_clip.get("gray_target_class")
+                        or record.get("diagnostics", {}).get("gray_target_class")
+                        or "sphere"
+                    ),
+                    "gray_target_detection_method": str(
+                        strategy_clip.get("gray_target_detection_method")
+                        or record.get("diagnostics", {}).get("gray_target_detection_method")
+                        or ""
+                    ),
+                    "gray_target_confidence": float(
+                        strategy_clip.get("gray_target_confidence", record.get("diagnostics", {}).get("gray_target_confidence", strategy_clip["confidence"]))
+                        or 0.0
+                    ),
+                    "gray_target_fallback_used": bool(
+                        strategy_clip.get("gray_target_fallback_used", record.get("diagnostics", {}).get("gray_target_fallback_used", False))
+                    ),
+                    "sample_plausibility": str(
+                        strategy_clip.get("sample_plausibility")
+                        or record.get("diagnostics", {}).get("sample_plausibility")
+                        or ""
+                    ),
+                    "manual_assist_used": bool(
+                        strategy_clip.get("manual_assist_used", record.get("diagnostics", {}).get("manual_assist_used", False))
+                    ),
+                    "neutral_sample_count": strategy_clip.get("neutral_sample_count"),
+                    "neutral_sample_log2_spread": strategy_clip.get("neutral_sample_log2_spread"),
+                    "neutral_sample_chromaticity_spread": strategy_clip.get("neutral_sample_chromaticity_spread"),
+                    "neutral_samples": strategy_clip.get("neutral_samples"),
+                    "commit_values": strategy_clip.get("commit_values"),
                         "preview_transform": _preview_transform_label(display_preview_settings),
                         "color_preview_applied": bool(color_preview_policy["enabled"]),
                         "color_preview_status": str(color_preview_policy["status"]),
+                        "color_preview_operator_status": str(color_preview_policy["operator_status"]),
                         "color_preview_note": color_preview_policy["note"],
                         "is_hero_camera": strategy_clip["is_hero_camera"],
                     },
+                    "clip_metadata": record.get("clip_metadata"),
+                    "confidence": strategy_clip.get("confidence"),
+                    "measured_rgb_chromaticity": [float(value) for value in list(strategy_clip.get("measured_rgb_chromaticity") or [])[:3]],
+                    "gray_target_class": str(
+                        strategy_clip.get("gray_target_class")
+                        or record.get("diagnostics", {}).get("gray_target_class")
+                        or "sphere"
+                    ),
+                    "gray_target_detection_method": str(
+                        strategy_clip.get("gray_target_detection_method")
+                        or record.get("diagnostics", {}).get("gray_target_detection_method")
+                        or ""
+                    ),
+                    "gray_target_confidence": float(
+                        strategy_clip.get("gray_target_confidence", record.get("diagnostics", {}).get("gray_target_confidence", strategy_clip.get("confidence", 0.0)))
+                        or 0.0
+                    ),
+                    "gray_target_fallback_used": bool(
+                        strategy_clip.get("gray_target_fallback_used", record.get("diagnostics", {}).get("gray_target_fallback_used", False))
+                    ),
+                    "sample_plausibility": str(
+                        strategy_clip.get("sample_plausibility")
+                        or record.get("diagnostics", {}).get("sample_plausibility")
+                        or ""
+                    ),
+                    "manual_assist_used": bool(
+                        strategy_clip.get("manual_assist_used", record.get("diagnostics", {}).get("manual_assist_used", False))
+                    ),
+                    "neutral_sample_count": strategy_clip.get("neutral_sample_count"),
+                    "neutral_sample_log2_spread": strategy_clip.get("neutral_sample_log2_spread"),
+                    "neutral_sample_chromaticity_spread": strategy_clip.get("neutral_sample_chromaticity_spread"),
+                    "pre_color_residual": strategy_clip.get("pre_color_residual"),
+                    "post_color_residual": strategy_clip.get("post_color_residual"),
+                    "white_balance_model_label": strategy_clip.get("white_balance_model_label"),
+                    "white_balance_model": strategy_clip.get("white_balance_model"),
+                    "commit_values": copy.deepcopy(strategy_clip.get("commit_values") or {}),
                 }
             )
         strategies.append(
@@ -7359,6 +10836,7 @@ def build_contact_sheet_report(
                 "anchor_scalar_value": float(strategy_payload.get("anchor_scalar_value", 0.0) or 0.0),
                 "anchor_ire_summary": str(strategy_payload.get("anchor_ire_summary") or "n/a"),
                 "anchor_summary": str(strategy_payload.get("anchor_summary") or ""),
+                "white_balance_model": dict(strategy_payload.get("white_balance_model") or {}),
                 "calibration_roi": calibration_roi or (analysis_records[0].get("diagnostics", {}).get("calibration_roi") if analysis_records else None),
                 "recommended": str(strategy_payload["strategy_key"]) == recommended_strategy_key,
                 "clips": strategy_clips,
@@ -7379,10 +10857,6 @@ def build_contact_sheet_report(
         ),
         "color_preview_policy": preview_manifest_payload.get("color_preview_policy"),
     }
-    corrected_residual_validation = _build_corrected_residual_validation(
-        strategies=strategies,
-        out_root=out_root,
-    )
     ipp2_validation = _build_ipp2_validation(
         input_path=input_path,
         out_root=out_root,
@@ -7395,12 +10869,29 @@ def build_contact_sheet_report(
         display_preview_paths=preview_paths,
         closed_loop_result=ipp2_closed_loop,
     )
-    render_trace_artifacts = _write_render_trace_artifacts(
-        out_root=out_root,
-        analysis_records=analysis_records,
-        strategies=strategies,
-        ipp2_validation_summary=ipp2_validation["summary"],
-        preview_manifest_payload=preview_manifest_payload,
+    corrected_residual_validation = (
+        _build_corrected_residual_validation(
+            strategies=strategies,
+            out_root=out_root,
+        )
+        if resolved_artifact_mode == "debug"
+        else {"path": "", "summary": {"rows": []}}
+    )
+    render_trace_artifacts = (
+        _write_render_trace_artifacts(
+            out_root=out_root,
+            analysis_records=analysis_records,
+            strategies=strategies,
+            ipp2_validation_summary=ipp2_validation["summary"],
+            preview_manifest_payload=preview_manifest_payload,
+        )
+        if resolved_artifact_mode == "debug"
+        else {
+            "render_input_state_path": "",
+            "pre_render_log_values_path": "",
+            "post_render_ipp2_values_path": "",
+            "render_trace_comparison_path": "",
+        }
     )
     sphere_detection_artifacts = _build_sphere_detection_artifacts(
         out_root=out_root,
@@ -7425,6 +10916,27 @@ def build_contact_sheet_report(
             clip["ipp2_validation"] = dict(
                 ipp2_lookup.get((str(strategy.get("strategy_key") or ""), str(clip.get("clip_id") or ""))) or {}
             )
+            upgraded_trust = _upgrade_trust_from_ipp2_validation(
+                {
+                    "trust_class": clip.get("trust_class"),
+                    "trust_score": clip.get("trust_score"),
+                    "trust_reason": clip.get("trust_reason"),
+                    "stability_label": clip.get("stability_label"),
+                    "correction_confidence": clip.get("correction_confidence"),
+                    "reference_use": clip.get("reference_use"),
+                    "screened_reasons": clip.get("screened_reasons"),
+                },
+                ipp2_validation=dict(clip.get("ipp2_validation") or {}),
+                gray_target_class=str(clip.get("gray_target_class") or ""),
+                sample_plausibility=str(clip.get("sample_plausibility") or ""),
+            )
+            clip["trust_class"] = str(upgraded_trust.get("trust_class") or clip.get("trust_class") or "UNTRUSTED")
+            clip["trust_score"] = float(upgraded_trust.get("trust_score", clip.get("trust_score", 0.0)) or 0.0)
+            clip["trust_reason"] = str(upgraded_trust.get("trust_reason") or clip.get("trust_reason") or "")
+            clip["stability_label"] = str(upgraded_trust.get("stability_label") or clip.get("stability_label") or "")
+            clip["correction_confidence"] = str(upgraded_trust.get("correction_confidence") or clip.get("correction_confidence") or "")
+            clip["reference_use"] = str(upgraded_trust.get("reference_use") or clip.get("reference_use") or "Included")
+            clip["screened_reasons"] = list(upgraded_trust.get("screened_reasons") or clip.get("screened_reasons") or [])
         strategy_target_profile = next(
             (
                 str((clip.get("ipp2_validation") or {}).get("ipp2_target_gray_exposure_summary") or "")
@@ -7461,9 +10973,15 @@ def build_contact_sheet_report(
         "measurement_preview_transform": _preview_transform_label(measurement_preview_settings),
         "color_preview_enabled": bool(color_preview_policy["enabled"]),
         "color_preview_status": str(color_preview_policy["status"]),
+        "color_preview_operator_status": str(color_preview_policy["operator_status"]),
         "color_preview_note": color_preview_policy["note"],
         "exposure_measurement_domain": resolved_matching_domain,
         "preview_mode": display_preview_settings["preview_mode"],
+        "preview_still_format": str(display_preview_settings.get("preview_still_format") or DEFAULT_PREVIEW_STILL_FORMAT),
+        "report_focus": resolved_report_focus,
+        "report_focus_label": report_focus_label(resolved_report_focus),
+        "artifact_mode": resolved_artifact_mode,
+        "artifact_mode_label": artifact_mode_label(resolved_artifact_mode),
         "preview_settings": display_preview_settings,
         "measurement_preview_settings": measurement_preview_settings,
         "redline_capabilities": redline_capabilities,
@@ -7521,6 +11039,7 @@ def build_contact_sheet_report(
                 "n/a",
             ),
             "summary": item.get("strategy_summary"),
+            "white_balance_model": dict(item.get("white_balance_model") or {}),
             "correction_metrics": _strategy_distribution_metrics(item),
         }
         for item in strategy_payloads
@@ -7541,12 +11060,13 @@ def build_contact_sheet_report(
     )
     payload["anchor_ire_summary"] = str((recommended_strategy_section or {}).get("anchor_ire_summary") or (recommended_strategy or {}).get("anchor_ire_summary") or "n/a")
     payload["exposure_anchor_summary"] = str((recommended_strategy_section or {}).get("anchor_summary") or (recommended_strategy or {}).get("anchor_summary") or "")
+    payload["white_balance_model"] = dict((recommended_strategy_section or {}).get("white_balance_model") or {})
     payload["strategy_comparison"] = strategy_summaries
     payload["visuals"] = {
         "exposure_plot_svg": _build_exposure_plot_svg((recommended_strategy_section or {}).get("clips", [])),
-        "strategy_chart_svg": _build_strategy_chart_svg(strategy_summaries),
+        "strategy_chart_svg": _build_strategy_chart_svg(strategy_summaries) if _strategy_chart_is_informative(strategy_summaries) else "",
     }
-    if strategy_payloads:
+    if strategy_payloads and resolved_artifact_mode == "debug":
         recommended_payload = next(
             item for item in strategy_payloads if str(item.get("strategy_key") or "") == str((payload["recommended_strategy"] or {}).get("strategy_key") or "")
         )
@@ -7557,12 +11077,69 @@ def build_contact_sheet_report(
             exposure_summary=payload["exposure_summary"],
             out_root=out_root,
         )
+    else:
+        payload["debug_exposure_trace"] = None
     payload["executive_synopsis"] = _build_lightweight_synopsis(
         exposure_summary=payload["exposure_summary"],
         strategy_summaries=strategy_summaries,
         recommended_strategy=payload["recommended_strategy"] or {"reason": "No recommendation available."},
         hero_summary=payload["hero_recommendation"],
     ) if strategy_payloads else ""
+    recommended_strategy_clips = [
+        copy.deepcopy(item)
+        for item in list((recommended_strategy_section or {}).get("clips") or [])
+    ]
+    payload["per_camera_analysis"] = recommended_strategy_clips
+    focus_validation_artifacts = (
+        _build_focus_validation_artifacts(
+            out_root=out_root,
+            per_camera_rows=recommended_strategy_clips,
+            shared_originals=shared_originals,
+            progress_path=progress_path,
+        )
+        if bool(focus_validation)
+        else {
+            "summary": {
+                "enabled": False,
+                "status": "disabled",
+                "reason": "Focus validation is disabled for this run.",
+                "rows": [],
+                "tiff_is_sufficient": False,
+                "confidence": "high",
+            },
+            "path": "",
+            "overlay_root": "",
+        }
+    )
+    payload["focus_validation"] = dict(focus_validation_artifacts.get("summary") or {})
+    payload["focus_validation_path"] = str(focus_validation_artifacts.get("path") or "")
+    payload["focus_validation_overlay_root"] = str(focus_validation_artifacts.get("overlay_root") or "")
+    focus_rows_by_clip = {
+        str(item.get("clip_id") or ""): dict(item)
+        for item in list((payload.get("focus_validation") or {}).get("rows") or [])
+        if str(item.get("clip_id") or "").strip()
+    }
+    for item in recommended_strategy_clips:
+        clip_id = str(item.get("clip_id") or "")
+        item["focus_validation"] = dict(focus_rows_by_clip.get(clip_id) or {})
+    run_assessment = _build_run_assessment(
+        per_camera_rows=recommended_strategy_clips,
+        recommended_payload=payload["recommended_strategy"] or {},
+        strategy_summaries=strategy_summaries,
+        exposure_summary=payload["exposure_summary"],
+    )
+    payload["run_assessment"] = run_assessment
+    payload["gray_target_consistency"] = dict(run_assessment.get("gray_target_consistency") or {})
+    payload["operator_recommendation"] = str(run_assessment.get("operator_note") or "")
+    scientific_validation = _build_scientific_validation_artifacts(
+        out_root=out_root,
+        analysis_records=analysis_records,
+        payload=payload,
+        fail_on_analysis_drift=True,
+    )
+    payload["scientific_validation"] = scientific_validation["summary"]
+    payload["scientific_validation_path"] = scientific_validation["path"]
+    payload["scientific_validation_markdown_path"] = scientific_validation["markdown_path"]
     json_path = out_root / "contact_sheet.json"
     html_path = out_root / "contact_sheet.html"
     debug_json_path = out_root / "contact_sheet_debug.json"
@@ -7603,6 +11180,11 @@ def build_contact_sheet_report(
                     "color_preview_status": payload["color_preview_status"],
                     "color_preview_note": payload["color_preview_note"],
                     "preview_mode": payload["preview_mode"],
+                    "preview_still_format": payload["preview_still_format"],
+                    "report_focus": payload["report_focus"],
+                    "report_focus_label": payload["report_focus_label"],
+                    "artifact_mode": payload["artifact_mode"],
+                    "artifact_mode_label": payload["artifact_mode_label"],
                     "preview_settings": payload["preview_settings"],
                     "measurement_preview_settings": payload["measurement_preview_settings"],
                     "redline_capabilities": payload["redline_capabilities"],
@@ -7616,6 +11198,8 @@ def build_contact_sheet_report(
                     "clip_count": payload["clip_count"],
                     "sphere_detection_summary_path": payload["sphere_detection_summary_path"],
                     "sphere_detection_overlay_root": payload["sphere_detection_overlay_root"],
+                    "scientific_validation_path": payload["scientific_validation_path"],
+                    "scientific_validation_markdown_path": payload["scientific_validation_markdown_path"],
                     "report_json": str(json_path),
                     "report_html": str(html_path),
                     "contact_sheet_debug": str(debug_json_path),
@@ -7646,6 +11230,11 @@ def build_contact_sheet_report(
         "review_mode": "full_contact_sheet",
         "review_mode_label": review_mode_label("full_contact_sheet"),
         "preview_mode": payload["preview_mode"],
+        "preview_still_format": payload["preview_still_format"],
+        "report_focus": payload["report_focus"],
+        "report_focus_label": payload["report_focus_label"],
+        "artifact_mode": payload["artifact_mode"],
+        "artifact_mode_label": payload["artifact_mode_label"],
         "preview_settings": payload["preview_settings"],
         "measurement_preview_settings": payload["measurement_preview_settings"],
         "redline_capabilities": payload["redline_capabilities"],
@@ -7657,6 +11246,14 @@ def build_contact_sheet_report(
         "render_trace_comparison_path": payload["render_trace_comparison_path"],
         "sphere_detection_summary_path": payload["sphere_detection_summary_path"],
         "sphere_detection_overlay_root": payload["sphere_detection_overlay_root"],
+        "scientific_validation_path": payload["scientific_validation_path"],
+        "scientific_validation_markdown_path": payload["scientific_validation_markdown_path"],
+        "recommended_strategy": payload.get("recommended_strategy"),
+        "hero_recommendation": payload.get("hero_recommendation"),
+        "white_balance_model": payload.get("white_balance_model"),
+        "run_assessment": payload.get("run_assessment"),
+        "gray_target_consistency": payload.get("gray_target_consistency"),
+        "operator_recommendation": payload.get("operator_recommendation"),
     }
 
 
@@ -7704,6 +11301,9 @@ def build_review_package(
     preview_highlight_rolloff: Optional[str] = None,
     preview_shadow_rolloff: Optional[str] = None,
     preview_lut: Optional[str] = None,
+    preview_still_format: str = DEFAULT_PREVIEW_STILL_FORMAT,
+    report_focus: str = "auto",
+    artifact_mode: str = DEFAULT_ARTIFACT_MODE,
     calibration_roi: Optional[Dict[str, float]] = None,
     target_strategies: Optional[List[str]] = None,
     reference_clip_id: Optional[str] = None,
@@ -7712,13 +11312,15 @@ def build_review_package(
     manual_target_stops: Optional[float] = None,
     manual_target_ire: Optional[float] = None,
     require_real_redline: bool = False,
+    focus_validation: bool = False,
     progress_path: Optional[str] = None,
 ) -> Dict[str, object]:
     raise_if_cancelled("Run cancelled before review package assembly.")
     root = Path(out_dir).expanduser().resolve()
     report_dir = root / "report"
     review_rmd_dir = root / "review_rmd"
-    rcx_compare_note = _write_rcx_comparison_placeholder(root)
+    resolved_artifact_mode = normalize_artifact_mode(artifact_mode)
+    rcx_compare_note = _write_rcx_comparison_placeholder(root) if resolved_artifact_mode == "debug" else None
     resolved_review_mode = normalize_review_mode(review_mode)
     if resolved_review_mode == "lightweight_analysis":
         report_payload = build_lightweight_analysis_report(
@@ -7741,6 +11343,8 @@ def build_review_package(
             exposure_anchor_mode=exposure_anchor_mode,
             manual_target_stops=manual_target_stops,
             manual_target_ire=manual_target_ire,
+            preview_still_format=preview_still_format,
+            artifact_mode=artifact_mode,
             clear_cache=False,
             progress_path=progress_path,
         )
@@ -7766,6 +11370,9 @@ def build_review_package(
             preview_highlight_rolloff=preview_highlight_rolloff,
             preview_shadow_rolloff=preview_shadow_rolloff,
             preview_lut=preview_lut,
+            preview_still_format=preview_still_format,
+            report_focus=report_focus,
+            artifact_mode=artifact_mode,
             calibration_roi=calibration_roi,
             target_strategies=target_strategies,
             reference_clip_id=reference_clip_id,
@@ -7775,6 +11382,7 @@ def build_review_package(
             manual_target_ire=manual_target_ire,
             clear_cache=True,
             require_real_redline=require_real_redline,
+            focus_validation=focus_validation,
             progress_path=progress_path,
         )
     if resolved_review_mode == "lightweight_analysis":
@@ -7784,8 +11392,16 @@ def build_review_package(
             "review_rmd_dir": str(review_rmd_dir),
         }
     else:
-        raise_if_cancelled("Run cancelled before writing temporary review RMDs.")
-        rmd_manifest = write_rmds_from_analysis(out_dir, out_dir=str(review_rmd_dir))
+        if resolved_artifact_mode == "debug":
+            raise_if_cancelled("Run cancelled before writing temporary review RMDs.")
+            rmd_manifest = write_rmds_from_analysis(out_dir, out_dir=str(review_rmd_dir))
+        else:
+            rmd_manifest = {
+                "skipped": True,
+                "reason": "Production mode keeps strategy preview RMDs for reproducible renders but skips extra clip-level review RMD exports.",
+                "review_rmd_dir": str(review_rmd_dir),
+                "strategy_review_rmd_root": str((review_rmd_dir / "strategies").resolve()),
+            }
     package_manifest = {
         "workflow_phase": "review",
         "review_mode": resolved_review_mode,
@@ -7805,6 +11421,26 @@ def build_review_package(
         "preview_transform": report_payload.get("preview_transform"),
         "measurement_preview_transform": report_payload.get("measurement_preview_transform"),
         "preview_mode": preview_mode,
+        "preview_still_format": normalize_preview_still_format(preview_still_format),
+        "focus_validation_enabled": bool(focus_validation),
+        "report_focus": normalize_report_focus(report_focus),
+        "report_focus_label": report_focus_label(report_focus),
+        "artifact_mode": resolved_artifact_mode,
+        "artifact_mode_label": artifact_mode_label(artifact_mode),
+        "artifact_policy": {
+            "sidecars": {
+                "default_mode": "production_required",
+                "reason": "Generated sidecars remain the canonical per-camera analysis payload for reproducibility, validation, and downstream apply/transcode paths.",
+            },
+            "review_rmd": {
+                "default_mode": "strategy_previews_only",
+                "reason": "Production runs retain strategy preview RMDs used to reproduce rendered review stills, but clip-level review RMD exports are reserved for debug mode.",
+            },
+            "rmd_compare": {
+                "default_mode": "debug_only",
+                "reason": "RCX parity scratch space is diagnostic-only and no longer clutters default production runs.",
+            },
+        },
         "preview_settings": report_payload.get("preview_settings"),
         "measurement_preview_settings": report_payload.get("measurement_preview_settings"),
         "redline_capabilities": report_payload.get("redline_capabilities"),
@@ -7824,6 +11460,12 @@ def build_review_package(
         "review_manifest": report_payload["review_manifest"],
         "clip_count": report_payload["clip_count"],
         "temporary_rmd_manifest": rmd_manifest,
+        "recommended_strategy": report_payload.get("recommended_strategy"),
+        "hero_recommendation": report_payload.get("hero_recommendation"),
+        "white_balance_model": report_payload.get("white_balance_model"),
+        "run_assessment": report_payload.get("run_assessment"),
+        "gray_target_consistency": report_payload.get("gray_target_consistency"),
+        "operator_recommendation": report_payload.get("operator_recommendation"),
     }
     manifest_path = report_dir / "review_package.json"
     manifest_path.write_text(json.dumps(package_manifest, indent=2), encoding="utf-8")
@@ -8176,6 +11818,377 @@ def _contact_sheet_goal_achieved(entries: List[Dict[str, object]], goal_stops: f
     return all(float(item.get("residual_abs_stops", 0.0) or 0.0) <= goal_stops for item in entries)
 
 
+def _camera_layout_sort_key(label: str) -> tuple[str, str]:
+    text = str(label or "").strip().upper()
+    match = re.match(r"([A-Z]+)(\d+)?", text)
+    if not match:
+        return (text, "")
+    prefix = str(match.group(1) or "")
+    suffix = str(match.group(2) or "")
+    suffix_key = f"{int(suffix):04d}" if suffix.isdigit() else ""
+    return (prefix, suffix_key)
+
+
+def _contact_sheet_attention_class(entry: Dict[str, object]) -> str:
+    if str(entry.get("reference_use") or "Included") == "Excluded":
+        return "outlier"
+    if str(entry.get("trust_class") or "") in {"EXCLUDED", "UNTRUSTED"}:
+        return "outlier"
+    if float(entry.get("residual_abs_stops", 0.0) or 0.0) > IPP2_VALIDATION_REVIEW_STOPS:
+        return "outlier"
+    if bool(entry.get("fallback_used")):
+        return "borderline"
+    if float(entry.get("residual_abs_stops", 0.0) or 0.0) > IPP2_VALIDATION_PASS_STOPS:
+        return "borderline"
+    if str(entry.get("trust_class") or "") == "USE_WITH_CAUTION":
+        return "borderline"
+    return "safe"
+
+
+def _contact_sheet_original_cast_label(amber_blue: float, green_magenta: float) -> str:
+    temperature = "near-neutral"
+    tint = "neutral"
+    if amber_blue > 0.03:
+        temperature = "cool / blue"
+    elif amber_blue < -0.03:
+        temperature = "warm / amber"
+    if green_magenta > 0.02:
+        tint = "green"
+    elif green_magenta < -0.02:
+        tint = "magenta"
+    if temperature == "near-neutral" and tint == "neutral":
+        return "Near neutral in the original still"
+    if tint == "neutral":
+        return f"{temperature.title()} bias"
+    if temperature == "near-neutral":
+        return f"{tint.title()} bias"
+    return f"{temperature.title()} with {tint} bias"
+
+
+def _contact_sheet_stability_summary(
+    *,
+    confidence: Optional[float],
+    log2_spread: Optional[float],
+    chroma_spread: Optional[float],
+    sample_count: Optional[int],
+) -> str:
+    notes: List[str] = []
+    if sample_count is not None and int(sample_count) > 0:
+        notes.append(f"{int(sample_count)} neutral samples")
+    if confidence is not None:
+        notes.append(f"confidence {float(confidence):.2f}")
+    if log2_spread is not None:
+        notes.append(f"log2 spread {float(log2_spread):.3f}")
+    if chroma_spread is not None:
+        notes.append(f"chroma spread {float(chroma_spread):.4f}")
+    return " | ".join(notes) if notes else "Stored original-still stability summary is not available."
+
+
+def _contact_sheet_has_meaningful_text(value: object, *, blocked_prefixes: Tuple[str, ...] = ()) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if "not available" in lowered or "not stored" in lowered or "no stored" in lowered or lowered == "n/a":
+        return False
+    return not any(lowered.startswith(prefix.lower()) for prefix in blocked_prefixes)
+
+
+def _contact_sheet_exposure_direction_label(offset_stops: float) -> str:
+    offset = float(offset_stops or 0.0)
+    if offset >= 0.05:
+        return f"↑ Lift {offset:+.2f} stops"
+    if offset <= -0.05:
+        return f"↓ Lower {offset:+.2f} stops"
+    return f"≈ Hold {offset:+.2f} stops"
+
+
+def _contact_sheet_overview_status(entry: Dict[str, object]) -> Tuple[str, str]:
+    attention = str(entry.get("attention_class") or "safe")
+    if str(entry.get("reference_use") or "Included") == "Excluded" or attention == "outlier":
+        return ("Excluded / Outlier", "danger")
+    if attention == "borderline":
+        return ("Needs Attention", "warning")
+    if bool(entry.get("is_anchor_reference")):
+        return ("Exposure Anchor", "info")
+    return ("Retained", "good")
+
+
+def _contact_sheet_reference_role_label(reference_use: object) -> str:
+    normalized = str(reference_use or "Included").strip() or "Included"
+    mapping = {
+        "Included": "Included in the solve",
+        "Excluded": "Excluded from the solve",
+        "Anchor": "Exposure anchor",
+    }
+    return mapping.get(normalized, normalized)
+
+
+def _contact_sheet_measurement_source_label(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "Stored measurement payload"
+    lowered = text.lower().replace("_", " ")
+    mapping = {
+        "shared original.display scalar log2": "Stored original gray measurement",
+        "shared original": "Stored original gray measurement",
+        "stored measurement payload": "Stored gray measurement",
+        "rendered preview ipp2": "Rendered gray measurement",
+        "median sample log2": "Neutral target measurement",
+    }
+    return mapping.get(lowered, text.replace("_", " "))
+
+
+def _contact_sheet_target_class_label(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    return {
+        "sphere": "Gray sphere",
+        "gray_card": "Gray card",
+        "unresolved": "Gray target unresolved",
+    }.get(normalized, "Gray target")
+
+
+def _contact_sheet_chromaticity_visual(measured_rgb: List[float]) -> str:
+    if len(measured_rgb) != 3:
+        return ""
+    red, green, blue = [float(value) for value in measured_rgb[:3]]
+    warm_cool = max(-0.08, min(0.08, red - blue))
+    green_magenta = max(-0.08, min(0.08, ((red + blue) * 0.5) - green))
+    width = 236
+    height = 138
+    pad_x = 26
+    pad_y = 18
+    center_x = width / 2.0
+    center_y = height / 2.0
+    scale = 720.0
+    point_x = center_x + (warm_cool * scale)
+    point_y = center_y - (green_magenta * scale)
+    return (
+        f"<svg viewBox='0 0 {width} {height}' role='img' aria-label='Neutral chromaticity placement'>"
+        f"<rect x='0' y='0' width='{width}' height='{height}' rx='14' fill='#f8fafc' stroke='#d7dee8'/>"
+        f"<circle cx='{center_x:.1f}' cy='{center_y:.1f}' r='26' fill='#f1f5f9' stroke='#e2e8f0' stroke-width='1.5'/>"
+        f"<line x1='{pad_x}' y1='{center_y:.1f}' x2='{width - pad_x}' y2='{center_y:.1f}' stroke='#cbd5e1' stroke-width='2'/>"
+        f"<line x1='{center_x:.1f}' y1='{pad_y}' x2='{center_x:.1f}' y2='{height - pad_y}' stroke='#cbd5e1' stroke-width='2'/>"
+        f"<circle cx='{center_x:.1f}' cy='{center_y:.1f}' r='7' fill='white' stroke='#0f172a' stroke-width='2.5'/>"
+        f"<line x1='{center_x - 10:.1f}' y1='{center_y:.1f}' x2='{center_x + 10:.1f}' y2='{center_y:.1f}' stroke='#0f172a' stroke-width='1.5'/>"
+        f"<line x1='{center_x:.1f}' y1='{center_y - 10:.1f}' x2='{center_x:.1f}' y2='{center_y + 10:.1f}' stroke='#0f172a' stroke-width='1.5'/>"
+        f"<circle cx='{point_x:.1f}' cy='{point_y:.1f}' r='9' fill='#2563eb' stroke='white' stroke-width='2.5'/>"
+        f"<circle cx='{point_x:.1f}' cy='{point_y:.1f}' r='14' fill='none' stroke='#93c5fd' stroke-width='2' stroke-opacity='0.75'/>"
+        f"<text x='{pad_x:.1f}' y='16' fill='#64748b' font-size='11' font-weight='700'>Green</text>"
+        f"<text x='{pad_x:.1f}' y='{height - 8}' fill='#64748b' font-size='11' font-weight='700'>Magenta</text>"
+        f"<text x='{pad_x:.1f}' y='{center_y - 8:.1f}' fill='#64748b' font-size='11' font-weight='700'>Warm</text>"
+        f"<text x='{width - pad_x:.1f}' y='{center_y - 8:.1f}' text-anchor='end' fill='#64748b' font-size='11' font-weight='700'>Cool</text>"
+        f"<text x='{center_x:.1f}' y='{height - 8}' text-anchor='middle' fill='#0f172a' font-size='11' font-weight='700'>Measured neutral placement</text>"
+        "</svg>"
+    )
+
+
+def _gray_target_consistency_summary(rows: List[Dict[str, object]]) -> Dict[str, object]:
+    tracked_rows = []
+    for row in list(rows or []):
+        reference_use = str(row.get("reference_use") or "Included")
+        trust_class = str(row.get("trust_class") or "")
+        if reference_use == "Excluded" or trust_class in {"EXCLUDED", "UNTRUSTED"}:
+            continue
+        target_class = str(row.get("gray_target_class") or "unresolved").strip().lower()
+        tracked_rows.append(
+            {
+                "clip_id": str(row.get("clip_id") or ""),
+                "camera_label": str(row.get("camera_label") or row.get("clip_id") or ""),
+                "target_class": target_class if target_class in {"sphere", "gray_card"} else "unresolved",
+            }
+        )
+    counts = {"sphere": 0, "gray_card": 0, "unresolved": 0}
+    for item in tracked_rows:
+        counts[str(item["target_class"])] = counts.get(str(item["target_class"]), 0) + 1
+    dominant = "unresolved"
+    dominant_count = -1
+    for target_class in ("sphere", "gray_card", "unresolved"):
+        if counts[target_class] > dominant_count:
+            dominant = target_class
+            dominant_count = counts[target_class]
+    mixed = counts["sphere"] > 0 and counts["gray_card"] > 0
+    non_dominant = [
+        item
+        for item in tracked_rows
+        if str(item.get("target_class") or "") in {"sphere", "gray_card"} and str(item.get("target_class") or "") != dominant
+    ]
+    summary = (
+        "Retained cameras consistently measured the gray sphere."
+        if dominant == "sphere" and not mixed
+        else "Retained cameras consistently used gray-card fallback."
+        if dominant == "gray_card" and not mixed
+        else "Retained cameras mix gray-sphere and gray-card solves. Review is required before commit."
+        if mixed
+        else "Gray target class could not be established for the retained set."
+    )
+    return {
+        "dominant_target_class": dominant,
+        "counts": counts,
+        "mixed_target_classes": mixed,
+        "non_dominant_clip_ids": [str(item.get("clip_id") or "") for item in non_dominant if str(item.get("clip_id") or "").strip()],
+        "non_dominant_camera_labels": [str(item.get("camera_label") or "") for item in non_dominant if str(item.get("camera_label") or "").strip()],
+        "summary": summary,
+        "commit_blocked": mixed,
+    }
+
+
+def _contact_sheet_flag_label(flag: str) -> str:
+    normalized = str(flag or "").strip()
+    mapping = {
+        "Fallback used": "Alternate detection path used",
+        "Residual > ±0.02": "Residual exceeds ±0.02 stops",
+        "Uneven sample profile": "Sample profile varies across the sphere",
+        "No anomaly flags": "No anomaly flags",
+        "Excluded": "Excluded from the solve",
+        "Included": "Included in the solve",
+    }
+    return mapping.get(normalized, normalized)
+
+
+def _contact_sheet_original_wb_block(
+    *,
+    clip: Dict[str, object],
+    clip_metadata: Dict[str, object],
+    top_level_wb_model: Dict[str, object],
+) -> Dict[str, object]:
+    metrics = dict(clip.get("metrics") or {})
+    as_shot = extract_as_shot_white_balance(clip_metadata if clip_metadata else None)
+    pre_residual = clip.get("pre_color_residual")
+    if pre_residual is None:
+        pre_residual = metrics.get("color", {}).get("pre_residual") if isinstance(metrics.get("color"), dict) else None
+    source_kind = "metadata_context"
+    source_label = "Using camera capture settings"
+    measured_rgb_payload = clip.get("measured_rgb_chromaticity")
+    if not measured_rgb_payload and isinstance(metrics.get("measurement"), dict):
+        measured_rgb_payload = metrics.get("measurement", {}).get("measured_rgb_chromaticity")
+    measured_rgb = [float(value) for value in list(measured_rgb_payload or [])[:3]]
+    commit_values = dict(clip.get("commit_values") or metrics.get("commit_values") or {})
+    axes = dict(commit_values.get("white_balance_axes") or clip.get("white_balance_axes") or {})
+    amber_blue = float(axes.get("amber_blue", 0.0) or 0.0)
+    green_magenta = float(axes.get("green_magenta", 0.0) or 0.0)
+    if measured_rgb:
+        source_kind = "measured_original_still"
+        source_label = "Measured from the original neutral target"
+    elif pre_residual is not None or str(clip.get("white_balance_model_label") or metrics.get("white_balance_model_label") or "").strip():
+        source_kind = "measured_or_solved"
+        source_label = "Using stored white-balance analysis"
+    shared_kelvin_mode = str((top_level_wb_model or {}).get("shared_kelvin_mode") or "")
+    shared_tint_mode = str((top_level_wb_model or {}).get("shared_tint_mode") or "")
+    shared_kelvin = (top_level_wb_model or {}).get("shared_kelvin")
+    shared_tint = (top_level_wb_model or {}).get("shared_tint")
+    context_bits: List[str] = []
+    model_label = str(
+        clip.get("white_balance_model_label")
+        or metrics.get("white_balance_model_label")
+        or (top_level_wb_model or {}).get("model_label")
+        or ""
+    ).strip()
+    if model_label and model_label != "n/a":
+        context_bits.append(model_label)
+    if shared_kelvin_mode == "shared" and shared_kelvin is not None:
+        context_bits.append(f"Shared Kelvin {int(round(float(shared_kelvin)))}K")
+    elif shared_kelvin_mode == "per_camera":
+        context_bits.append("Kelvin varies per camera")
+    if shared_tint_mode == "shared" and shared_tint is not None:
+        context_bits.append(f"Shared Tint {float(shared_tint):+.1f}")
+    elif shared_tint_mode == "per_camera":
+        context_bits.append("Tint varies per camera")
+    as_shot_kelvin = as_shot.get("kelvin")
+    as_shot_tint = as_shot.get("tint")
+    chroma_summary = (
+        f"R {measured_rgb[0]:.3f} / G {measured_rgb[1]:.3f} / B {measured_rgb[2]:.3f}"
+        if len(measured_rgb) == 3
+        else "Stored original neutral sample is not available."
+    )
+    gray_target_class = str(
+        clip.get("gray_target_class")
+        or metrics.get("gray_target_class")
+        or ((metrics.get("exposure") or {}).get("gray_target_class") if isinstance(metrics.get("exposure"), dict) else "")
+        or "sphere"
+    )
+    gray_target_confidence = float(
+        clip.get("gray_target_confidence")
+        or metrics.get("gray_target_confidence")
+        or ((metrics.get("exposure") or {}).get("gray_target_confidence") if isinstance(metrics.get("exposure"), dict) else 0.0)
+        or clip.get("confidence")
+        or metrics.get("confidence")
+        or 0.0
+    )
+    stability_summary = _contact_sheet_stability_summary(
+        confidence=(clip.get("confidence") or metrics.get("confidence")),
+        log2_spread=(clip.get("neutral_sample_log2_spread") or metrics.get("neutral_sample_log2_spread")),
+        chroma_spread=(clip.get("neutral_sample_chromaticity_spread") or metrics.get("neutral_sample_chromaticity_spread")),
+        sample_count=(clip.get("neutral_sample_count") or metrics.get("neutral_sample_count")),
+    )
+    wb_context = " | ".join(context_bits) if context_bits else "Stored array white-balance context is limited for this camera."
+    return {
+        "source_kind": source_kind,
+        "source_label": source_label,
+        "as_shot_kelvin": (int(round(float(as_shot_kelvin))) if as_shot_kelvin is not None else None),
+        "as_shot_tint": (float(as_shot_tint) if as_shot_tint is not None else None),
+        "pre_neutral_residual": (float(pre_residual) if pre_residual is not None else None),
+        "derived_cast": _contact_sheet_original_cast_label(amber_blue, green_magenta) if measured_rgb or axes else "A derived original-still cast was not stored for this camera.",
+        "derived_axes": {
+            "amber_blue": amber_blue,
+            "green_magenta": green_magenta,
+        },
+        "chroma_summary": chroma_summary,
+        "context": wb_context,
+        "gray_target_class": gray_target_class,
+        "gray_target_label": _contact_sheet_target_class_label(gray_target_class),
+        "gray_target_confidence": gray_target_confidence,
+        "stability_summary": stability_summary,
+        "chromaticity_chart_svg": _contact_sheet_chromaticity_visual(measured_rgb),
+        "has_chroma_summary": len(measured_rgb) == 3,
+        "has_context_summary": _contact_sheet_has_meaningful_text(wb_context),
+        "has_stability_summary": _contact_sheet_has_meaningful_text(stability_summary),
+        "has_derived_cast": _contact_sheet_has_meaningful_text(
+            _contact_sheet_original_cast_label(amber_blue, green_magenta) if measured_rgb or axes else ""
+        ),
+    }
+
+
+def _contact_sheet_array_focus_entries(
+    entries: List[Dict[str, object]],
+    *,
+    focus_mode: str,
+    reference_candidate: Optional[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    normalized = normalize_report_focus(focus_mode)
+    if normalized == "full":
+        return list(entries)
+    anchors: List[Dict[str, object]] = []
+    if reference_candidate is not None:
+        anchors.append(reference_candidate)
+    anchors.extend(item for item in entries if bool(item.get("is_hero_camera")))
+    unique_by_clip = {str(item.get("clip_id") or ""): item for item in anchors if str(item.get("clip_id") or "").strip()}
+    anchors = list(unique_by_clip.values())
+    retained = [item for item in entries if str(item.get("reference_use") or "Included") != "Excluded"]
+    cluster_extremes: List[Dict[str, object]] = []
+    if retained:
+        low = min(retained, key=lambda item: float(item.get("offset_to_anchor", 0.0) or 0.0))
+        high = max(retained, key=lambda item: float(item.get("offset_to_anchor", 0.0) or 0.0))
+        cluster_extremes = [low] if str(low.get("clip_id") or "") == str(high.get("clip_id") or "") else [low, high]
+    outliers = [item for item in entries if _contact_sheet_attention_class(item) == "outlier"]
+    if normalized == "outliers":
+        selected = outliers
+    elif normalized == "anchors":
+        selected = anchors
+    elif normalized == "cluster_extremes":
+        selected = cluster_extremes
+    else:
+        selected = [*outliers, *anchors, *cluster_extremes]
+    if not selected:
+        selected = sorted(entries, key=lambda item: float(item.get("residual_abs_stops", 0.0) or 0.0), reverse=True)[: min(6, len(entries))]
+    ordered: Dict[str, Dict[str, object]] = {}
+    for item in selected:
+        clip_id = str(item.get("clip_id") or "")
+        if clip_id:
+            ordered[clip_id] = item
+    return list(ordered.values())
+
+
 def _contact_sheet_chunks(entries: List[Dict[str, object]], *, columns: int = 2, max_rows: int = 2) -> List[List[Dict[str, object]]]:
     page_size = max(1, int(columns) * int(max_rows))
     if not entries:
@@ -8409,6 +12422,96 @@ def _contact_sheet_svg_color_deviation_chart(
     )
 
 
+def _contact_sheet_svg_exposure_offset_lollipop(entries: List[Dict[str, object]]) -> str:
+    if not entries:
+        return ""
+    ordered = sorted(
+        list(entries),
+        key=lambda item: abs(float(item.get("offset_to_anchor", 0.0) or 0.0)),
+        reverse=True,
+    )
+    width = 1080
+    row_height = 44
+    height = max(220, 120 + row_height * len(ordered))
+    margin_left = 220
+    margin_right = 46
+    margin_top = 42
+    margin_bottom = 36
+    plot_width = width - margin_left - margin_right
+    plot_height = height - margin_top - margin_bottom
+    offsets = [abs(float(item.get("offset_to_anchor", 0.0) or 0.0)) for item in ordered]
+    max_abs_offset = max(offsets) if offsets else 0.0
+    focus_abs_offset = float(np.quantile(np.asarray(offsets, dtype=np.float32), 0.85)) if offsets else 0.0
+    axis_max = max(0.20, focus_abs_offset + 0.05)
+    if max_abs_offset <= 0.60:
+        axis_max = max(axis_max, max_abs_offset + 0.05)
+    axis_max = min(0.75, axis_max)
+    axis_max = max(0.20, round(axis_max / 0.05) * 0.05)
+
+    def x_for(value: float) -> float:
+        clipped = max(-axis_max, min(axis_max, float(value)))
+        normalized = (clipped + axis_max) / (axis_max * 2.0)
+        return margin_left + (normalized * plot_width)
+
+    zero_x = x_for(0.0)
+    guides = [
+        f"<line x1='{zero_x:.1f}' y1='{margin_top - 8:.1f}' x2='{zero_x:.1f}' y2='{height - margin_bottom + 6:.1f}' stroke='#475569' stroke-width='2.5' />"
+    ]
+    tick = -axis_max
+    while tick <= axis_max + 1e-9:
+        x = x_for(tick)
+        is_major = math.isclose((tick / 0.10) - round(tick / 0.10), 0.0, abs_tol=1e-6) or math.isclose(tick, 0.0, abs_tol=1e-6)
+        guides.append(
+            f"<line x1='{x:.1f}' y1='{margin_top - 4:.1f}' x2='{x:.1f}' y2='{height - margin_bottom + 4:.1f}' "
+            f"stroke='{'#cbd5e1' if is_major else '#e2e8f0'}' stroke-width='{'1.8' if is_major else '0.9'}' />"
+        )
+        if is_major:
+            guides.append(f"<text x='{x:.1f}' y='{height - 6:.1f}' text-anchor='middle' fill='#64748b' font-size='14'>{tick:+.2f}</text>")
+        tick = round(tick + 0.05, 4)
+    guides.append(
+        f"<rect x='{x_for(-0.25):.1f}' y='{margin_top:.1f}' width='{max(x_for(0.25) - x_for(-0.25), 4):.1f}' height='{plot_height:.1f}' fill='#dcfce7' opacity='0.65' rx='12' />"
+    )
+    if axis_max > 0.25:
+        guides.append(
+            f"<rect x='{x_for(-axis_max):.1f}' y='{margin_top:.1f}' width='{max(x_for(axis_max) - x_for(-axis_max), 4):.1f}' height='{plot_height:.1f}' fill='#fef3c7' opacity='0.22' rx='12' />"
+        )
+    rows = []
+    for index, item in enumerate(ordered):
+        y = margin_top + (index * row_height) + 18
+        offset = float(item.get("offset_to_anchor", 0.0) or 0.0)
+        plotted_offset = max(-axis_max, min(axis_max, offset))
+        camera_label = str(item.get("camera_label") or item.get("clip_id") or f"Camera {index + 1}")
+        attention = str(item.get("attention_class") or "safe")
+        is_anchor = bool(item.get("is_anchor_reference"))
+        fill = "#2563eb" if is_anchor else "#dc2626" if attention == "outlier" else "#f59e0b" if attention == "borderline" else "#0f172a"
+        label_suffix = " | Anchor" if is_anchor else " | Excluded" if attention == "outlier" else " | Review" if attention == "borderline" else ""
+        clipped = not math.isclose(plotted_offset, offset, abs_tol=1e-6)
+        value_label = f"{offset:+.2f} stops" + (" (clipped)" if clipped else "")
+        rows.append(
+            f"<text x='{margin_left - 12:.1f}' y='{y + 5:.1f}' text-anchor='end' fill='#0f172a' font-size='15' font-weight='700'>{html.escape(camera_label + label_suffix)}</text>"
+            f"<line x1='{zero_x:.1f}' y1='{y:.1f}' x2='{x_for(plotted_offset):.1f}' y2='{y:.1f}' stroke='#94a3b8' stroke-width='4' />"
+            f"<circle cx='{x_for(plotted_offset):.1f}' cy='{y:.1f}' r='7' fill='{fill}' stroke='white' stroke-width='2.5' />"
+            + (
+                f"<polygon points='{x_for(plotted_offset):.1f},{y - 8:.1f} {x_for(plotted_offset) + (10 if offset > 0 else -10):.1f},{y:.1f} {x_for(plotted_offset):.1f},{y + 8:.1f}' fill='{fill}' opacity='0.85' />"
+                if clipped
+                else ""
+            )
+            + f"<text x='{x_for(plotted_offset) + 14 if plotted_offset >= 0 else x_for(plotted_offset) - 14:.1f}' y='{y + 5:.1f}' text-anchor='{'start' if plotted_offset >= 0 else 'end'}' fill='#334155' font-size='14' font-weight='700'>{html.escape(value_label)}</text>"
+        )
+    legend = (
+        f"<text x='{margin_left:.1f}' y='20' fill='#0f172a' font-size='18' font-weight='700'>Exposure offset from the anchor (sorted by magnitude)</text>"
+        f"<text x='{margin_left:.1f}' y='40' fill='#64748b' font-size='13'>Fine grid = 0.05 stops | Green band = within ±0.25 | Blue = anchor | Red = excluded / outlier | Clipped labels mark larger offsets outside the focused range</text>"
+    )
+    return (
+        f"<svg viewBox='0 0 {width} {height}' role='img' aria-label='Exposure offsets from the anchor'>"
+        f"<rect x='0' y='0' width='{width}' height='{height}' fill='white' />"
+        + "".join(guides)
+        + legend
+        + "".join(rows)
+        + "</svg>"
+    )
+
+
 def _contact_sheet_view_model(payload: Dict[str, object]) -> Dict[str, object]:
     recommended_strategy = dict(payload.get("recommended_strategy") or {})
     recommended_key = str(recommended_strategy.get("strategy_key") or "")
@@ -8437,6 +12540,13 @@ def _contact_sheet_view_model(payload: Dict[str, object]) -> Dict[str, object]:
         if str(item.get("clip_id") or "").strip() and (
             not recommended_key or str(item.get("strategy_key") or "") == recommended_key
         )
+    }
+    top_level_wb_model = dict(payload.get("white_balance_model") or {})
+    focus_validation = dict(payload.get("focus_validation") or {})
+    focus_rows_by_clip = {
+        str(item.get("clip_id") or ""): dict(item)
+        for item in list(focus_validation.get("rows") or [])
+        if str(item.get("clip_id") or "").strip()
     }
 
     entries: List[Dict[str, object]] = []
@@ -8525,6 +12635,12 @@ def _contact_sheet_view_model(payload: Dict[str, object]) -> Dict[str, object]:
                 _contact_sheet_format_tint(commit_values.get("tint")),
             ]
         )
+        original_wb = _contact_sheet_original_wb_block(
+            clip=dict(clip),
+            clip_metadata=clip_metadata,
+            top_level_wb_model=top_level_wb_model,
+        )
+        focus_row = dict(focus_rows_by_clip.get(clip_id) or clip.get("focus_validation") or {})
         entries.append(
             {
                 "clip_id": clip_id,
@@ -8563,19 +12679,52 @@ def _contact_sheet_view_model(payload: Dict[str, object]) -> Dict[str, object]:
                 "shutter_seconds": float(shutter_seconds or 0.0) if shutter_seconds is not None else 0.0,
                 "original_metadata_line": original_metadata_line,
                 "adjusted_metadata_line": adjusted_metadata_line,
+                "original_wb": original_wb,
                 "residual_stops": residual_stops,
                 "residual_abs_stops": residual_abs_stops,
                 "offset_to_anchor": float(ipp2_row.get("camera_offset_from_anchor", ipp2_row.get("derived_exposure_offset_stops", 0.0)) or 0.0),
                 "reference_use": str(ipp2_row.get("reference_use") or clip.get("reference_use") or "Included"),
                 "trust_score": float(clip.get("trust_score", ipp2_row.get("trust_score", 0.0)) or 0.0),
                 "trust_class": str(clip.get("trust_class") or ipp2_row.get("trust_class") or "TRUSTED"),
-                "sphere_detection_note": str(ipp2_row.get("sphere_detection_note") or "Sphere detection: verified"),
-                "profile_note": str(ipp2_row.get("profile_note") or "Profile consistent with stored solve."),
-                "fallback_used": "fallback" in str(ipp2_row.get("sphere_detection_note") or "").lower(),
+                "sphere_detection_note": str(ipp2_row.get("sphere_detection_note") or "Sphere check verified"),
+                "profile_note": str(ipp2_row.get("profile_note") or "Sample profile aligned with stored solve."),
+                "fallback_used": bool(
+                    clip.get("gray_target_fallback_used")
+                    or ipp2_row.get("gray_target_fallback_used")
+                    or ("fallback" in str(ipp2_row.get("sphere_detection_note") or "").lower())
+                    or str(ipp2_row.get("ipp2_detection_source") or "") in {"secondary_detected", "localized_recovery", "forced_best_effort", "opencv_hough_recovery", "opencv_contour_recovery"}
+                ),
+                "sample_plausibility": str(ipp2_row.get("ipp2_sample_plausibility") or clip.get("sample_plausibility") or ""),
+                "gray_target_class": str(
+                    ipp2_row.get("ipp2_target_class")
+                    or clip.get("gray_target_class")
+                    or ((clip.get("metrics") or {}).get("exposure", {}) or {}).get("gray_target_class")
+                    or "sphere"
+                ),
+                "gray_target_detection_method": str(
+                    ipp2_row.get("ipp2_target_detection_method")
+                    or clip.get("gray_target_detection_method")
+                    or ((clip.get("metrics") or {}).get("exposure", {}) or {}).get("gray_target_detection_method")
+                    or ""
+                ),
+                "gray_target_confidence": float(
+                    ipp2_row.get("ipp2_target_confidence")
+                    or clip.get("gray_target_confidence")
+                    or ((clip.get("metrics") or {}).get("exposure", {}) or {}).get("gray_target_confidence")
+                    or clip.get("confidence")
+                    or 0.0
+                ),
                 "measurement_domain": str(payload.get("measurement_preview_transform") or REVIEW_PREVIEW_TRANSFORM),
+                "focus_validation": focus_row,
+                "focus_classification": str(focus_row.get("focus_classification") or ""),
+                "focus_composite_score": float(focus_row.get("composite_focus_score", 0.0) or 0.0),
             }
         )
 
+    entries = sorted(
+        entries,
+        key=lambda item: _camera_layout_sort_key(str(item.get("camera_label") or item.get("clip_id") or "")),
+    )
     before_values = [float(item.get("display_scalar_log2", 0.0) or 0.0) for item in entries]
     after_values = [
         float(
@@ -8586,8 +12735,47 @@ def _contact_sheet_view_model(payload: Dict[str, object]) -> Dict[str, object]:
     ]
     center_values = [float(item.get("sample_2_ire", 0.0) or 0.0) for item in entries if float(item.get("sample_2_ire", 0.0) or 0.0) > 0.0]
     reference_candidate = _contact_sheet_reference_candidate(entries)
+    reference_clip_id = str((reference_candidate or {}).get("clip_id") or "")
+    for entry in entries:
+        entry["attention_class"] = _contact_sheet_attention_class(entry)
+        entry["is_reference_candidate"] = str(entry.get("clip_id") or "") == reference_clip_id
+        entry["is_anchor_reference"] = bool(entry.get("is_reference_candidate")) or bool(entry.get("is_hero_camera"))
+    is_large_array = len(entries) >= LARGE_ARRAY_OVERVIEW_THRESHOLD
+    requested_focus = normalize_report_focus(payload.get("report_focus"))
+    effective_focus = DEFAULT_LARGE_ARRAY_AUTO_FOCUS if requested_focus == "auto" and is_large_array else "full" if requested_focus == "auto" else requested_focus
+    detail_entries = _contact_sheet_array_focus_entries(entries, focus_mode=effective_focus, reference_candidate=reference_candidate)
+    outlier_entries = [item for item in entries if str(item.get("attention_class") or "") == "outlier"]
+    borderline_entries = [item for item in entries if str(item.get("attention_class") or "") == "borderline"]
+    anchor_entries = [item for item in entries if bool(item.get("is_anchor_reference"))]
+    retained_entries = [item for item in entries if str(item.get("reference_use") or "Included") != "Excluded"]
+    gray_target_consistency = _gray_target_consistency_summary(entries)
+    focus_rows = [dict(item) for item in list(focus_validation.get("rows") or [])]
+    cluster_extreme_entries: List[Dict[str, object]] = []
+    if retained_entries:
+        low = min(retained_entries, key=lambda item: float(item.get("offset_to_anchor", 0.0) or 0.0))
+        high = max(retained_entries, key=lambda item: float(item.get("offset_to_anchor", 0.0) or 0.0))
+        cluster_extreme_entries = [low] if str(low.get("clip_id") or "") == str(high.get("clip_id") or "") else [low, high]
+    recommended_attention = list(dict.fromkeys(
+        [str(item.get("camera_label") or item.get("clip_id") or "") for item in [*outlier_entries, *anchor_entries, *cluster_extreme_entries] if str(item.get("camera_label") or item.get("clip_id") or "").strip()]
+    ))
+    overview_pages = _chunk_tiles(
+        [
+            {
+                "clip_id": str(item.get("clip_id") or ""),
+                "camera_label": str(item.get("camera_label") or ""),
+                "status": str(item.get("status") or "REVIEW"),
+                "attention_class": str(item.get("attention_class") or "safe"),
+                "residual_abs_stops": float(item.get("residual_abs_stops", 0.0) or 0.0),
+                "display_scalar_ire": float(item.get("display_scalar_ire", 0.0) or 0.0),
+                "reference_use": str(item.get("reference_use") or "Included"),
+                "is_anchor_reference": bool(item.get("is_anchor_reference")),
+            }
+            for item in entries
+        ],
+        24,
+    )
     contact_pages = []
-    for page_index, page_entries in enumerate(_contact_sheet_chunks(entries, columns=2, max_rows=2), start=1):
+    for page_index, page_entries in enumerate(_contact_sheet_chunks(detail_entries, columns=2, max_rows=2), start=1):
         labels = [str(item.get("camera_label") or item.get("clip_id") or "") for item in page_entries]
         original_exposure_values = [float(item.get("display_scalar_ire", 0.0) or 0.0) for item in page_entries]
         adjusted_exposure_values = [float(item.get("adjusted_display_scalar_ire", item.get("display_scalar_ire", 0.0)) or 0.0) for item in page_entries]
@@ -8666,9 +12854,35 @@ def _contact_sheet_view_model(payload: Dict[str, object]) -> Dict[str, object]:
         "goal_threshold_stops": 0.02,
         "goal_achieved": _contact_sheet_goal_achieved(entries, 0.02),
         "reference_candidate": reference_candidate,
+        "is_large_array": is_large_array,
+        "requested_report_focus": requested_focus,
+        "effective_report_focus": effective_focus,
+        "effective_report_focus_label": report_focus_label(effective_focus),
+        "detail_entry_count": len(detail_entries),
+        "overview_pages": overview_pages,
+        "outlier_entries": outlier_entries,
+        "anchor_entries": anchor_entries,
+        "cluster_extreme_entries": cluster_extreme_entries,
+        "recommended_attention": recommended_attention,
+        "gray_target_consistency": gray_target_consistency,
+        "focus_validation": focus_validation,
+        "focus_rows": focus_rows,
+        "summary_blocks": {
+            "excluded_count": sum(1 for item in entries if str(item.get("reference_use") or "Included") == "Excluded"),
+            "outlier_count": len(outlier_entries),
+            "borderline_count": len(borderline_entries),
+            "anchor_count": len(anchor_entries),
+            "tint_spread": (
+                max(float(item.get("tint", 0.0) or 0.0) for item in entries) - min(float(item.get("tint", 0.0) or 0.0) for item in entries)
+            ) if len(entries) >= 2 else 0.0,
+            "kelvin_spread": (
+                max(float(item.get("kelvin", 0.0) or 0.0) for item in entries) - min(float(item.get("kelvin", 0.0) or 0.0) for item in entries)
+            ) if len(entries) >= 2 else 0.0,
+        },
         "visuals": dict(payload.get("visuals") or {}),
         "contact_pages": contact_pages,
         "entries": entries,
+        "detail_entries": detail_entries,
     }
 
 
@@ -8856,7 +13070,7 @@ def _ipp2_validation_presentation(validation: Dict[str, object]) -> Dict[str, st
         else "Needs adjustment" if status == "REVIEW"
         else "Outside tolerance"
     )
-    exact_correction_text = f"Digital correction applied: {correction_stops:+.2f} stops"
+    exact_correction_text = f"Exposure adjustment applied: {correction_stops:+.2f} stops"
     rounded_correction_text = f"Rounded operator target: {rounded_stops:+.2f} stops"
     residual_text = f"Exposure residual after validation: {scalar_abs_residual:.2f} stops"
     profile_residual_text = f"Worst zone residual after validation: {profile_max_residual:.2f} stops"
@@ -8883,7 +13097,7 @@ def _ipp2_validation_presentation(validation: Dict[str, object]) -> Dict[str, st
         "target_profile_text": f"Reference profile: {target_profile_summary}",
         "profile_note_text": f"Profile note: {profile_note}",
         "zone_residual_text": f"Zone residuals: {zone_residual_text}" if zone_residual_text != "n/a" else "Zone residuals: n/a",
-        "sphere_detection_note": str(validation.get("sphere_detection_note") or "Sphere detection: review needed"),
+        "sphere_detection_note": str(validation.get("sphere_detection_note") or "Sphere check needs review"),
         "tone": tone,
     }
 
@@ -8918,9 +13132,143 @@ def render_contact_sheet_html(
             [float(item.get("original_tint", 0.0) or 0.0) for item in chart_entries],
             stroke="#0f766e",
         )
+    exposure_chart_svg = _contact_sheet_svg_exposure_offset_lollipop([dict(item) for item in list(view_model.get("entries") or [])])
+    summary_blocks = dict(view_model.get("summary_blocks") or {})
+    anchor_summary_text = str(view_model.get("anchor_summary") or "Exposure Anchor: Derived from retained cluster")
+    anchor_summary_display = anchor_summary_text.replace("Exposure Anchor: ", "", 1)
+    gray_target_consistency = dict(view_model.get("gray_target_consistency") or {})
+    focus_validation = dict(view_model.get("focus_validation") or {})
+    focus_rows = [dict(item) for item in list(view_model.get("focus_rows") or [])]
+    focus_chart_svg = ""
+    if focus_rows:
+        sorted_focus_rows = sorted(focus_rows, key=lambda item: float(item.get("composite_focus_score", 0.0) or 0.0), reverse=True)
+        focus_chart_svg = _contact_sheet_svg_single_series(
+            "Focus score",
+            [str(item.get("camera_label") or item.get("clip_id") or "") for item in sorted_focus_rows],
+            [float(item.get("composite_focus_score", 0.0) or 0.0) for item in sorted_focus_rows],
+            stroke="#7c3aed",
+            units="score",
+            goal=None,
+        )
     page_markup: List[str] = []
     debug_rows: List[Dict[str, object]] = []
-    for index, entry in enumerate(list(view_model.get("entries") or []), start=1):
+    overview_pages = list(view_model.get("overview_pages") or [])
+    for overview_index, page_entries in enumerate(overview_pages, start=1):
+        tiles_markup = []
+        for tile in list(page_entries or []):
+            attention_class = str(tile.get("attention_class") or "safe")
+            reference_bits: List[str] = []
+            if bool(tile.get("is_anchor_reference")):
+                reference_bits.append("Exposure Anchor")
+            if str(tile.get("reference_use") or "Included") != "Included":
+                reference_bits.append(str(tile.get("reference_use") or "Excluded"))
+            status_label, _status_tone = _contact_sheet_overview_status(tile)
+            tiles_markup.append(
+                "<div class='overview-tile {tone}'>"
+                f"<div class='overview-camera'>{html.escape(str(tile.get('camera_label') or tile.get('clip_id') or 'Camera'))}</div>"
+                f"<div class='overview-status'>{html.escape(status_label)}</div>"
+                f"<div class='overview-metric'>Residual {float(tile.get('residual_abs_stops', 0.0) or 0.0):.3f}</div>"
+                f"<div class='overview-metric'>Scalar {float(tile.get('display_scalar_ire', 0.0) or 0.0):.1f} IRE</div>"
+                f"<div class='overview-note'>{html.escape(' | '.join(reference_bits) if reference_bits else 'Included')}</div>"
+                "</div>".format(tone=html.escape(attention_class))
+            )
+        summary_lists = []
+        if overview_index == 1:
+            summary_lists.append(
+                (
+                    "<div class='overview-hero-row'>"
+                    f"<div class='overview-hero-card'><div class='summary-kicker'>Overall Recommendation</div><div class='summary-value'>{html.escape(str(view_model.get('strategy_label') or 'Median'))}</div><div class='overview-summary-copy'>{html.escape(str((payload.get('recommended_strategy') or {}).get('strategy_summary') or payload.get('executive_synopsis') or 'Review the retained cluster before applying calibration.'))}</div></div>"
+                    f"<div class='overview-hero-card'><div class='summary-kicker'>Anchor / Reference</div><div class='summary-value'>{html.escape(anchor_summary_display or 'Derived cluster center')}</div><div class='overview-summary-copy'>Exposure anchors: {html.escape(', '.join(str(item.get('camera_label') or item.get('clip_id') or '') for item in list(view_model.get('anchor_entries') or [])[:8]) or 'None')}</div></div>"
+                    f"<div class='overview-hero-card'><div class='summary-kicker'>Gray Sample Basis</div><div class='summary-value'>{html.escape(_contact_sheet_target_class_label(gray_target_consistency.get('dominant_target_class') or 'sphere'))}</div><div class='overview-summary-copy'>{html.escape(str(gray_target_consistency.get('summary') or 'Gray target basis is not available.'))}</div></div>"
+                )
+                + (
+                    f"<div class='overview-hero-card'><div class='summary-kicker'>Focus Validation</div><div class='summary-value'>{html.escape(str(focus_validation.get('status') or 'disabled').replace('_', ' ').title())}</div><div class='overview-summary-copy'>{html.escape(str(focus_validation.get('reason') or 'Focus validation is not enabled for this run.'))}</div></div>"
+                    if focus_validation
+                    else ""
+                )
+                + "</div>"
+            )
+            summary_lists.append(
+                (
+                    "<div class='overview-summary-row'>"
+                    f"<div class='overview-summary-card'><div class='summary-kicker'>Retained</div><div class='summary-value'>{int(view_model.get('camera_count', 0) or 0) - int(summary_blocks.get('excluded_count', 0) or 0)}</div></div>"
+                    f"<div class='overview-summary-card'><div class='summary-kicker'>Needs Attention</div><div class='summary-value'>{int(summary_blocks.get('borderline_count', 0) or 0)}</div></div>"
+                    f"<div class='overview-summary-card'><div class='summary-kicker'>Excluded</div><div class='summary-value'>{int(summary_blocks.get('excluded_count', 0) or 0)}</div></div>"
+                    f"<div class='overview-summary-card'><div class='summary-kicker'>Center IRE Range</div><div class='summary-value'>{float(view_model.get('center_ire_min', 0.0) or 0.0):.0f}–{float(view_model.get('center_ire_max', 0.0) or 0.0):.0f}</div></div>"
+                    f"<div class='overview-summary-card'><div class='summary-kicker'>Median Residual</div><div class='summary-value'>{float(view_model.get('median_residual', 0.0) or 0.0):.3f}</div></div>"
+                    f"<div class='overview-summary-card'><div class='summary-kicker'>Default Focus</div><div class='summary-value'>{html.escape(str(view_model.get('effective_report_focus_label') or 'Auto'))}</div></div>"
+                )
+                + (
+                    f"<div class='overview-summary-card'><div class='summary-kicker'>Sharp / Review / Soft</div><div class='summary-value'>{int(focus_validation.get('sharp_camera_count', 0) or 0)} / {int(focus_validation.get('review_camera_count', 0) or 0)} / {int(focus_validation.get('soft_camera_count', 0) or 0)}</div></div>"
+                    if focus_validation.get("enabled")
+                    else ""
+                )
+                + "</div>"
+            )
+            attention_text = ", ".join(list(view_model.get("recommended_attention") or [])[:10]) or "No special attention cameras."
+            outlier_text = ", ".join(str(item.get("camera_label") or item.get("clip_id") or "") for item in list(view_model.get("outlier_entries") or [])[:12]) or "None"
+            summary_lists.append(
+                (
+                    "<div class='overview-text-row'>"
+                    f"<div><strong>Recommended Attention:</strong> {html.escape(attention_text)}</div>"
+                    f"<div><strong>Outliers / Excluded:</strong> {html.escape(outlier_text)}</div>"
+                    f"<div><strong>White-balance model:</strong> {html.escape(str((payload.get('white_balance_model') or {}).get('model_label') or 'n/a'))}</div>"
+                    "<div><strong>Legend:</strong> Retained = green tile | Needs Attention = amber tile | Excluded / Outlier = red tile | Exposure Anchor = blue callout</div>"
+                )
+                + (
+                    f"<div><strong>Gray-target consistency:</strong> {html.escape(str(gray_target_consistency.get('summary') or 'n/a'))}</div>"
+                    if gray_target_consistency
+                    else ""
+                )
+                + (
+                    f"<div><strong>TIFF focus validation:</strong> {html.escape(str(focus_validation.get('measured_error') or 'n/a'))}</div>"
+                    if focus_validation.get("enabled")
+                    else ""
+                )
+                + "</div>"
+            )
+        chart_markup = ""
+        if overview_index == 1 and exposure_chart_svg:
+            chart_markup += (
+                "<div class='overview-chart-block'>"
+                "<div class='footer-title'>Exposure Spread</div>"
+                f"{exposure_chart_svg}"
+                "</div>"
+            )
+        if overview_index == 1 and chart_svg:
+            chart_markup += (
+                "<div class='overview-chart-block'>"
+                "<div class='footer-title'>White-Balance Deviation</div>"
+                f"{chart_svg}"
+                "</div>"
+            )
+        if overview_index == 1 and focus_chart_svg:
+            chart_markup += (
+                "<div class='overview-chart-block'>"
+                "<div class='footer-title'>Focus Validation</div>"
+                f"{focus_chart_svg}"
+                "</div>"
+            )
+        page_markup.append(
+            "<div class='page'>"
+            "<div class='header'>"
+            "<div class='header-left'>"
+            f"{logo_markup if overview_index == 1 else ''}"
+            f"<div class='title-block'><div class='report-title'>{html.escape(final_title)}</div><div class='report-subtitle'>{html.escape(str(view_model.get('batch_label') or 'Calibration run'))}</div><div class='report-subtitle'>Exposure Anchor: {html.escape(anchor_summary_display)}</div><div class='report-subtitle'>Measurement Domain: {html.escape(str(view_model.get('domain_label') or REVIEW_PREVIEW_TRANSFORM))}</div></div>"
+            "</div>"
+            "<div class='header-right'>"
+            f"<div class='camera-id'>Array Overview</div>"
+            f"<div class='camera-clip'>Page {overview_index} of {max(len(overview_pages), 1)}</div>"
+            f"<div class='camera-status'>{int(view_model.get('camera_count', 0) or 0)} cameras | {html.escape(str(view_model.get('strategy_label') or 'Median'))}</div>"
+            f"<div class='camera-action'>Detailed export: {html.escape(str(view_model.get('effective_report_focus_label') or 'Auto'))} ({int(view_model.get('detail_entry_count', 0) or 0)} camera pages)</div>"
+            "</div>"
+            "</div>"
+            + "".join(summary_lists)
+            + "<div class='overview-grid'>" + "".join(tiles_markup) + "</div>"
+            + (f"<div class='overview-charts'>{chart_markup}</div>" if chart_markup else "")
+            + "</div>"
+        )
+    for index, entry in enumerate(list(view_model.get("detail_entries") or []), start=1):
         clip_id = str(entry.get("clip_id") or "")
         camera_label = str(entry.get("camera_label") or clip_id or f"Camera {index}")
         original_source = _contact_sheet_required_asset(entry.get("original_image"), label="original frame", clip_id=clip_id)
@@ -8953,16 +13301,50 @@ def render_contact_sheet_html(
             raise RuntimeError(f"Contact-sheet displayed S3 IRE diverged from stored payload for {clip_id}.")
         flags: List[str] = []
         if bool(entry.get("fallback_used")):
-            flags.append("Fallback used")
+            flags.append("Alternate detection path used")
         if str(entry.get("reference_use") or "Included") != "Included":
-            flags.append(str(entry.get("reference_use") or "Excluded"))
+            flags.append(_contact_sheet_reference_role_label(str(entry.get("reference_use") or "Excluded")))
         if float(entry.get("residual_abs_stops", 0.0) or 0.0) > 0.02:
-            flags.append("Residual > ±0.02")
+            flags.append("Residual exceeds ±0.02 stops")
         sample_range = max(sample_1_ire, sample_2_ire, sample_3_ire) - min(sample_1_ire, sample_2_ire, sample_3_ire)
         if sample_range > 3.0:
-            flags.append("Uneven sample profile")
+            flags.append("Sample profile varies across the sphere")
         if not flags:
             flags.append("No anomaly flags")
+        original_wb = dict(entry.get("original_wb") or {})
+        as_shot_kelvin = original_wb.get("as_shot_kelvin")
+        as_shot_tint = original_wb.get("as_shot_tint")
+        as_shot_kelvin_text = (
+            "Unavailable"
+            if as_shot_kelvin is None
+            else f"{int(as_shot_kelvin)}K"
+        )
+        as_shot_tint_text = (
+            "Unavailable"
+            if as_shot_tint is None
+            else f"{float(as_shot_tint or 0.0):+.1f}"
+        )
+        original_wb_lines = [
+            f"<div class='metric-line'><span>Basis / cast:</span> <strong>{html.escape(str(original_wb.get('source_label') or 'Stored original-still context'))}</strong> <span class='metric-inline-soft'>| {html.escape(str(original_wb.get('derived_cast') or 'Original cast not stored'))}</span></div>",
+            f"<div class='metric-line'><span>As-shot / target:</span> <strong>{html.escape(as_shot_kelvin_text)} / {html.escape(as_shot_tint_text)}</strong> <span class='metric-inline-soft'>| {html.escape(str(original_wb.get('gray_target_label') or 'Gray sphere'))} confidence {float(original_wb.get('gray_target_confidence', 0.0) or 0.0):.2f}</span></div>",
+        ]
+        if bool(original_wb.get("has_context_summary")):
+            original_wb_lines.append(
+                f"<div class='metric-line'><span>Array WB model:</span> <strong>{html.escape(str(original_wb.get('context') or ''))}</strong></div>"
+            )
+        if bool(original_wb.get("has_chroma_summary")):
+            original_wb_lines.append(
+                f"<div class='metric-line metric-secondary'><span>Neutral sample RGB:</span> <strong>{html.escape(str(original_wb.get('chroma_summary') or ''))}</strong></div>"
+            )
+        if len(original_wb_lines) <= 2:
+            original_wb_lines.append(
+                "<div class='metric-line'><span>Original still evaluation:</span> <strong>Stored derived original-still context is limited for this camera.</strong></div>"
+            )
+        original_wb_markup = "".join(original_wb_lines) + (
+            f"<div class='wb-compact-visual'>{str(original_wb.get('chromaticity_chart_svg') or '')}</div>"
+            if str(original_wb.get("chromaticity_chart_svg") or "").strip()
+            else ""
+        )
         header_right = _contact_sheet_join_bits(
             [
                 str(entry.get("status") or "REVIEW"),
@@ -8970,56 +13352,33 @@ def render_contact_sheet_html(
                 f"Residual {float(entry.get('residual_abs_stops', 0.0) or 0.0):.3f} stops",
             ]
         )
-        footer_markup = ""
-        if index == 1:
-            footer_markup = (
-                "<div class='footer'>"
-                "<div class='footer-title'>Original Array Synopsis</div>"
-                "<div class='footer-line'><strong>What To Look For:</strong> Original / Corrected / Sphere Mask Overlay / Samples / Residual</div>"
-            )
-            if chart_svg:
-                footer_markup += (
-                    "<div class='footer-title'>White-balance deviation</div>"
-                    "<div class='footer-chart'>"
-                    f"{chart_svg}"
-                    "</div>"
-                )
-            else:
-                footer_markup += "<div class='footer-line'>White-balance deviation unavailable from stored payload.</div>"
-            footer_markup += "</div>"
-        else:
-            footer_markup = (
-                "<div class='footer'>"
-                f"<div class='footer-line'>Measurement domain: {html.escape(str(entry.get('measurement_domain') or REVIEW_PREVIEW_TRANSFORM))}</div>"
-                f"<div class='footer-line'>Sphere detection: {html.escape(str(entry.get('sphere_detection_note') or 'Sphere detection: verified'))}</div>"
-                "</div>"
-            )
+        footer_markup = (
+            "<div class='footer'>"
+            f"<div class='footer-line'><strong>Measurement domain:</strong> {html.escape(str(entry.get('measurement_domain') or REVIEW_PREVIEW_TRANSFORM))}</div>"
+            f"<div class='footer-line'><strong>Reference use:</strong> {html.escape(str(entry.get('reference_use') or 'Included'))} | <strong>Attention:</strong> {html.escape(str(entry.get('attention_class') or 'safe').replace('_', ' ').title())}</div>"
+            f"<div class='footer-line'><strong>Gray target check:</strong> {html.escape(str(entry.get('sphere_detection_note') or 'Sphere check verified'))}</div>"
+            "</div>"
+        )
         page_markup.append(
             "<div class='page'>"
             "<div class='header'>"
             "<div class='header-left'>"
-            f"{logo_markup if index == 1 else ''}"
-            f"<div class='title-block'><div class='report-title'>{html.escape(final_title)}</div><div class='report-subtitle'>{html.escape(str(view_model.get('batch_label') or 'Calibration run'))}</div><div class='report-subtitle'>Exposure Anchor: {html.escape(str(view_model.get('anchor_summary') or 'Derived from retained cluster'))}</div><div class='report-subtitle'>Color preview: {html.escape(str(payload.get('color_preview_status') or 'unknown'))}</div>"
-            + (
-                f"<div class='report-subtitle'>Hero clip: {html.escape(str(payload.get('hero_clip_id') or 'None selected'))}</div>"
-                if index == 1 and str(payload.get("hero_clip_id") or "").strip()
-                else ""
-            )
+            f"{logo_markup if index == 1 and not overview_pages else ''}"
+            f"<div class='title-block'><div class='report-title'>{html.escape(final_title)}</div><div class='report-subtitle'>{html.escape(str(view_model.get('batch_label') or 'Calibration run'))}</div><div class='report-subtitle'>Exposure Anchor: {html.escape(anchor_summary_display)}</div><div class='report-subtitle'>Color preview: {html.escape(str(payload.get('color_preview_operator_status') or payload.get('color_preview_status') or 'unknown'))}</div>"
             + "</div>"
             "</div>"
             "<div class='header-right'>"
             f"<div class='camera-id'>{html.escape(camera_label)}</div>"
             f"<div class='camera-clip'>{html.escape(clip_id)}</div>"
-            + ("<div class='camera-clip hero-badge'>Hero Camera</div>" if bool(entry.get("is_hero_camera")) else "")
+            + ("<div class='camera-clip hero-badge'>Exposure Anchor / Hero</div>" if bool(entry.get("is_anchor_reference")) else "")
             + f"<div class='camera-status'>{html.escape(header_right)}</div>"
             + f"<div class='camera-action'>Recommended Action: {html.escape(str(entry.get('recommended_action') or 'Review'))}</div>"
-            + (f"<div class='camera-stamp'>{html.escape(str(timestamp_label))}</div>" if timestamp_label and index == 1 else "")
+            + (f"<div class='camera-stamp'>{html.escape(str(timestamp_label))}</div>" if timestamp_label and index == 1 and not overview_pages else "")
             + "</div>"
             "</div>"
             "<div class='image-row'>"
-            f"<div class='image-panel'><div class='image-label'>Original Frame</div><img src='{html.escape(original_src)}' alt='{html.escape(clip_id)} original'></div>"
-            f"<div class='image-panel'><div class='image-label'>Corrected Frame</div><img src='{html.escape(corrected_src)}' alt='{html.escape(clip_id)} corrected'></div>"
-            f"<div class='image-panel'><div class='image-label'>Sphere Mask Overlay</div><img src='{html.escape(overlay_src)}' alt='{html.escape(clip_id)} sphere mask overlay'></div>"
+            f"<div class='image-panel half'><div class='image-label'>Original + Solve Overlay</div><img src='{html.escape(overlay_src)}' alt='{html.escape(clip_id)} original with solve overlay'></div>"
+            f"<div class='image-panel half'><div class='image-label'>Corrected Frame</div><img src='{html.escape(corrected_src)}' alt='{html.escape(clip_id)} corrected'></div>"
             "</div>"
             "<div class='metrics'>"
             "<div class='metric-column'>"
@@ -9031,18 +13390,29 @@ def render_contact_sheet_html(
             f"<div class='metric-line'><span>Scalar:</span> <strong>{scalar_log2:+.3f} log2</strong></div>"
             "</div>"
             "<div class='metric-column'>"
+            "<div class='metric-title'>Original WB Evaluation</div>"
+            f"{original_wb_markup}"
+            "</div>"
+            "<div class='metric-column'>"
             "<div class='metric-title'>Correction</div>"
-            f"<div class='metric-line'><span>Digital correction applied:</span> <strong>{float(entry.get('exposure_adjust_stops', 0.0) or 0.0):+.2f} stops</strong></div>"
+            f"<div class='metric-line'><span>Exposure adjustment applied:</span> <strong>{html.escape(_contact_sheet_exposure_direction_label(float(entry.get('exposure_adjust_stops', 0.0) or 0.0)))}</strong></div>"
             f"<div class='metric-line'><span>Kelvin:</span> <strong>{int(round(float(entry.get('kelvin', 0.0) or 0.0)))}K</strong></div>"
             f"<div class='metric-line'><span>Tint:</span> <strong>{float(entry.get('tint', 0.0) or 0.0):+.1f}</strong></div>"
             f"<div class='metric-line'><span>Validation Residual:</span> <strong>{float(entry.get('residual_abs_stops', 0.0) or 0.0):.3f} stops</strong></div>"
-            f"<div class='metric-line'><span>Reference Use:</span> <strong>{html.escape(str(entry.get('reference_use') or 'Included'))}</strong></div>"
+            f"<div class='metric-line'><span>Array role:</span> <strong>{html.escape(_contact_sheet_reference_role_label(entry.get('reference_use') or 'Included'))}</strong></div>"
             "</div>"
             "<div class='metric-column'>"
-            "<div class='metric-title'>Verification</div>"
-            f"<div class='metric-line'><span>Profile:</span> <strong>{html.escape(str(entry.get('profile_note') or 'Profile consistent with stored solve.'))}</strong></div>"
-            f"<div class='metric-line'><span>Flags:</span> <strong>{html.escape(' | '.join(flags))}</strong></div>"
-            f"<div class='metric-line'><span>Scalar Source:</span> <strong>{html.escape(str(entry.get('display_scalar_source') or 'stored measurement payload'))}</strong></div>"
+            "<div class='metric-title'>Result</div>"
+            f"<div class='metric-line'><span>Result:</span> <strong>{html.escape(str(entry.get('operator_result_label') or entry.get('status') or 'Review'))}</strong></div>"
+            f"<div class='metric-line'><span>Notes:</span> <strong>{html.escape(' | '.join(_contact_sheet_flag_label(flag) for flag in flags))}</strong></div>"
+            f"<div class='metric-line'><span>Measurement source:</span> <strong>{html.escape(_contact_sheet_measurement_source_label(entry.get('display_scalar_source') or 'stored measurement payload'))}</strong></div>"
+            f"<div class='metric-line'><span>Gray target used:</span> <strong>{html.escape(_contact_sheet_target_class_label(entry.get('gray_target_class') or 'sphere'))}</strong></div>"
+            + (
+                f"<div class='metric-line'><span>Sample plausibility:</span> <strong>{html.escape(str(entry.get('sample_plausibility') or 'n/a'))}</strong></div>"
+                if str(entry.get("sample_plausibility") or "").strip()
+                else ""
+            )
+            +
             f"<div class='metric-line'><span>Measurement Domain:</span> <strong>{html.escape(str(entry.get('measurement_domain') or REVIEW_PREVIEW_TRANSFORM))}</strong></div>"
             "</div>"
             "</div>"
@@ -9067,6 +13437,7 @@ def render_contact_sheet_html(
                     "display_scalar_log2": scalar_log2,
                     "exposure_adjust_stops": float(entry.get("exposure_adjust_stops", 0.0) or 0.0),
                 },
+                "original_wb": original_wb,
                 "fallback_used": bool(entry.get("fallback_used")),
             }
         )
@@ -9095,18 +13466,50 @@ def render_contact_sheet_html(
     .camera-status {{ margin-top:8px; font-size:15px; font-weight:700; }}
     .camera-action {{ margin-top:6px; font-size:15px; line-height:1.35; }}
     .camera-stamp {{ margin-top:6px; font-size:13px; color:var(--soft); }}
+    .overview-summary-row {{ width:100%; margin-bottom:12px; }}
+    .overview-hero-row {{ width:100%; margin-bottom:12px; }}
+    .overview-hero-card {{ width:32.1%; display:inline-block; vertical-align:top; margin:0 1.3% 10px 0; padding:14px 16px; border:1px solid var(--line); background:#f8fafc; min-height:112px; }}
+    .overview-hero-card:nth-child(3n) {{ margin-right:0; }}
+    .overview-summary-copy {{ margin-top:8px; font-size:14px; line-height:1.45; color:var(--muted); }}
+    .overview-summary-card {{ width:16%; min-width:120px; display:inline-block; vertical-align:top; margin:0 0.7% 10px 0; padding:10px 12px; border:1px solid var(--line); }}
+    .overview-summary-card:last-child {{ margin-right:0; }}
+    .summary-kicker {{ font-size:12px; font-weight:800; letter-spacing:.04em; text-transform:uppercase; color:var(--soft); }}
+    .summary-value {{ margin-top:4px; font-size:20px; font-weight:800; }}
+    .overview-filter-bar {{ margin:4px 0 12px; }}
+    .filter-pill {{ display:inline-block; margin:0 8px 8px 0; padding:6px 10px; border:1px solid var(--line); border-radius:999px; font-size:12px; font-weight:800; color:var(--muted); }}
+    .filter-pill.active {{ background:#0f172a; border-color:#0f172a; color:#fff; }}
+    .overview-text-row {{ margin-bottom:14px; font-size:15px; line-height:1.55; color:var(--muted); }}
+    .overview-text-row div {{ margin-bottom:4px; }}
+    .overview-grid {{ width:100%; margin-bottom:14px; }}
+    .overview-tile {{ width:15.8%; display:inline-block; vertical-align:top; margin:0 0.8% 0.8% 0; padding:10px 10px 9px; border:1px solid var(--line); }}
+    .overview-tile:nth-child(6n) {{ margin-right:0; }}
+    .overview-tile.safe {{ border-color:#bbf7d0; background:#f0fdf4; }}
+    .overview-tile.borderline {{ border-color:#fde68a; background:#fffbeb; }}
+    .overview-tile.outlier {{ border-color:#fecaca; background:#fef2f2; }}
+    .overview-camera {{ font-size:16px; font-weight:800; }}
+    .overview-status {{ margin-top:4px; font-size:12px; font-weight:800; letter-spacing:.05em; text-transform:uppercase; color:var(--soft); }}
+    .overview-metric {{ margin-top:5px; font-size:13px; line-height:1.35; }}
+    .overview-note {{ margin-top:5px; font-size:12px; color:var(--muted); }}
+    .overview-charts {{ width:100%; margin-top:8px; }}
+    .overview-chart-block {{ margin-top:10px; border:1px solid var(--line); padding:10px; }}
+    .overview-chart-block svg {{ width:100%; height:auto; display:block; }}
     .image-row {{ width:100%; margin-bottom:12px; }}
     .image-panel {{ width:32%; display:inline-block; vertical-align:top; margin-right:1.6%; }}
+    .image-panel.half {{ width:49.2%; }}
     .image-panel:last-child {{ margin-right:0; }}
     .image-label {{ margin-bottom:6px; font-size:13px; font-weight:800; letter-spacing:.04em; text-transform:uppercase; color:var(--soft); }}
     .image-panel img {{ width:100%; max-height:3.35in; display:block; object-fit:cover; border:1px solid var(--line); background:#dce3ec; }}
     .metrics {{ width:100%; border-top:1px solid var(--ink); border-bottom:1px solid var(--line); padding:10px 0 8px; }}
-    .metric-column {{ width:32%; display:inline-block; vertical-align:top; margin-right:1.6%; padding-right:10px; }}
+    .metric-column {{ width:24%; display:inline-block; vertical-align:top; margin-right:1%; padding-right:10px; }}
     .metric-column:last-child {{ margin-right:0; padding-right:0; }}
     .metric-title {{ margin-bottom:8px; font-size:13px; font-weight:800; letter-spacing:.05em; text-transform:uppercase; color:var(--soft); }}
     .metric-line {{ margin:0 0 7px; font-size:15px; line-height:1.35; }}
     .metric-line span {{ color:var(--muted); }}
     .metric-line strong {{ font-weight:800; }}
+    .metric-line.metric-secondary {{ margin-top:8px; font-size:13px; }}
+    .metric-inline-soft {{ color:var(--muted); font-size:13px; font-weight:700; }}
+    .wb-compact-visual {{ margin-top:10px; border:1px solid var(--line); padding:8px; background:#ffffff; }}
+    .wb-compact-visual svg {{ width:100%; height:auto; display:block; }}
     .footer {{ width:100%; margin-top:12px; }}
     .footer-title {{ margin-bottom:6px; font-size:13px; font-weight:800; letter-spacing:.05em; text-transform:uppercase; color:var(--soft); }}
     .footer-line {{ margin:0 0 5px; font-size:14px; color:var(--muted); }}
@@ -9134,6 +13537,8 @@ def render_contact_sheet_html(
         debug_payload = {
             "html_path": str(html_file),
             "resolved_asset_paths": list(asset_validation.get("resolved_assets") or []),
+            "scientific_validation_path": str(payload.get("scientific_validation_path") or ""),
+            "scientific_validation_markdown_path": str(payload.get("scientific_validation_markdown_path") or ""),
             "measurement_values_per_camera": debug_rows,
             "validation_status": {
                 "status_counts": dict(view_model.get("status_counts") or {}),

@@ -15,7 +15,7 @@ from PIL import Image, UnidentifiedImageError
 from .color import is_identity_cdl_payload
 from .commit_values import build_commit_values
 from .execution import raise_if_cancelled
-from .ftps_ingest import DEFAULT_CAMERA_IP_MAP, ingest_ftps_batch, normalize_source_mode, source_mode_label
+from .ftps_ingest import DEFAULT_CAMERA_IP_MAP, normalize_source_mode, run_ftps_ingest_job, source_mode_label
 from .identity import group_key_from_clip_id, inventory_camera_label_from_clip_id, inventory_camera_label_from_source_path
 from .matching import analyze_path
 from .progress import emit_review_progress, review_progress_path_for
@@ -612,6 +612,14 @@ def _camera_rows_for_commit_payload(
     rows: List[Dict[str, object]] = []
     array_by_clip_id: Dict[str, Dict[str, object]] = {}
     excluded_by_clip_id: Dict[str, Dict[str, object]] = {}
+    gray_target_consistency = dict(report_payload.get("gray_target_consistency") or {})
+    dominant_target_class = str(gray_target_consistency.get("dominant_target_class") or "").strip().lower()
+    non_dominant_clip_ids = {
+        str(item).strip()
+        for item in list(gray_target_consistency.get("non_dominant_clip_ids") or [])
+        if str(item).strip()
+    }
+    mixed_target_classes = bool(gray_target_consistency.get("mixed_target_classes"))
     for excluded in list((physical_validation or {}).get("excluded_cameras") or []):
         clip_id = str(excluded.get("clip_id") or "").strip()
         if clip_id:
@@ -634,6 +642,14 @@ def _camera_rows_for_commit_payload(
         if not camera_id or not commit_values:
             continue
         exclusion = excluded_by_clip_id.get(clip_id, {})
+        exclusion_reasons = [str(reason) for reason in exclusion.get("reasons", []) if str(reason).strip()]
+        gray_target_class = str(item.get("gray_target_class") or "unresolved").strip().lower()
+        if mixed_target_classes and clip_id in non_dominant_clip_ids:
+            exclusion_reasons.append("Mixed gray-target classes across retained cameras")
+            exclusion = {
+                **exclusion,
+                "reasons": exclusion_reasons,
+            }
         confidence = float(item.get("confidence", 0.0) or 0.0)
         trust_class = str(item.get("trust_class") or "").strip()
         if not trust_class:
@@ -646,7 +662,7 @@ def _camera_rows_for_commit_payload(
         trust_reason = str(item.get("trust_reason") or "").strip()
         if not trust_reason:
             if exclusion:
-                trust_reason = ", ".join(str(reason) for reason in exclusion.get("reasons", []) if str(reason).strip()) or "Excluded due to inconsistent measurement"
+                trust_reason = ", ".join(exclusion_reasons) or "Excluded due to inconsistent measurement"
             elif confidence < PHYSICAL_MIN_CONFIDENCE_THRESHOLD:
                 trust_reason = "Low confidence"
             else:
@@ -671,7 +687,9 @@ def _camera_rows_for_commit_payload(
                 "correction_confidence": correction_confidence,
                 "is_hero_camera": bool(item.get("is_hero_camera")),
                 "excluded_from_commit": bool(exclusion),
-                "exclusion_reasons": [str(reason) for reason in exclusion.get("reasons", []) if str(reason).strip()],
+                "exclusion_reasons": exclusion_reasons,
+                "gray_target_class": gray_target_class,
+                "gray_target_is_dominant": bool(gray_target_class and gray_target_class == dominant_target_class),
             }
         )
     if rows or not isinstance(array_payload, dict):
@@ -738,6 +756,7 @@ def _write_commit_payload_artifacts(
     array_payload: Optional[Dict[str, object]],
     physical_validation: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
+    gray_target_consistency = dict(report_payload.get("gray_target_consistency") or (report_payload.get("run_assessment") or {}).get("gray_target_consistency") or {})
     rows = _camera_rows_for_commit_payload(
         report_payload=report_payload,
         array_payload=array_payload,
@@ -774,6 +793,8 @@ def _write_commit_payload_artifacts(
             "excluded_from_commit": bool(row.get("excluded_from_commit")),
             "exclusion_reasons": [str(reason) for reason in row.get("exclusion_reasons", []) if str(reason).strip()],
             "safe_to_commit": not bool(row.get("excluded_from_commit")),
+            "gray_target_class": str(row.get("gray_target_class") or ""),
+            "gray_target_is_dominant": bool(row.get("gray_target_is_dominant")),
             "notes": [
                 *([str(row["note"])] if str(row["note"]).strip() else []),
                 *(
@@ -821,6 +842,8 @@ def _write_commit_payload_artifacts(
                 "is_hero_camera": bool(row["is_hero_camera"]),
                 "excluded_from_commit": bool(row.get("excluded_from_commit")),
                 "exclusion_reasons": [str(reason) for reason in row.get("exclusion_reasons", []) if str(reason).strip()],
+                "gray_target_class": str(row.get("gray_target_class") or ""),
+                "gray_target_is_dominant": bool(row.get("gray_target_is_dominant")),
             }
             for row in rows
         ],
@@ -841,6 +864,7 @@ def _write_commit_payload_artifacts(
                 "reference_use": str(row.get("reference_use") or ""),
                 "correction_confidence": str(row.get("correction_confidence") or ""),
                 "is_hero_camera": bool(row["is_hero_camera"]),
+                "gray_target_class": str(row.get("gray_target_class") or ""),
             }
             for row in rows
             if not bool(row.get("excluded_from_commit"))
@@ -853,10 +877,12 @@ def _write_commit_payload_artifacts(
                 "inventory_camera_ip": str(row.get("inventory_camera_ip") or ""),
                 "trust_class": str(row.get("trust_class") or ""),
                 "reasons": [str(reason) for reason in row.get("exclusion_reasons", []) if str(reason).strip()],
+                "gray_target_class": str(row.get("gray_target_class") or ""),
             }
             for row in rows
             if bool(row.get("excluded_from_commit"))
         ],
+        "gray_target_consistency": gray_target_consistency,
         "per_camera_payloads": per_camera_paths,
     }
     aggregate_path = review_commit_payload_path_for(analysis_root)
@@ -919,12 +945,17 @@ def _resolve_run_assessment(
     payload_assessment = dict(report_payload.get("run_assessment") or {})
     if str(payload_assessment.get("status") or "").strip():
         return payload_assessment
+    gray_target_consistency = dict(report_payload.get("gray_target_consistency") or {})
     excluded_camera_count = int(physical_validation.get("excluded_camera_count", 0) or 0)
     camera_count = max(int(physical_validation.get("included_camera_count", 0) or 0) + excluded_camera_count, 0)
     physical_status = str(physical_validation.get("status") or "")
     confidence_score = float(recommendation.get("confidence_score", 0.0) or 0.0)
     cluster_usable = bool(physical_validation.get("cluster_is_usable_after_exclusions"))
-    if physical_status == "failed" or not cluster_usable and excluded_camera_count:
+    if bool(gray_target_consistency.get("mixed_target_classes")):
+        status = "DO_NOT_PUSH"
+        recommendation_strength = "LOW_CONFIDENCE"
+        operator_note = "Review is required before commit because retained cameras were measured from mixed gray target classes."
+    elif physical_status == "failed" or not cluster_usable and excluded_camera_count:
         status = "DO_NOT_PUSH"
         recommendation_strength = "LOW_CONFIDENCE"
         operator_note = "Do not push these corrections later without remeasuring the set."
@@ -950,8 +981,16 @@ def _resolve_run_assessment(
         "anchor_camera": None,
         "anchor_trust_class": "",
         "anchor_summary": "Legacy report payload did not include anchor trust details.",
-        "gating_reasons": list(physical_validation.get("warnings") or []),
+        "gating_reasons": [
+            *list(physical_validation.get("warnings") or []),
+            *(
+                ["Retained cameras mix gray-sphere and gray-card solves, so safe commit export is blocked."]
+                if bool(gray_target_consistency.get("mixed_target_classes"))
+                else []
+            ),
+        ],
         "operator_note": operator_note,
+        "gray_target_consistency": gray_target_consistency,
     }
 
 
@@ -1368,6 +1407,12 @@ def validate_review_run_contract(analysis_dir: str) -> Dict[str, object]:
     result["human_summary"] = human_summary
     result["commit_payload"] = commit_payload
     result["post_apply_validation"] = post_apply_validation
+    gray_target_consistency = dict(report_payload.get("gray_target_consistency") or {})
+    dominant_target_class = str(gray_target_consistency.get("dominant_target_class") or "").strip().lower()
+    if bool(gray_target_consistency.get("mixed_target_classes")):
+        result["errors"].append("Target class mismatch — run invalid")
+    elif str(report_payload.get("target_type") or "").strip().lower() == "gray_sphere" and dominant_target_class and dominant_target_class != "sphere":
+        result["errors"].append("Gray-sphere review resolved to a non-sphere retained target class — run invalid")
 
     if result["errors"]:
         result["status"] = "failed"
@@ -1406,6 +1451,7 @@ def review_calibration(
     ftps_reel: Optional[str] = None,
     ftps_clip_spec: Optional[str] = None,
     ftps_cameras: Optional[List[str]] = None,
+    ftps_local_root: Optional[str] = None,
     ftps_username: str = "ftp1",
     ftps_password: str = "12345678",
     target_type: str,
@@ -1432,13 +1478,18 @@ def review_calibration(
     run_label: Optional[str] = None,
     matching_domain: str = "scene",
     review_mode: str = "full_contact_sheet",
+    report_focus: str = "auto",
     preview_mode: str = "monitoring",
     preview_output_space: Optional[str] = None,
     preview_output_gamma: Optional[str] = None,
     preview_highlight_rolloff: Optional[str] = None,
     preview_shadow_rolloff: Optional[str] = None,
     preview_lut: Optional[str] = None,
+    preview_still_format: str = "tiff",
     require_real_redline: bool = False,
+    artifact_mode: str = "production",
+    sphere_assist_file: Optional[str] = None,
+    focus_validation: bool = False,
 ) -> Dict[str, object]:
     workflow_started_at = time.perf_counter()
     invocation_source = str(os.getenv("R3DMATCH_INVOCATION_SOURCE", "direct_cli") or "direct_cli")
@@ -1483,15 +1534,17 @@ def review_calibration(
             raise ValueError("FTPS source mode requires --ftps-reel.")
         if not ftps_clip_spec:
             raise ValueError("FTPS source mode requires --ftps-clips.")
-        ingest_root = Path(resolved_out_dir).expanduser().resolve() / "ingest"
+        ingest_root = Path(ftps_local_root).expanduser().resolve() if str(ftps_local_root or "").strip() else Path(resolved_out_dir).expanduser().resolve() / "ingest"
         raise_if_cancelled("Run cancelled before FTPS ingest.")
-        ingest_manifest = ingest_ftps_batch(
+        ingest_manifest = run_ftps_ingest_job(
+            action="download",
             out_dir=str(ingest_root),
             reel_identifier=ftps_reel,
             clip_spec=ftps_clip_spec,
             requested_cameras=ftps_cameras,
             username=ftps_username,
             password=ftps_password,
+            processing_requested_after_ingest=True,
         )
         source_input_path = str(ingest_root)
     raise_if_cancelled("Run cancelled before analysis.")
@@ -1525,6 +1578,7 @@ def review_calibration(
         runtime_trace_path=str(Path(resolved_out_dir).expanduser().resolve() / "lightweight_runtime_trace.json"),
         invocation_source=invocation_source,
         measurement_source="rendered_preview_ipp2",
+        sphere_assist_path=sphere_assist_file,
     )
     raise_if_cancelled("Run cancelled before review package generation.")
     emit_review_progress(
@@ -1546,6 +1600,7 @@ def review_calibration(
         run_label=resolved_run_label,
         matching_domain=resolved_matching_domain,
         review_mode=review_mode,
+        report_focus=report_focus,
         selected_clip_ids=merged_clip_ids,
         selected_clip_groups=merged_clip_groups,
         preview_mode=preview_mode,
@@ -1554,6 +1609,7 @@ def review_calibration(
         preview_highlight_rolloff=preview_highlight_rolloff,
         preview_shadow_rolloff=preview_shadow_rolloff,
         preview_lut=preview_lut,
+        preview_still_format=preview_still_format,
         calibration_roi=calibration_roi,
         target_strategies=target_strategies,
         reference_clip_id=reference_clip_id,
@@ -1562,6 +1618,8 @@ def review_calibration(
         manual_target_stops=manual_target_stops,
         manual_target_ire=manual_target_ire,
         require_real_redline=require_real_redline,
+        focus_validation=focus_validation,
+        artifact_mode=artifact_mode,
         source_mode=resolved_source_mode,
         source_mode_label_value=source_mode_label(resolved_source_mode),
         source_input_path=source_input_path,
@@ -1580,6 +1638,7 @@ def review_calibration(
     package["source_input_path"] = source_input_path
     package["ingest_manifest"] = ingest_manifest
     package["clip_subset_file"] = subset_definition["path"] if subset_definition else None
+    package["sphere_assist_file"] = str(Path(sphere_assist_file).expanduser().resolve()) if str(sphere_assist_file or "").strip() else None
     validation = validate_review_run_contract(resolved_out_dir)
     package["review_validation"] = validation
     package_manifest_path = package.get("package_manifest")

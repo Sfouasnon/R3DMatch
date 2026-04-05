@@ -112,6 +112,64 @@ Direct CLI wrapper:
   --target-strategy median
 ```
 
+### 4. FTPS ingest workflow
+
+Recommended FTPS operator flow in the web UI:
+
+1. Launch with `/bin/sh scripts/run_r3dmatch_web.sh 5000`
+2. Set `Source Mode = FTPS Camera Pull`
+3. Enter:
+   - `FTPS Reel`
+   - `Clip Numbers / Ranges`
+   - optional `Camera Subset`
+   - optional `Local Ingest Cache Root`
+4. Use one of:
+   - `Discover`
+   - `Download`
+   - `Download + Process`
+   - `Retry Failed`
+
+Direct CLI ingest wrapper:
+
+```bash
+/bin/sh scripts/run_r3dmatch_ingest.sh \
+  --action discover \
+  --out /path/to/ingest \
+  --ftps-reel 007 \
+  --ftps-clips 63 \
+  --ftps-camera GA
+```
+
+Direct CLI download + process:
+
+```bash
+./.venv/bin/python -m r3dmatch.cli ftps-download-process \
+  --out /path/to/review \
+  --ftps-local-root /Volumes/RAID/ingest/063 \
+  --ftps-reel 007 \
+  --ftps-clips 63 \
+  --target-type gray_sphere \
+  --processing-mode both \
+  --backend red \
+  --review-mode full_contact_sheet \
+  --preview-mode monitoring \
+  --target-strategy median
+```
+
+Process existing local ingest without re-downloading:
+
+```bash
+./.venv/bin/python -m r3dmatch.cli process-local-ingest \
+  /Volumes/RAID/ingest/063 \
+  --out /path/to/review \
+  --target-type gray_sphere \
+  --processing-mode both \
+  --backend red \
+  --review-mode full_contact_sheet \
+  --preview-mode monitoring \
+  --target-strategy median
+```
+
 Key outputs:
 
 - `report/contact_sheet.html`
@@ -154,6 +212,33 @@ The contact sheet is authored once in HTML and the final PDF is exported from th
 - `contact_sheet.html` is the master artifact
 - `preview_contact_sheet.pdf` is generated from the HTML export path
 - no parallel custom PDF layout path is used for the contact sheet
+
+## macOS App Build
+
+Build a portable Apple Silicon app bundle:
+
+```bash
+/bin/sh scripts/build_macos_app.sh
+```
+
+Smoke-check the bundle:
+
+```bash
+dist/R3DMatch.app/Contents/MacOS/R3DMatch --check
+```
+
+Zip it for transport:
+
+```bash
+/bin/sh scripts/package_macos_app.sh
+```
+
+Runtime assumptions on the destination Mac:
+
+- Apple Silicon macOS
+- external `RED_SDK_ROOT` if RED backend is required
+- optional `RED_SDK_REDISTRIBUTABLE_DIR`
+- Homebrew cairo / pango / glib libraries available under `/opt/homebrew/lib` for WeasyPrint HTML→PDF export
 
 ## Supporting Docs
 
