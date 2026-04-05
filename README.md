@@ -1,6 +1,6 @@
 # R3DMatch
 
-**R3DMatch** is an IPP2-first calibration and verification system for multi-camera RED workflows. R3DMatch analyzes a gray sphere using sci-kit, samples RGB data in a pixel array in three bands across the middle of the sphere. That data is translated into luminance, then IRE to match on set workflows on display transfomred RED camera video. R3DMatch then computes exposure, white balance, and tint corrections, and produces a dense, diagnostic contact sheet for validation. These changes can be pushed to RED cameras over network via RCP2 for live camera matching pre-capture. 
+**R3DMatch** is an IPP2-first calibration and verification system for multi-camera RED workflows. R3DMatch analyzes a gray sphere using sci-kit, samples RGB data in a pixel array in three bands across the middle of the sphere. That data is translated into luminance, then IRE to match on set workflows on display transformed R3Ds. R3DMatch computes exposure, white balance, and tint corrections, and produces a dense, diagnostic contact sheet for validation. These changes can be pushed to RED cameras over network via RCP2 using --exposureAdjust --kelvin --tint for live camera matching. 
 
 ---
 
