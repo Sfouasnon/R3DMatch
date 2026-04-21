@@ -15,6 +15,7 @@ from .sdk import load_configured_red_native_module, red_sdk_configuration_error,
 DESKTOP_CONFIG_ENV = "R3DMATCH_USER_CONFIG_PATH"
 DESKTOP_REDLINE_SOURCE_ENV = "R3DMATCH_DESKTOP_REDLINE_SOURCE"
 DESKTOP_REDLINE_KEY = "redline_path"
+DEFAULT_DESKTOP_RED_SDK_ROOT = "/Users/sfouasnon/Desktop/R3DSplat_Dependecies/RED_SDK/R3DSDKv9_2_0"
 
 
 def desktop_config_path() -> Path:
@@ -110,6 +111,7 @@ def recommended_dyld_fallback_library_path() -> Dict[str, str]:
 
 
 def ensure_runtime_environment() -> Dict[str, str]:
+    os.environ.setdefault("RED_SDK_ROOT", DEFAULT_DESKTOP_RED_SDK_ROOT)
     _apply_persisted_redline_environment()
     recommendation = recommended_dyld_fallback_library_path()
     if recommendation["source"] == "auto_homebrew" and recommendation["value"]:

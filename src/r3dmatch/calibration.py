@@ -1486,19 +1486,78 @@ def build_array_calibration_from_analysis(
         raise ValueError("array calibration requires at least one clip result")
     resolved_group_key = group_key or derive_array_group_key(input_path)
     resolved_capture_id = capture_id or Path(input_path).expanduser().resolve().name or resolved_group_key
+
+    def _measurement_is_valid(item: object) -> bool:
+        diagnostics = getattr(item, "diagnostics", {}) or {}
+        explicit_flag = diagnostics.get("measurement_valid", diagnostics.get("gray_target_measurement_valid"))
+        if explicit_flag is not None:
+            return bool(explicit_flag)
+        for key in ("measured_log2_luminance_raw", "measured_log2_luminance_monitoring", "measured_log2_luminance"):
+            value = diagnostics.get(key)
+            if isinstance(value, (int, float)):
+                return True
+        return False
+
+    def _resolved_clip_log2(item: object) -> float:
+        diagnostics = getattr(item, "diagnostics", {}) or {}
+        for key in ("measured_log2_luminance_raw", "measured_log2_luminance_monitoring", "measured_log2_luminance"):
+            value = diagnostics.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+        fallback = getattr(item, "measured_log2", 0.0)
+        return float(fallback if isinstance(fallback, (int, float)) else 0.0)
+
+    valid_results = [item for item in results if _measurement_is_valid(item)]
+    excluded_clip_ids = [str(getattr(item, "clip_id", "") or "") for item in results if not _measurement_is_valid(item)]
+    if not valid_results:
+        print(f"[r3dmatch] array calibration valid_clips=0 total_clips={len(results)}")
+        if excluded_clip_ids:
+            print(f"[r3dmatch] array calibration excluded_invalid_measurements={excluded_clip_ids}")
+        return ArrayCalibration(
+            schema="r3dmatch_array_calibration_v1",
+            capture_id=resolved_capture_id,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            input_path=str(Path(input_path).expanduser().resolve()),
+            mode="array_gray_sphere",
+            backend=str(getattr(results[0], "backend", "") or ""),
+            measurement_domain="scene",
+            group_key=resolved_group_key,
+            target=ArrayTarget(
+                method="no_valid_measurements",
+                exposure=ExposureTarget(
+                    log2_luminance_target=0.0,
+                    estimator="none",
+                    included_camera_count=0,
+                    excluded_camera_ids=list(excluded_clip_ids),
+                ),
+                color=ColorTarget(
+                    target_rgb_chromaticity=[1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
+                    estimator="none",
+                    included_camera_count=0,
+                    excluded_camera_ids=list(excluded_clip_ids),
+                ),
+            ),
+            global_scene_intent={
+                "enabled": False,
+                "global_exposure_offset_stops": 0.0,
+                "notes": "No valid gray-target measurements were available.",
+                "white_balance_model": {
+                    "model_key": None,
+                    "model_label": None,
+                    "shared_kelvin": None,
+                    "shared_tint": None,
+                    "metrics": {},
+                    "candidates": [],
+                },
+            },
+            cameras=[],
+        )
+
     measured_log2 = np.array(
-        [
-            float(
-                item.diagnostics.get(
-                    "measured_log2_luminance_raw",
-                    item.diagnostics["measured_log2_luminance_monitoring"],
-                )
-            )
-            for item in results
-        ],
+        [_resolved_clip_log2(item) for item in valid_results],
         dtype=np.float32,
     )
-    measured_chroma = np.array([item.diagnostics["measured_rgb_chromaticity"] for item in results], dtype=np.float32)
+    measured_chroma = np.array([item.diagnostics["measured_rgb_chromaticity"] for item in valid_results], dtype=np.float32)
     target_log2 = float(np.median(percentile_clip(measured_log2)))
     target_chroma = percentile_clip(measured_chroma[:, 0]), percentile_clip(measured_chroma[:, 1]), percentile_clip(measured_chroma[:, 2])
     target_rgb = [
@@ -1506,7 +1565,9 @@ def build_array_calibration_from_analysis(
         float(np.median(target_chroma[1])),
         float(np.median(target_chroma[2])),
     ]
-    print(f"[r3dmatch] array calibration clips={len(results)}")
+    print(f"[r3dmatch] array calibration valid_clips={len(valid_results)} total_clips={len(results)}")
+    if excluded_clip_ids:
+        print(f"[r3dmatch] array calibration excluded_invalid_measurements={excluded_clip_ids}")
     print(f"[r3dmatch] shared target exposure monitoring log2={target_log2:.6f}")
     print(f"[r3dmatch] shared target chromaticity={target_rgb}")
 
@@ -1522,13 +1583,13 @@ def build_array_calibration_from_analysis(
                 "sample_log2_spread": float(item.diagnostics.get("neutral_sample_log2_spread", 0.0) or 0.0),
                 "sample_chromaticity_spread": float(item.diagnostics.get("neutral_sample_chromaticity_spread", 0.0) or 0.0),
             }
-            for item in results
+            for item in valid_results
         ],
         target_rgb_chromaticity=target_rgb,
     )
 
     cameras: list[CameraCalibrationEntry] = []
-    for item in results:
+    for item in valid_results:
         measured_rgb = list(item.diagnostics["measured_rgb_mean"])
         measured_chromaticity = list(item.diagnostics["measured_rgb_chromaticity"])
         raw_gains = [
@@ -1538,12 +1599,7 @@ def build_array_calibration_from_analysis(
         ]
         gain_norm = (raw_gains[0] * raw_gains[1] * raw_gains[2]) ** (1.0 / 3.0)
         normalized_gains = [float(value / max(gain_norm, 1e-6)) for value in raw_gains]
-        measured_log2_value = float(
-            item.diagnostics.get(
-                "measured_log2_luminance_raw",
-                item.diagnostics["measured_log2_luminance_monitoring"],
-            )
-        )
+        measured_log2_value = _resolved_clip_log2(item)
         exposure_offset = float(target_log2 - measured_log2_value)
         wb_solution = dict(wb_model_solution["clips"][item.clip_id])
         color_residual = float(wb_solution["pre_neutral_residual"])
@@ -1613,7 +1669,7 @@ def build_array_calibration_from_analysis(
         created_at=datetime.now(timezone.utc).isoformat(),
         input_path=str(Path(input_path).expanduser().resolve()),
         mode="array_gray_sphere",
-        backend=str(getattr(results[0], "backend", "") or ""),
+        backend=str(getattr(valid_results[0], "backend", "") or getattr(results[0], "backend", "") or ""),
         measurement_domain="scene",
         group_key=resolved_group_key,
         target=ArrayTarget(
@@ -1621,14 +1677,14 @@ def build_array_calibration_from_analysis(
             exposure=ExposureTarget(
                 log2_luminance_target=target_log2,
                 estimator="median",
-                included_camera_count=len(results),
-                excluded_camera_ids=[],
+                included_camera_count=len(valid_results),
+                excluded_camera_ids=list(excluded_clip_ids),
             ),
             color=ColorTarget(
                 target_rgb_chromaticity=target_rgb,
                 estimator="median",
-                included_camera_count=len(results),
-                excluded_camera_ids=[],
+                included_camera_count=len(valid_results),
+                excluded_camera_ids=list(excluded_clip_ids),
             ),
         ),
         global_scene_intent={

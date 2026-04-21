@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import math
+import os
 import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -67,6 +69,8 @@ def analyze_path(
     invocation_source: str = "direct_cli",
     measurement_source: str = "scene_sdk_decode_with_proxy_monitoring",
     sphere_assist_path: Optional[str] = None,
+    measurement_workers: Optional[int] = None,
+    emit_sidecars: bool = True,
 ) -> Dict[str, object]:
     analysis_started_at = time.perf_counter()
     emit_review_progress(
@@ -121,7 +125,8 @@ def analyze_path(
     analysis_dir = out_root / "analysis"
     sidecar_dir = out_root / "sidecars"
     analysis_dir.mkdir(parents=True, exist_ok=True)
-    sidecar_dir.mkdir(parents=True, exist_ok=True)
+    if emit_sidecars:
+        sidecar_dir.mkdir(parents=True, exist_ok=True)
     rendered_preview_context = None
     if str(measurement_source or "").strip() == "rendered_preview_ipp2":
         rendered_preview_context = _resolve_rendered_preview_context()
@@ -136,48 +141,127 @@ def analyze_path(
     )
 
     provisional: list[ClipResult] = []
-    for clip_index, clip in enumerate(clips, start=1):
-        raise_if_cancelled("Run cancelled during clip measurement.")
-        clip_id = clip_id_from_path(str(clip))
-        clip_started_at = time.perf_counter()
-        emit_review_progress(
-            progress_path,
-            phase="clip_measurement_start",
-            detail="Measuring clip." if str(measurement_source or "").strip() != "rendered_preview_ipp2" else "Rendering and measuring clip in IPP2.",
-            stage_label="Measuring clips",
-            clip_index=clip_index,
-            clip_count=len(clips),
-            current_clip_id=clip_id,
-            elapsed_seconds=time.perf_counter() - analysis_started_at,
-        )
-        provisional.append(
-            analyze_clip(
-                str(clip),
-                mode=mode,
-                backend=backend,
-                lut_override=lut_override,
-                sample_count=sample_count,
-                sampling_strategy=sampling_strategy,
-                calibration_roi=calibration_roi,
-                target_type=target_type,
-                half_res_decode=half_res_decode,
-                measurement_source=measurement_source,
-                measurement_output_dir=str(out_root),
-                rendered_preview_context=rendered_preview_context,
-                sphere_assist_entry=dict(sphere_assist_entries.get(clip_id) or {}) or None,
+    resolved_measurement_workers = _resolve_measurement_worker_count(
+        requested_workers=measurement_workers,
+        measurement_source=measurement_source,
+        clip_count=len(clips),
+    )
+    emit_review_progress(
+        progress_path,
+        phase="measurement_workers_resolved",
+        detail=f"Measurement worker count resolved to {resolved_measurement_workers}.",
+        stage_label="Measuring clips",
+        clip_count=len(clips),
+        elapsed_seconds=time.perf_counter() - analysis_started_at,
+        extra={
+            "measurement_workers": int(resolved_measurement_workers),
+            "measurement_source": str(measurement_source or ""),
+        },
+    )
+
+    if resolved_measurement_workers <= 1:
+        for clip_index, clip in enumerate(clips, start=1):
+            raise_if_cancelled("Run cancelled during clip measurement.")
+            clip_id = clip_id_from_path(str(clip))
+            clip_started_at = time.perf_counter()
+            emit_review_progress(
+                progress_path,
+                phase="clip_measurement_start",
+                detail="Measuring clip." if str(measurement_source or "").strip() != "rendered_preview_ipp2" else "Rendering and measuring clip in IPP2.",
+                stage_label="Measuring clips",
+                clip_index=clip_index,
+                clip_count=len(clips),
+                current_clip_id=clip_id,
+                elapsed_seconds=time.perf_counter() - analysis_started_at,
             )
-        )
-        emit_review_progress(
-            progress_path,
-            phase="clip_measurement_complete",
-            detail=f"Finished measuring {clip_id}.",
-            stage_label="Measuring clips",
-            clip_index=clip_index,
-            clip_count=len(clips),
-            current_clip_id=clip_id,
-            elapsed_seconds=time.perf_counter() - analysis_started_at,
-            extra={"clip_elapsed_seconds": time.perf_counter() - clip_started_at},
-        )
+            provisional.append(
+                analyze_clip(
+                    str(clip),
+                    mode=mode,
+                    backend=backend,
+                    lut_override=lut_override,
+                    sample_count=sample_count,
+                    sampling_strategy=sampling_strategy,
+                    calibration_roi=calibration_roi,
+                    target_type=target_type,
+                    half_res_decode=half_res_decode,
+                    measurement_source=measurement_source,
+                    measurement_output_dir=str(out_root),
+                    rendered_preview_context=rendered_preview_context,
+                    sphere_assist_entry=dict(sphere_assist_entries.get(clip_id) or {}) or None,
+                )
+            )
+            emit_review_progress(
+                progress_path,
+                phase="clip_measurement_complete",
+                detail=f"Finished measuring {clip_id}.",
+                stage_label="Measuring clips",
+                clip_index=clip_index,
+                clip_count=len(clips),
+                current_clip_id=clip_id,
+                elapsed_seconds=time.perf_counter() - analysis_started_at,
+                extra={"clip_elapsed_seconds": time.perf_counter() - clip_started_at},
+            )
+    else:
+        provisional_by_index: Dict[int, ClipResult] = {}
+        future_map: Dict[concurrent.futures.Future[ClipResult], Dict[str, object]] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=resolved_measurement_workers, thread_name_prefix="r3dmatch-measure") as executor:
+            for clip_index, clip in enumerate(clips, start=1):
+                raise_if_cancelled("Run cancelled during clip measurement dispatch.")
+                clip_id = clip_id_from_path(str(clip))
+                clip_started_at = time.perf_counter()
+                emit_review_progress(
+                    progress_path,
+                    phase="clip_measurement_start",
+                    detail="Measuring clip." if str(measurement_source or "").strip() != "rendered_preview_ipp2" else "Rendering and measuring clip in IPP2.",
+                    stage_label="Measuring clips",
+                    clip_index=clip_index,
+                    clip_count=len(clips),
+                    current_clip_id=clip_id,
+                    elapsed_seconds=time.perf_counter() - analysis_started_at,
+                    extra={"measurement_workers": int(resolved_measurement_workers)},
+                )
+                future = executor.submit(
+                    analyze_clip,
+                    str(clip),
+                    mode=mode,
+                    backend=backend,
+                    lut_override=lut_override,
+                    sample_count=sample_count,
+                    sampling_strategy=sampling_strategy,
+                    calibration_roi=calibration_roi,
+                    target_type=target_type,
+                    half_res_decode=half_res_decode,
+                    measurement_source=measurement_source,
+                    measurement_output_dir=str(out_root),
+                    rendered_preview_context=rendered_preview_context,
+                    sphere_assist_entry=dict(sphere_assist_entries.get(clip_id) or {}) or None,
+                )
+                future_map[future] = {
+                    "clip_index": int(clip_index),
+                    "clip_id": clip_id,
+                    "started_at": float(clip_started_at),
+                }
+            for future in concurrent.futures.as_completed(future_map):
+                raise_if_cancelled("Run cancelled while collecting clip measurements.")
+                meta = future_map[future]
+                result = future.result()
+                provisional_by_index[int(meta["clip_index"])] = result
+                emit_review_progress(
+                    progress_path,
+                    phase="clip_measurement_complete",
+                    detail=f"Finished measuring {meta['clip_id']}.",
+                    stage_label="Measuring clips",
+                    clip_index=int(meta["clip_index"]),
+                    clip_count=len(clips),
+                    current_clip_id=str(meta["clip_id"]),
+                    elapsed_seconds=time.perf_counter() - analysis_started_at,
+                    extra={
+                        "clip_elapsed_seconds": time.perf_counter() - float(meta["started_at"]),
+                        "measurement_workers": int(resolved_measurement_workers),
+                    },
+                )
+        provisional = [provisional_by_index[index] for index in sorted(provisional_by_index)]
 
     should_use_array_batch = calibration_mode == "array-gray-sphere" or (
         Path(input_path).expanduser().resolve().is_dir()
@@ -330,7 +414,8 @@ def analyze_path(
         )
         final_results.append(result)
         write_json(analysis_dir / f"{result.clip_id}.analysis.json", result.to_dict())
-        write_sidecar_file(sidecar_dir, result)
+        if emit_sidecars:
+            write_sidecar_file(sidecar_dir, result)
 
     summary = {
         "input_path": str(Path(input_path).expanduser().resolve()),
@@ -338,7 +423,8 @@ def analyze_path(
         "backend": backend,
         "clip_count": len(final_results),
         "analysis_dir": str(analysis_dir),
-        "sidecar_dir": str(sidecar_dir),
+        "sidecar_dir": str(sidecar_dir) if emit_sidecars else "",
+        "sidecar_generation_enabled": bool(emit_sidecars),
         "group_baselines": group_baselines,
         "array_calibration": (
             {
@@ -716,6 +802,24 @@ def analyze_clip(
     )
 
 
+def _resolve_measurement_worker_count(
+    *,
+    requested_workers: Optional[int],
+    measurement_source: str,
+    clip_count: int,
+) -> int:
+    if clip_count <= 1:
+        return 1
+    if requested_workers is not None:
+        return max(1, min(int(requested_workers), int(clip_count)))
+    normalized_source = str(measurement_source or "").strip().lower()
+    if normalized_source != "rendered_preview_ipp2":
+        return 1
+    cpu_cap = max(1, (os.cpu_count() or 2))
+    safe_default = min(2, clip_count, cpu_cap)
+    return max(1, safe_default)
+
+
 def _resolve_rendered_preview_context() -> Dict[str, object]:
     from .report import (
         _detect_redline_capabilities,
@@ -766,6 +870,7 @@ def _analyze_clip_via_rendered_preview(
     sphere_assist_entry: Optional[Dict[str, object]] = None,
 ) -> ClipResult:
     from .report import (
+        _measurement_valid_flag,
         _measure_rendered_preview_roi_ipp2,
         _preview_transform_label,
         _render_preview_frame_with_retries,
@@ -810,12 +915,14 @@ def _analyze_clip_via_rendered_preview(
     measure_seconds = time.perf_counter() - measure_started_at
     function_durations["measure_rendered_preview_seconds"] = float(measure_seconds)
 
+    measurement_valid = _measurement_valid_flag(measured)
     measured_log2 = float(
         measured.get(
             "measured_log2_luminance_monitoring",
-            measured.get("measured_log2_luminance", 0.0),
+            measured.get("measured_log2_luminance", global_reference),
         )
-        or 0.0
+        if measurement_valid
+        else global_reference
     )
     raw_offset = float(global_reference - measured_log2)
     measurement_runtime = dict(measured.get("measurement_runtime") or {})
@@ -887,9 +994,11 @@ def _analyze_clip_via_rendered_preview(
     diagnostics = {
         "sampled_frames": 1,
         "accepted_frames": 1,
-        "measured_log2_luminance": measured_log2,
-        "measured_log2_luminance_monitoring": measured_log2,
-        "measured_log2_luminance_raw": measured_log2,
+        "measurement_valid": bool(measurement_valid),
+        "gray_target_measurement_valid": bool(measurement_valid),
+        "measured_log2_luminance": measured_log2 if measurement_valid else None,
+        "measured_log2_luminance_monitoring": measured_log2 if measurement_valid else None,
+        "measured_log2_luminance_raw": measured_log2 if measurement_valid else None,
         "measured_rgb_mean": [float(value) for value in measured.get("measured_rgb_mean", [0.0, 0.0, 0.0])],
         "measured_rgb_chromaticity": [float(value) for value in measured.get("measured_rgb_chromaticity", [1 / 3, 1 / 3, 1 / 3])],
         "valid_pixel_count": int(measured.get("valid_pixel_count", 0) or 0),
@@ -969,17 +1078,17 @@ def _analyze_clip_via_rendered_preview(
     diagnostics.update(
         {
             "gray_exposure_summary": str(measured.get("gray_exposure_summary") or "n/a"),
-            "bright_ire": float(measured.get("bright_ire", 0.0) or 0.0),
-            "center_ire": float(measured.get("center_ire", 0.0) or 0.0),
-            "dark_ire": float(measured.get("dark_ire", 0.0) or 0.0),
-            "sample_1_ire": float(measured.get("sample_1_ire", measured.get("bright_ire", 0.0)) or 0.0),
-            "sample_2_ire": float(measured.get("sample_2_ire", measured.get("center_ire", 0.0)) or 0.0),
-            "sample_3_ire": float(measured.get("sample_3_ire", measured.get("dark_ire", 0.0)) or 0.0),
-            "top_ire": float(measured.get("top_ire", 0.0) or 0.0),
-            "mid_ire": float(measured.get("mid_ire", 0.0) or 0.0),
-            "bottom_ire": float(measured.get("bottom_ire", 0.0) or 0.0),
-            "zone_spread_ire": float(measured.get("zone_spread_ire", 0.0) or 0.0),
-            "zone_spread_stops": float(measured.get("zone_spread_stops", 0.0) or 0.0),
+            "bright_ire": (float(measured["bright_ire"]) if measured.get("bright_ire") not in (None, "") else None),
+            "center_ire": (float(measured["center_ire"]) if measured.get("center_ire") not in (None, "") else None),
+            "dark_ire": (float(measured["dark_ire"]) if measured.get("dark_ire") not in (None, "") else None),
+            "sample_1_ire": (float(measured.get("sample_1_ire", measured.get("bright_ire"))) if measured.get("sample_1_ire", measured.get("bright_ire")) not in (None, "") else None),
+            "sample_2_ire": (float(measured.get("sample_2_ire", measured.get("center_ire"))) if measured.get("sample_2_ire", measured.get("center_ire")) not in (None, "") else None),
+            "sample_3_ire": (float(measured.get("sample_3_ire", measured.get("dark_ire"))) if measured.get("sample_3_ire", measured.get("dark_ire")) not in (None, "") else None),
+            "top_ire": (float(measured["top_ire"]) if measured.get("top_ire") not in (None, "") else None),
+            "mid_ire": (float(measured["mid_ire"]) if measured.get("mid_ire") not in (None, "") else None),
+            "bottom_ire": (float(measured["bottom_ire"]) if measured.get("bottom_ire") not in (None, "") else None),
+            "zone_spread_ire": (float(measured["zone_spread_ire"]) if measured.get("zone_spread_ire") not in (None, "") else None),
+            "zone_spread_stops": (float(measured["zone_spread_stops"]) if measured.get("zone_spread_stops") not in (None, "") else None),
             "zone_measurements": zone_measurements,
             "gray_target_class": str(measured.get("gray_target_class") or ""),
             "gray_target_detection_method": str(measured.get("gray_target_detection_method") or ""),

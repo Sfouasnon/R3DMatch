@@ -10,7 +10,7 @@ from typing import Optional, cast
 
 import numpy as np
 import pytest
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 from typer.testing import CliRunner
@@ -22,8 +22,8 @@ from r3dmatch.desktop_app import R3DMatchDesktopWindow, _build_desktop_results_s
 from r3dmatch.execution import CANCEL_FILE_ENV, CancellationError, run_cancellable_subprocess
 from r3dmatch.ftps_ingest import discover_ftps_batch, ingest_ftps_batch, ingest_manifest_path_for, plan_ftps_request, retry_failed_ftps_batch, run_ftps_ingest_job
 from r3dmatch.identity import group_key_from_clip_id, rmd_name_for_clip_id, subset_key_from_clip_id
-from r3dmatch.matching import analyze_path, camera_group_from_clip_id, discover_clips, measure_frame_color_and_exposure
-from r3dmatch.models import GrayCardROI, SamplingRegion, SphereROI
+from r3dmatch.matching import _resolve_measurement_worker_count, analyze_path, camera_group_from_clip_id, discover_clips, measure_frame_color_and_exposure
+from r3dmatch.models import ClipMetadata, ClipResult, FrameStat, GrayCardROI, MonitoringContext, SamplePlan, SamplingRegion, SphereROI
 from r3dmatch.rcp2_apply import (
     MemoryRcp2Transport,
     Rcp2TimeoutError,
@@ -45,7 +45,7 @@ from r3dmatch.rcp2_websocket import (
     expected_websocket_accept,
     extract_parameter_state,
 )
-from r3dmatch.report import _build_exposure_plot_svg, _build_scientific_validation_artifacts, _build_sphere_detection_artifacts, _build_strategy_payloads, _compute_image_difference_metrics, _contact_sheet_original_wb_block, _contact_sheet_svg_color_deviation_chart, _derived_profile_scalar, _detect_focus_chart_roi_hwc, _detect_sphere_roi_in_region_hwc, _focus_metric_bundle, _focus_validation_summary, _gray_target_consistency_summary, _ipp2_closed_loop_next_correction, _ipp2_closed_loop_target, _ipp2_validation_presentation, _load_preview_image_as_normalized_rgb, _manual_assist_sanitized_entry, _measure_rendered_preview_roi_ipp2, _measurement_values_for_record, _normalize_preview_image_array, _operator_guidance_for_correction, _report_grid_columns, _report_tiles_per_page, _resolve_redline_executable, _sphere_detection_label, _sphere_detection_note, _upgrade_trust_from_ipp2_validation, build_contact_sheet_report, build_lightweight_analysis_report, build_review_package, contact_sheet_pdf_export_preflight, format_stop_string, generate_preview_stills, preview_filename_for_clip_id, render_contact_sheet_html, render_contact_sheet_pdf, render_contact_sheet_pdf_from_html, render_preview_frame, round_to_standard_stop_fraction, validate_contact_sheet_html_assets
+from r3dmatch.report import _build_exposure_plot_svg, _build_scientific_validation_artifacts, _build_sphere_detection_artifacts, _build_strategy_payloads, _compute_image_difference_metrics, _compute_sphere_center_patch, _contact_sheet_chromaticity_visual, _contact_sheet_original_wb_block, _contact_sheet_resolve_measurement_fields, _contact_sheet_svg_color_deviation_chart, _derived_profile_scalar, _detect_focus_chart_roi_hwc, _detect_sphere_roi_in_region_hwc, _focus_metric_bundle, _focus_validation_summary, _gray_target_consistency_summary, _ipp2_closed_loop_next_correction, _ipp2_closed_loop_target, _ipp2_validation_presentation, _load_preview_image_as_normalized_rgb, _manual_assist_sanitized_entry, _measure_rendered_preview_roi_ipp2, _measurement_values_for_record, _normalize_preview_image_array, _operator_guidance_for_correction, _refine_manual_assist_sphere_roi, _render_preview_frame_with_retries, _report_grid_columns, _report_tiles_per_page, _resolve_redline_executable, _sphere_detection_label, _sphere_detection_note, _upgrade_trust_from_ipp2_validation, _validate_known_sphere_roi, _validate_rendered_preview_output, build_contact_sheet_report, build_lightweight_analysis_report, build_review_package, contact_sheet_pdf_export_preflight, format_stop_string, generate_preview_stills, preview_filename_for_clip_id, render_contact_sheet_html, render_contact_sheet_pdf, render_contact_sheet_pdf_from_html, render_preview_frame, round_to_standard_stop_fraction, validate_contact_sheet_html_assets
 from r3dmatch.rmd import render_rmd_xml, rmd_filename_for_clip_id, write_rmd_for_clip_with_metadata, write_rmds_from_analysis
 from r3dmatch.runtime_env import (
     DESKTOP_CONFIG_ENV,
@@ -237,7 +237,16 @@ def test_measure_rendered_preview_roi_ipp2_detects_off_center_sphere_when_roi_mi
 
     measured = _measure_rendered_preview_roi_ipp2(str(path), None)
 
-    assert measured["sphere_roi_source"] in {"primary_detected", "secondary_detected", "opencv_hough_recovery", "opencv_contour_recovery", "forced_best_effort"}
+    assert measured["sphere_detection_success"] is True
+    assert measured["sphere_roi_source"] in {
+        "primary_detected",
+        "secondary_detected",
+        "neutral_blob_recovery",
+        "opencv_hough_recovery",
+        "opencv_hough_alt_detected",
+        "opencv_hough_alt_recovery",
+        "opencv_contour_recovery",
+    }
     assert measured["detected_sphere_roi"]["cx"] == pytest.approx(cx, abs=18.0)
     assert measured["detected_sphere_roi"]["cy"] == pytest.approx(cy, abs=18.0)
     assert measured["top_ire"] > measured["mid_ire"] > measured["bottom_ire"]
@@ -263,13 +272,16 @@ def test_measure_rendered_preview_roi_ipp2_detects_far_right_edge_sphere_when_ro
     measured = _measure_rendered_preview_roi_ipp2(str(path), None)
 
     assert measured["detection_failed"] is False
+    assert measured["sphere_detection_success"] is True
     assert measured["sphere_roi_source"] in {
         "primary_detected",
         "secondary_detected",
         "localized_recovery",
+        "neutral_blob_recovery",
         "opencv_hough_recovery",
+        "opencv_hough_alt_detected",
+        "opencv_hough_alt_recovery",
         "opencv_contour_recovery",
-        "forced_best_effort",
     }
     assert measured["detected_sphere_roi"]["cx"] == pytest.approx(cx, abs=22.0)
     assert measured["detected_sphere_roi"]["cy"] == pytest.approx(cy, abs=22.0)
@@ -308,6 +320,7 @@ def test_measure_rendered_preview_roi_ipp2_prefers_bright_edge_sphere_over_darke
     measured = _measure_rendered_preview_roi_ipp2(str(path), None)
 
     assert measured["detection_failed"] is False
+    assert measured["sphere_detection_success"] is True
     assert measured["detected_sphere_roi"]["cx"] == pytest.approx(sphere_cx, abs=24.0)
     assert measured["detected_sphere_roi"]["cy"] == pytest.approx(sphere_cy, abs=24.0)
 
@@ -321,6 +334,8 @@ def test_measure_rendered_preview_roi_ipp2_fails_explicitly_when_no_sphere_candi
     measured = _measure_rendered_preview_roi_ipp2(str(path), None)
 
     assert measured["detection_failed"] is True
+    assert measured["sphere_detection_success"] is False
+    assert measured["sphere_detection_unresolved"] is False
     assert measured["sphere_roi_source"] == "failed"
     assert measured["gray_exposure_summary"] == "Sphere detection failed"
 
@@ -349,55 +364,202 @@ def test_measure_rendered_preview_roi_ipp2_reuses_original_roi_for_corrected_fra
     )
 
     assert measured["detection_failed"] is False
+    assert measured["sphere_detection_success"] is True
     assert measured["sphere_roi_source"] == "reused_from_original"
     assert measured["detected_sphere_roi"]["cx"] == pytest.approx(cx)
 
 
-def test_measure_rendered_preview_roi_ipp2_falls_back_to_gray_card_when_sphere_is_unresolved(
+def test_measure_rendered_preview_roi_ipp2_returns_unresolved_when_sphere_candidates_fail_hard_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     image = np.full((96, 128, 3), 0.42, dtype=np.float32)
-    path = tmp_path / "gray_card_fallback.jpg"
+    path = tmp_path / "sphere_unresolved.jpg"
     Image.fromarray(np.clip(image * 255.0, 0, 255).astype(np.uint8), mode="RGB").save(path, format="JPEG")
 
     monkeypatch.setattr(
         "r3dmatch.report._detect_sphere_roi_in_region_hwc",
-        lambda _region: {"source": "failed", "confidence": 0.0, "confidence_label": "FAILED", "roi": None},
-    )
-    monkeypatch.setattr(
-        "r3dmatch.report._detect_gray_card_in_region_hwc",
         lambda _region: {
-            "source": "gray_card_detected",
-            "confidence": 0.78,
-            "confidence_label": "MEDIUM",
-            "review_recommended": False,
-            "roi": {"x": 18.0, "y": 20.0, "w": 54.0, "h": 38.0},
-            "neutrality_score": 0.005,
-            "stats": {
-                "measured_log2_luminance": -2.25,
-                "measured_ire": 21.0,
-                "measured_rgb_mean": [0.42, 0.41, 0.40],
-                "measured_rgb_chromaticity": [0.342, 0.334, 0.324],
-                "valid_pixel_count": 1800,
-                "roi_variance": 0.0006,
-                "saturation_fraction": 0.0,
-                "mask_fraction": 0.91,
-                "gray_log2_stddev": 0.014,
-            },
+            "source": "unresolved",
+            "confidence": 0.24,
+            "confidence_label": "UNRESOLVED",
+            "roi": None,
+            "sample_plausibility": "LOW",
+            "sphere_detection_success": False,
+            "sphere_detection_unresolved": True,
+            "validation": {"reason": "candidates_rejected_by_hard_gate", "hard_gate_reasons": ["radial_coherence_below_min"]},
         },
     )
 
     measured = _measure_rendered_preview_roi_ipp2(str(path), None)
 
     assert measured["detection_failed"] is False
-    assert measured["gray_target_class"] == "gray_card"
-    assert measured["gray_target_fallback_used"] is True
-    assert measured["sphere_roi_source"] == "gray_card_fallback"
-    assert measured["sample_1_ire"] == pytest.approx(21.0)
-    assert measured["sample_2_ire"] == pytest.approx(21.0)
-    assert measured["sample_3_ire"] == pytest.approx(21.0)
-    assert measured["detected_gray_card_roi"]["w"] == pytest.approx(54.0)
+    assert measured["sphere_detection_success"] is False
+    assert measured["sphere_detection_unresolved"] is True
+    assert measured["gray_target_class"] == "unresolved"
+    assert measured["gray_target_fallback_used"] is False
+    assert measured["sphere_roi_source"] == "unresolved"
+    assert measured["sample_plausibility"] == "LOW"
+
+
+def test_compute_sphere_center_patch_uses_only_hero_center_pixels() -> None:
+    region = np.full((240, 240, 3), np.asarray([0.70, 0.12, 0.12], dtype=np.float32), dtype=np.float32)
+    yy, xx = np.meshgrid(np.arange(240, dtype=np.float32), np.arange(240, dtype=np.float32), indexing="ij")
+    cx = 120.0
+    cy = 118.0
+    measurement_radius = 80.0
+    hero_mask = ((xx - cx) ** 2 + (yy - cy) ** 2) <= (8.0 ** 2)
+    region[hero_mask] = np.asarray([0.24, 0.24, 0.24], dtype=np.float32)
+
+    patch = _compute_sphere_center_patch(region, cx, cy, measurement_radius)
+
+    assert patch is not None
+    assert patch["sample_count"] >= 64
+    assert patch["center_luminance"] == pytest.approx(0.24, abs=0.02)
+    assert tuple(patch["center_rgb"]) == pytest.approx((0.24, 0.24, 0.24), abs=0.02)
+
+
+def test_measure_rendered_preview_roi_ipp2_uses_hero_center_as_authoritative_scalar(tmp_path: Path) -> None:
+    height = 320
+    width = 320
+    image = np.full((height, width, 3), 0.05, dtype=np.float32)
+    yy, xx = np.meshgrid(np.arange(height, dtype=np.float32), np.arange(width, dtype=np.float32), indexing="ij")
+    cx = 168.0
+    cy = 154.0
+    radius = 72.0
+    distance = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    sphere_mask = distance <= radius
+    vertical = np.clip((yy - (cy - radius)) / max(2.0 * radius, 1.0), 0.0, 1.0)
+    sphere_luma = 0.34 - (vertical * 0.10)
+    image[sphere_mask] = np.stack([sphere_luma[sphere_mask]] * 3, axis=-1)
+    outer_ring = sphere_mask & (distance >= (radius * 0.82))
+    image[outer_ring] = np.asarray([0.62, 0.62, 0.62], dtype=np.float32)
+    hero_center = distance <= (radius * 0.08)
+    image[hero_center] = np.asarray([0.22, 0.22, 0.22], dtype=np.float32)
+    path = tmp_path / "hero_authoritative.jpg"
+    Image.fromarray(np.clip(image * 255.0, 0, 255).astype(np.uint8), mode="RGB").save(path, format="JPEG")
+
+    measured = _measure_rendered_preview_roi_ipp2(
+        str(path),
+        {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        sphere_roi_override={"cx": cx, "cy": cy, "r": radius},
+    )
+
+    assert measured["measurement_source"] == "hero_center_patch"
+    assert measured["measurement_fallback_used"] is False
+    assert measured["sample_2_ire"] == pytest.approx(22.0, abs=2.0)
+    assert measured["center_ire"] == pytest.approx(22.0, abs=2.0)
+    assert measured["measured_log2_luminance_monitoring"] == pytest.approx(np.log2(0.22), abs=0.15)
+
+
+def test_measure_rendered_preview_roi_ipp2_uses_legacy_center_fallback_only_when_hero_patch_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    height = 320
+    width = 320
+    image = np.full((height, width, 3), 0.05, dtype=np.float32)
+    yy, xx = np.meshgrid(np.arange(height, dtype=np.float32), np.arange(width, dtype=np.float32), indexing="ij")
+    cx = 160.0
+    cy = 150.0
+    radius = 70.0
+    distance = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    sphere_mask = distance <= radius
+    vertical = np.clip((yy - (cy - radius)) / max(2.0 * radius, 1.0), 0.0, 1.0)
+    sphere_luma = 0.30 - (vertical * 0.08)
+    image[sphere_mask] = np.stack([sphere_luma[sphere_mask]] * 3, axis=-1)
+    path = tmp_path / "hero_fallback.jpg"
+    Image.fromarray(np.clip(image * 255.0, 0, 255).astype(np.uint8), mode="RGB").save(path, format="JPEG")
+    monkeypatch.setattr("r3dmatch.report._compute_sphere_center_patch", lambda *args, **kwargs: None)
+
+    measured = _measure_rendered_preview_roi_ipp2(
+        str(path),
+        {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        sphere_roi_override={"cx": cx, "cy": cy, "r": radius},
+    )
+
+    assert measured["measurement_source"] == "legacy_center_fallback"
+    assert measured["measurement_fallback_used"] is True
+    assert measured["sphere_detection_success"] is True
+
+
+def test_validate_known_sphere_roi_rejects_flat_neutral_surface() -> None:
+    image = np.full((180, 180, 3), 0.42, dtype=np.float32)
+
+    validated = _validate_known_sphere_roi(
+        image,
+        roi=SphereROI(cx=90.0, cy=90.0, r=48.0),
+        detection_source="primary_detected",
+        confidence_hint=0.92,
+    )
+
+    assert validated["sphere_detection_success"] is False
+    assert validated["sphere_detection_unresolved"] is True
+    reasons = list((validated.get("hard_gate") or {}).get("reasons") or [])
+    assert "flat_luminance_profile" in reasons or "samples_too_equal" in reasons
+    assert "exposure_distribution_invalid" in reasons
+
+
+def test_detect_sphere_roi_in_region_hwc_attempts_fallback_when_primary_candidates_are_all_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = np.full((220, 220, 3), 0.35, dtype=np.float32)
+    primary_candidate = {
+        "source": "primary_detected",
+        "confidence": 0.76,
+        "roi": {"cx": 110.0, "cy": 110.0, "r": 46.0},
+        "validation": {"radius_sane": True},
+    }
+    fallback_calls = {"secondary": 0, "opencv_hough": 0, "opencv_hough_alt": 0, "opencv_contour": 0, "blob": 0}
+
+    monkeypatch.setattr("r3dmatch.report._resize_region_for_sphere_detection", lambda region: (region, 1.0))
+    monkeypatch.setattr("r3dmatch.report._detect_gray_card_in_region_hwc", lambda _region: {"roi": {}, "confidence": 0.0})
+
+    def fake_detect(region: np.ndarray, *, search_bounds=None, detection_source: str, sigma=2.0, low_threshold=0.03, high_threshold=0.12, **_kwargs: object):  # type: ignore[no-untyped-def]
+        if detection_source == "primary_detected":
+            return [dict(primary_candidate)]
+        fallback_calls["secondary"] += 1
+        return []
+
+    monkeypatch.setattr("r3dmatch.report._detect_sphere_candidates_in_region_hwc", fake_detect)
+    monkeypatch.setattr(
+        "r3dmatch.report._detect_sphere_candidates_opencv_hough_hwc",
+        lambda *args, **kwargs: fallback_calls.__setitem__("opencv_hough", fallback_calls["opencv_hough"] + 1) or [],
+    )
+    monkeypatch.setattr(
+        "r3dmatch.report._detect_sphere_candidates_opencv_hough_alt_hwc",
+        lambda *args, **kwargs: fallback_calls.__setitem__("opencv_hough_alt", fallback_calls["opencv_hough_alt"] + 1) or [],
+    )
+    monkeypatch.setattr(
+        "r3dmatch.report._detect_sphere_candidates_opencv_contours_hwc",
+        lambda *args, **kwargs: fallback_calls.__setitem__("opencv_contour", fallback_calls["opencv_contour"] + 1) or [],
+    )
+    monkeypatch.setattr(
+        "r3dmatch.report._detect_neutral_blob_candidates_in_region_hwc",
+        lambda *args, **kwargs: fallback_calls.__setitem__("blob", fallback_calls["blob"] + 1) or [],
+    )
+    monkeypatch.setattr(
+        "r3dmatch.report._rescore_sphere_candidates_with_profile",
+        lambda _region, candidates, **_kwargs: [
+            {
+                **dict(candidates[0]),
+                "hard_gate": {"passed": False, "reasons": ["flat_luminance_profile"], "metrics": {}},
+                "profile_probe": {"score": 0.18},
+                "sample_plausibility": "IMPLAUSIBLE",
+                "confidence": 0.18,
+                "confidence_label": "UNRESOLVED",
+            }
+        ],
+    )
+
+    detected = _detect_sphere_roi_in_region_hwc(image)
+
+    assert detected["source"] == "unresolved"
+    assert detected["sphere_detection_success"] is False
+    assert detected["sphere_detection_unresolved"] is True
+    assert detected["validation"]["reason"] == "primary_candidates_rejected_by_hard_gate"
+    assert detected["validation"]["fallback_trigger_reason"] == "primary_candidates_rejected_by_hard_gate"
+    assert fallback_calls == {"secondary": 1, "opencv_hough": 2, "opencv_hough_alt": 2, "opencv_contour": 2, "blob": 2}
 
 
 def _write_scientific_validation_preview(tmp_path: Path) -> tuple[str, dict[str, object]]:
@@ -682,6 +844,46 @@ def test_measurement_values_for_record_uses_sphere_sample_median_for_perceptual_
     assert len(values["zone_measurements"]) == 3
 
 
+def test_measurement_values_for_record_keeps_unresolved_measurement_non_numeric() -> None:
+    record = {
+        "clip_id": "G007_A067_0403RE_001",
+        "diagnostics": {
+            "exposure_measurement_domain": "rendered_preview_ipp2",
+            "measurement_valid": False,
+            "gray_target_measurement_valid": False,
+            "gray_target_class": "unresolved",
+            "measured_log2_luminance_monitoring": None,
+            "measured_log2_luminance": None,
+            "sample_1_ire": None,
+            "sample_2_ire": None,
+            "sample_3_ire": None,
+            "zone_measurements": [],
+        },
+    }
+
+    values = _measurement_values_for_record(record, matching_domain="perceptual")
+
+    assert values["measurement_valid"] is False
+    assert values["display_scalar_log2"] is None
+    assert values["display_scalar_ire"] is None
+    assert values["log2_luminance"] is None
+
+
+def test_contact_sheet_resolve_measurement_fields_skips_unresolved_scalar_placeholders() -> None:
+    resolved = _contact_sheet_resolve_measurement_fields(
+        clip_id="G007_A067_0403RE_001",
+        clip_row={"measurement_valid": False},
+        shared={"measurement_valid": False, "display_scalar_log2": None},
+        exposure_metrics={"measurement_valid": False},
+        ipp2_row={},
+    )
+
+    assert resolved["measurement_valid"] is False
+    assert resolved["sample_1_ire"] is None
+    assert resolved["display_scalar_log2"] is None
+    assert resolved["target_sample_label"] == "Gray target unresolved"
+
+
 def test_derived_profile_scalar_uses_median_sample_value() -> None:
     zone_measurements = [
         {"label": "bright_side", "measured_log2_luminance": -2.0, "measured_ire": 25.0},
@@ -708,8 +910,8 @@ def test_sphere_detection_label_thresholds() -> None:
 
 def test_sphere_detection_note_includes_recovery_labels() -> None:
     assert _sphere_detection_note("primary_detected", "HIGH") == "Sphere check verified"
-    assert _sphere_detection_note("localized_recovery", "MEDIUM") == "Alternate detection path used"
-    assert _sphere_detection_note("forced_best_effort", "LOW") == "Alternate detection path used — confirm sphere placement"
+    assert _sphere_detection_note("localized_recovery", "MEDIUM", sphere_detection_success=True, fallback_used=True) == "Alternate detection path used"
+    assert _sphere_detection_note("unresolved", "UNRESOLVED", sphere_detection_success=False, sphere_detection_unresolved=True) == "Gray target needs review"
 
 
 def test_sphere_detection_prefers_off_center_gray_sphere_over_center_distractor() -> None:
@@ -725,7 +927,9 @@ def test_sphere_detection_prefers_off_center_gray_sphere_over_center_distractor(
 
     true_mask = true_distance <= true_r
     true_ring = np.abs(true_distance - true_r) <= 2.0
-    image[true_mask] = np.asarray([0.23, 0.23, 0.23], dtype=np.float32)
+    true_vertical = np.clip((yy - (true_cy - true_r)) / max(2.0 * true_r, 1.0), 0.0, 1.0)
+    true_luma = 0.31 - (true_vertical * 0.08)
+    image[true_mask] = np.stack([true_luma[true_mask]] * 3, axis=-1)
     image[true_ring] = np.asarray([0.82, 0.82, 0.82], dtype=np.float32)
 
     distractor_mask = distractor_distance <= distractor_r
@@ -754,7 +958,9 @@ def test_measure_rendered_preview_recovers_sphere_outside_calibration_roi(tmp_pa
     sphere_cx, sphere_cy, sphere_r = 430.0, 170.0, 48.0
     sphere_distance = np.sqrt((xx - sphere_cx) ** 2 + (yy - sphere_cy) ** 2)
     sphere_mask = sphere_distance <= sphere_r
-    image[sphere_mask] = np.asarray([0.24, 0.24, 0.24], dtype=np.float32)
+    sphere_vertical = np.clip((yy - (sphere_cy - sphere_r)) / max(2.0 * sphere_r, 1.0), 0.0, 1.0)
+    sphere_luma = 0.29 - (sphere_vertical * 0.08)
+    image[sphere_mask] = np.stack([sphere_luma[sphere_mask]] * 3, axis=-1)
     image[np.abs(sphere_distance - sphere_r) <= 2.0] = np.asarray([0.78, 0.78, 0.78], dtype=np.float32)
     image[:, :220, :] = np.asarray([0.18, 0.18, 0.18], dtype=np.float32)
     preview_path = tmp_path / "preview.tiff"
@@ -1333,7 +1539,14 @@ def _install_fake_redline(monkeypatch: pytest.MonkeyPatch) -> None:
         if "--loadRMD" in command:
             rmd_payload = cast(Optional[dict], state["rmd_payload"]) or {}
             base = _apply_fake_cdl(base, rmd_payload.get("cdl"), enabled=bool(rmd_payload.get("cdl_enabled")))
-        Image.fromarray(np.clip(base * 255.0, 0, 255).astype(np.uint8), mode="RGB").save(generated_path, format="JPEG")
+        output_array = np.clip(base * 255.0, 0, 255).astype(np.uint8)
+        if output_path.suffix.lower() in {".tif", ".tiff"}:
+            Image.fromarray(output_array, mode="RGB").resize((96, 96), resample=Image.Resampling.NEAREST).save(
+                generated_path,
+                format="TIFF",
+            )
+        else:
+            Image.fromarray(output_array, mode="RGB").save(generated_path, format="JPEG")
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("r3dmatch.report.write_rmd_for_clip_with_metadata", fake_write_rmd_for_clip_with_metadata)
@@ -1651,6 +1864,22 @@ def test_load_preview_image_as_normalized_rgb_retries_truncated_tiff_until_ready
     assert metadata["preview_format"] == "tiff"
 
 
+def test_validate_rendered_preview_output_rejects_tiny_tiff_stub(tmp_path: Path) -> None:
+    stub_path = tmp_path / "preview.tiff"
+    stub_path.write_bytes(
+        bytes.fromhex(
+            "49492a00080000000c000001030001000000000f0000010103000100000070080000"
+            "02010300030000009e00000003010300010000000100000006010300010000000200"
+            "00000a01030001000000010000001101040001000000080000001201030001000000"
+            "01000000150103000100000003000000160103000100000070080000170104000100"
+            "0000000000001c010300010000000100000000000000100010001000"
+        )
+    )
+
+    with pytest.raises(OSError, match="below sane minimum size|invalid render stub"):
+        _validate_rendered_preview_output(stub_path)
+
+
 def test_manual_assist_sanitized_entry_keeps_coordinate_lists() -> None:
     payload = _manual_assist_sanitized_entry(
         {
@@ -1666,6 +1895,60 @@ def test_manual_assist_sanitized_entry_keeps_coordinate_lists() -> None:
     assert payload["center_preview_px"] == [1004, 329]
     assert payload["radius_preview_px"] == 72
     assert "center_normalized" not in payload
+
+
+def test_refine_manual_assist_sphere_roi_runs_local_search_until_valid(monkeypatch: pytest.MonkeyPatch) -> None:
+    image = np.ones((120, 120, 3), dtype=np.float32) * 0.4
+
+    def fake_validate(region: np.ndarray, *, roi, detection_source: str, confidence_hint=None, manual_assist_metadata=None):  # type: ignore[no-untyped-def]
+        passed = abs(float(roi.cx) - 66.0) < 1.0 and abs(float(roi.cy) - 54.0) < 1.0 and abs(float(roi.r) - 19.55) < 0.6
+        margin = 7.5 if passed else 0.2
+        return {
+            "source": detection_source,
+            "roi": {"cx": float(roi.cx), "cy": float(roi.cy), "r": float(roi.r)},
+            "profile_probe": {
+                "score": 0.96 if passed else 0.52,
+                "review_required": not passed,
+            },
+            "hard_gate": {
+                "passed": passed,
+                "reasons": [] if passed else ["center_too_close_to_extremum"],
+                "metrics": {
+                    "center_margin_ire": margin,
+                },
+            },
+            "sample_plausibility": "HIGH" if passed else "LOW",
+            "confidence": 0.94 if passed else 0.31,
+            "confidence_label": "HIGH" if passed else "UNRESOLVED",
+            "sphere_detection_success": passed,
+            "sphere_detection_unresolved": not passed,
+        }
+
+    def fake_detect(region: np.ndarray) -> dict[str, object]:
+        return {
+            "source": "unresolved",
+            "confidence": 0.2,
+            "confidence_label": "UNRESOLVED",
+            "sphere_detection_success": False,
+            "sphere_detection_unresolved": True,
+            "candidate_diagnostics": {"rescored_candidates": []},
+        }
+
+    monkeypatch.setattr("r3dmatch.report._validate_known_sphere_roi", fake_validate)
+    monkeypatch.setattr("r3dmatch.report._detect_sphere_roi_in_region_hwc", fake_detect)
+
+    refinement = _refine_manual_assist_sphere_roi(
+        image,
+        {
+            "cx": 72.0,
+            "cy": 48.0,
+            "r": 23.0,
+        },
+    )
+
+    assert refinement["refined"] is True
+    assert refinement["reason"] == "accepted_manual_local_search"
+    assert refinement["source"] == "manual_operator_assist_local_search"
 
 
 def test_upgrade_trust_from_ipp2_validation_recovers_sphere_camera() -> None:
@@ -1716,6 +1999,7 @@ def test_upgrade_trust_from_ipp2_validation_preserves_non_sphere_target() -> Non
 
 
 def test_detect_focus_chart_roi_hwc_finds_colorchecker_cluster() -> None:
+    pytest.importorskip("cv2")
     image = np.ones((420, 820, 3), dtype=np.float32) * 0.72
     rows, cols = 4, 6
     start_x, start_y = 620, 120
@@ -1734,6 +2018,10 @@ def test_detect_focus_chart_roi_hwc_finds_colorchecker_cluster() -> None:
             x0 = start_x + (col * (cell_w + gap))
             y0 = start_y + (row * (cell_h + gap))
             image[y0:y0 + cell_h, x0:x0 + cell_w, :] = palette[(row + col) % len(palette)]
+            image[y0:y0 + cell_h, x0:x0 + 2, :] = 0.08
+            image[y0:y0 + cell_h, x0 + cell_w - 2:x0 + cell_w, :] = 0.08
+            image[y0:y0 + 2, x0:x0 + cell_w, :] = 0.08
+            image[y0 + cell_h - 2:y0 + cell_h, x0:x0 + cell_w, :] = 0.08
     detection = _detect_focus_chart_roi_hwc(image)
     assert detection["found"] is True
     roi = dict(detection["roi"])
@@ -5103,6 +5391,62 @@ def test_array_calibration_uses_scene_measurements_and_preserves_confidence() ->
     }
 
 
+def test_array_calibration_excludes_invalid_measurements_from_targets() -> None:
+    valid = types.SimpleNamespace(
+        clip_id="G007_B057_0324YT_001",
+        source_path="/tmp/G007_B057_0324YT_001.R3D",
+        confidence=0.9,
+        clip_metadata=types.SimpleNamespace(
+            to_dict=lambda: {"extra_metadata": {"extra_metadata": {"white_balance_kelvin": 5600.0, "white_balance_tint": 0.0}}}
+        ),
+        diagnostics={
+            "measurement_valid": True,
+            "gray_target_measurement_valid": True,
+            "measured_log2_luminance_monitoring": -2.5,
+            "measured_log2_luminance_raw": -1.5,
+            "measured_rgb_mean": [0.18, 0.18, 0.18],
+            "measured_rgb_chromaticity": [0.34, 0.33, 0.33],
+            "valid_pixel_count": 100,
+            "raw_saturation_fraction": 0.0,
+            "black_fraction": 0.0,
+            "neutral_sample_count": 3,
+            "neutral_sample_log2_spread": 0.03,
+            "neutral_sample_chromaticity_spread": 0.002,
+            "accepted_frames": 1,
+            "sampled_frames": 1,
+        },
+    )
+    invalid = types.SimpleNamespace(
+        clip_id="G007_C057_0324YT_001",
+        source_path="/tmp/G007_C057_0324YT_001.R3D",
+        confidence=0.1,
+        clip_metadata=types.SimpleNamespace(
+            to_dict=lambda: {"extra_metadata": {"extra_metadata": {"white_balance_kelvin": 5600.0, "white_balance_tint": 0.0}}}
+        ),
+        diagnostics={
+            "measurement_valid": False,
+            "gray_target_measurement_valid": False,
+            "measured_log2_luminance_monitoring": None,
+            "measured_log2_luminance_raw": None,
+            "measured_rgb_mean": [0.0, 0.0, 0.0],
+            "measured_rgb_chromaticity": [1 / 3, 1 / 3, 1 / 3],
+            "valid_pixel_count": 0,
+            "raw_saturation_fraction": 0.0,
+            "black_fraction": 0.0,
+            "neutral_sample_count": 0,
+            "neutral_sample_log2_spread": 0.0,
+            "neutral_sample_chromaticity_spread": 0.0,
+            "accepted_frames": 1,
+            "sampled_frames": 1,
+        },
+    )
+    calibration = build_array_calibration_from_analysis([valid, invalid], input_path="/tmp/batch")
+    assert [camera.clip_id for camera in calibration.cameras] == ["G007_B057_0324YT_001"]
+    assert calibration.target.exposure.included_camera_count == 1
+    assert calibration.target.exposure.excluded_camera_ids == ["G007_C057_0324YT_001"]
+    assert calibration.target.color.excluded_camera_ids == ["G007_C057_0324YT_001"]
+
+
 def test_hero_camera_strategy_matches_to_selected_hero() -> None:
     records = [
         {
@@ -5264,6 +5608,125 @@ def test_analyze_path_writes_workload_trace_for_half_res_single_frame(tmp_path: 
     assert row["measurement_domain"] == "scene_sdk_decode_with_proxy_monitoring"
 
 
+def test_resolve_measurement_worker_count_defaults_conservatively() -> None:
+    assert _resolve_measurement_worker_count(requested_workers=None, measurement_source="scene_sdk_decode_with_proxy_monitoring", clip_count=12) == 1
+    assert _resolve_measurement_worker_count(requested_workers=None, measurement_source="rendered_preview_ipp2", clip_count=1) == 1
+    assert _resolve_measurement_worker_count(requested_workers=None, measurement_source="rendered_preview_ipp2", clip_count=12) in {1, 2}
+    assert _resolve_measurement_worker_count(requested_workers=3, measurement_source="rendered_preview_ipp2", clip_count=2) == 2
+
+
+def test_analyze_path_preserves_deterministic_clip_order_with_parallel_measurement(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clip_names = [
+        "G007_A068_0403IW_001.R3D",
+        "H007_B068_0403YH_001.R3D",
+        "H007_D068_0403AA_001.R3D",
+    ]
+    clip_paths = []
+    for name in clip_names:
+        path = tmp_path / name
+        path.write_bytes(b"")
+        clip_paths.append(path)
+
+    monkeypatch.setattr("r3dmatch.matching.discover_clips", lambda _input: list(clip_paths))
+
+    delays = {
+        "G007_A068_0403IW_001": 0.10,
+        "H007_B068_0403YH_001": 0.02,
+        "H007_D068_0403AA_001": 0.06,
+    }
+
+    def fake_analyze_clip(  # type: ignore[no-untyped-def]
+        source_path,
+        *,
+        mode,
+        backend,
+        lut_override,
+        sample_count,
+        sampling_strategy,
+        calibration_roi=None,
+        target_type=None,
+        half_res_decode=False,
+        measurement_source="scene_sdk_decode_with_proxy_monitoring",
+        measurement_output_dir=None,
+        rendered_preview_context=None,
+        sphere_assist_entry=None,
+    ):
+        clip_id = Path(source_path).stem
+        time.sleep(delays[clip_id])
+        return ClipResult(
+            clip_id=clip_id,
+            group_key="subset_068",
+            source_path=str(source_path),
+            backend="red",
+            clip_statistic_log2=-2.473931188332412,
+            group_key_statistic_log2=-2.473931188332412,
+            global_reference_log2=-2.473931188332412,
+            raw_offset_stops=0.0,
+            camera_baseline_stops=0.0,
+            clip_trim_stops=0.0,
+            final_offset_stops=0.0,
+            confidence=0.91,
+            sample_plan=SamplePlan(strategy="uniform", sample_count=1, start_frame=0, frame_step=1, max_frames=1),
+            monitoring=MonitoringContext(
+                mode="scene",
+                ipp2_color_space="REDWideGamutRGB",
+                ipp2_gamma_curve="Log3G10",
+                active_lut_path=None,
+                lut_override_path=None,
+                resolved_lut_path=None,
+            ),
+            clip_metadata=ClipMetadata(
+                clip_id=clip_id,
+                group_key="subset_068",
+                original_filename=f"{clip_id}.R3D",
+                source_path=str(source_path),
+                fps=24.0,
+                width=4096,
+                height=2160,
+                total_frames=100,
+            ),
+            frame_stats=[
+                FrameStat(
+                    frame_index=0,
+                    timestamp_seconds=0.0,
+                    log_luminance_median=-2.473931188332412,
+                    clipped_fraction=0.0,
+                    valid_fraction=1.0,
+                    accepted=True,
+                )
+            ],
+            diagnostics={
+                "measured_log2_luminance_monitoring": -2.473931188332412,
+                "measured_log2_luminance_raw": -2.473931188332412,
+                "measured_rgb_mean": [0.18, 0.18, 0.18],
+                "measured_rgb_chromaticity": [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
+                "neutral_sample_log2_spread": 0.0,
+                "neutral_sample_chromaticity_spread": 0.0,
+                "neutral_samples": [],
+                "runtime_trace": {},
+                "workload_trace": {},
+            },
+        )
+
+    monkeypatch.setattr("r3dmatch.matching.analyze_clip", fake_analyze_clip)
+
+    summary = analyze_path(
+        str(tmp_path),
+        out_dir=str(tmp_path / "out"),
+        mode="scene",
+        backend="mock",
+        lut_override=None,
+        calibration_path=None,
+        sample_count=1,
+        sampling_strategy="uniform",
+        target_type="gray_sphere",
+        measurement_source="rendered_preview_ipp2",
+        measurement_workers=3,
+    )
+
+    assert [row["clip_id"] for row in summary["clips"]] == [Path(name).stem for name in clip_names]
+
+
 def test_analyze_path_uses_rendered_preview_ipp2_for_lightweight_measurement(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_redline(monkeypatch)
     clip_a = tmp_path / "G007_D060_0324M6_001.R3D"
@@ -5359,7 +5822,7 @@ def test_analyze_path_rendered_preview_measurement_retries_missing_tiff_and_reco
                 "output_path": output_path,
             }
         output.parent.mkdir(parents=True, exist_ok=True)
-        Image.fromarray(np.full((16, 16, 3), 180, dtype=np.uint8), mode="RGB").save(output, format="TIFF")
+        Image.fromarray(np.full((96, 96, 3), 180, dtype=np.uint8), mode="RGB").save(output, format="TIFF")
         return {
             "command": ["REDLine", "--i", input_r3d, "--o", output_path],
             "returncode": 0,
@@ -5368,7 +5831,13 @@ def test_analyze_path_rendered_preview_measurement_retries_missing_tiff_and_reco
             "output_path": output_path,
         }
 
-    def fake_measure_rendered_preview_roi_ipp2(preview_path: str, calibration_roi, *, sphere_roi_override=None):  # type: ignore[no-untyped-def]
+    def fake_measure_rendered_preview_roi_ipp2(  # type: ignore[no-untyped-def]
+        preview_path: str,
+        calibration_roi,
+        *,
+        sphere_roi_override=None,
+        manual_assist_entry=None,
+    ):
         return {
             "measured_log2_luminance": -2.45,
             "measured_log2_luminance_monitoring": -2.45,
@@ -5395,6 +5864,8 @@ def test_analyze_path_rendered_preview_measurement_retries_missing_tiff_and_reco
             "zone_measurements": [],
             "sphere_detection_confidence": 0.78,
             "sphere_detection_label": "MEDIUM",
+            "sphere_detection_success": True,
+            "sphere_detection_unresolved": False,
             "sphere_roi_source": "neutral_blob_recovery",
             "sphere_detection_details": {"reason": "recovered_after_render_retry"},
             "detected_sphere_roi": {"cx": 320.0, "cy": 210.0, "r": 88.0},
@@ -6246,16 +6717,17 @@ def test_cli_review_and_approve_workflow(tmp_path: Path, monkeypatch: pytest.Mon
     assert review_result.exit_code == 0
     assert (review_dir / "report" / "contact_sheet.html").exists()
     assert (review_dir / "report" / "preview_contact_sheet.pdf").exists()
-    assert (review_dir / "review_rmd" / "strategies" / "median" / "exposure" / "G007_D060_0324M6_001.RMD").exists()
+    assert not (review_dir / "review_rmd" / "strategies").exists()
     review_manifest = json.loads((review_dir / "report" / "review_manifest.json").read_text(encoding="utf-8"))
     assert review_manifest["calibration_roi"] == {"x": 0.25, "y": 0.25, "w": 0.5, "h": 0.5}
     assert review_manifest["target_strategies"] == ["median", "optimal_exposure"]
     review_package = json.loads((review_dir / "report" / "review_package.json").read_text(encoding="utf-8"))
     assert review_package["artifact_mode"] == "production"
     assert review_package["temporary_rmd_manifest"]["skipped"] is True
+    assert review_package["temporary_rmd_manifest"]["strategy_review_rmd_root"] == ""
     assert review_package["rcx_compare_note"] is None
     assert review_package["recommended_strategy"]["strategy_key"] == "median"
-    assert review_package["hero_recommendation"]["candidate_clip_id"] == "G007_D060_0324M6_001"
+    assert review_package["hero_recommendation"]["candidate_clip_id"] is None
     assert review_package["run_assessment"]["status"] in {"READY", "READY_WITH_WARNINGS", "REVIEW_REQUIRED", "DO_NOT_PUSH"}
     assert review_package["gray_target_consistency"]["dominant_target_class"] in {"sphere", "gray_card", "unresolved"}
     approve_result = runner.invoke(app, ["approve-master-rmd", str(review_dir), "--target-strategy", "optimal-exposure"])
@@ -6533,7 +7005,7 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert Path(payload["preview_report_pdf"]).exists()
     assert Path(payload["previews_dir"]).exists()
     assert payload["recommended_strategy"]["strategy_key"] == "median"
-    assert payload["hero_recommendation"]["candidate_clip_id"] == "G007_D060_0324M6_001"
+    assert payload["hero_recommendation"]["candidate_clip_id"] is None
     assert payload["run_assessment"]["status"] in {"READY", "READY_WITH_WARNINGS", "REVIEW_REQUIRED", "DO_NOT_PUSH"}
     assert payload["gray_target_consistency"]["dominant_target_class"] in {"sphere", "gray_card", "unresolved"}
     report_json = json.loads(Path(payload["report_json"]).read_text(encoding="utf-8"))
@@ -6572,42 +7044,38 @@ def test_report_contact_sheet_scaffold(tmp_path: Path, monkeypatch: pytest.Monke
     assert "measured_log2_luminance_raw" in report_json["strategies"][0]["clips"][0]["metrics"]["exposure"]
     assert Path(report_json["clips"][0]["original_frame"]).exists()
     assert not list((tmp_path / "analysis-out" / "previews").glob("*.000000.jpg"))
+    assert not (tmp_path / "analysis-out" / "previews" / "_ipp2_closed_loop").exists()
     preview_commands = json.loads((tmp_path / "analysis-out" / "previews" / "preview_commands.json").read_text(encoding="utf-8"))
-    exposure_command = next(command for command in preview_commands["commands"] if command["variant"] == "exposure" and command["strategy"] == "median")
-    assert exposure_command["application_method"] == "direct_redline_flags"
-    assert exposure_command["look_metadata_path"].endswith("/review_rmd/strategies/median/exposure/G007_D060_0324M6_001.RMD")
-    assert Path(exposure_command["look_metadata_path"]).exists()
-    assert "--useMeta" in exposure_command["command"]
-    assert "--exposureAdjust" in exposure_command["command"]
-    assert "--loadRMD" not in exposure_command["command"]
-    assert "--lut" in exposure_command["command"]
     strategy_command = next(command for command in preview_commands["commands"] if command["variant"] == "both" and command["strategy"] == "median")
-    assert strategy_command["application_method"] == "preview_color_disabled"
+    assert strategy_command["application_method"] == "direct_redline_flags"
     assert strategy_command["preview_color_applied"] is False
-    assert strategy_command["output_reused_from_variant"] == "exposure"
-    assert strategy_command["validation_method"] == "preview_fallback_copy"
-    assert strategy_command["correction_application_method"] == "preview_color_disabled"
-    assert strategy_command["command"] is None
-    assert strategy_command["rmd_path"].endswith("/review_rmd/strategies/median/both/G007_D060_0324M6_001.RMD")
-    assert Path(strategy_command["rmd_path"]).exists()
+    assert strategy_command["validation_method"] == "pixel_diff_from_baseline"
+    assert strategy_command["correction_application_method"] == "direct_redline_flags"
+    assert strategy_command["command"] is not None
+    assert strategy_command["rmd_path"] in {"", None}
+    assert "--useMeta" in strategy_command["command"]
+    assert "--exposureAdjust" in strategy_command["command"]
+    assert "--loadRMD" not in strategy_command["command"]
+    assert "--lut" in strategy_command["command"]
     assert report_json["color_preview_enabled"] is False
     assert report_json["color_preview_status"] == "disabled_unverified"
     assert report_json["color_preview_operator_status"] == "Not shown in operator review"
     html = Path(payload["report_html"]).read_text(encoding="utf-8")
-    assert "Color preview" in html
-    assert "Gray Exposure" in html
-    assert "aperture" in html
-    assert "Exposure adjustment applied" in html
+    assert "Array Calibration Summary" in html
+    assert "Hero Center IRE" in html
+    assert "Original → Target" in html
     assert "Measurement source" in html
-    assert "Array role" in html
-    assert "Gray target check" in html
+    assert "Hero-center patch" in html
+    assert "HOW TO READ THIS REPORT" in html
+    assert "<th>Detection</th>" not in html
+    assert "<th>Result</th>" not in html
     assert "Digital correction applied" not in html
     assert "Reference Use" not in html
     assert "Validation state" not in html
     assert "Scalar Source" not in html
-    assert "Recommended Attention" in html or "Original WB Evaluation" in html
-    assert "Array Overview" in html or "White-Balance Deviation" in html
-    assert "Recommended Action" in html
+    assert "White Balance Model" in html or "White Balance" in html
+    assert "summary-table" in html
+    assert "Recommended action:" in html
     assert "G007_D060_0324M6_001" in html
     assert "images/G007_D060_corrected.jpg" in html
     assert "images/G007_D060_mask.jpg" in html
@@ -6685,7 +7153,7 @@ def test_contact_sheet_report_treats_calibration_preview_mode_as_monitoring_alia
     )
     report_json = json.loads(Path(payload["report_json"]).read_text(encoding="utf-8"))
     preview_commands = json.loads((tmp_path / "analysis-out" / "previews" / "preview_commands.json").read_text(encoding="utf-8"))
-    exposure_command = next(command for command in preview_commands["commands"] if command["variant"] == "exposure")
+    corrected_command = next(command for command in preview_commands["commands"] if command["variant"] == "both")
     assert report_json["preview_mode"] == "monitoring"
     assert report_json["preview_settings"]["requested_preview_mode"] == "calibration"
     assert report_json["preview_settings"]["preview_mode_alias"] == "calibration_compatibility_alias_to_monitoring"
@@ -6694,10 +7162,10 @@ def test_contact_sheet_report_treats_calibration_preview_mode_as_monitoring_alia
     assert report_json["ipp2_validation"]["contact_sheet_preview_matches_validation"] is True
     assert Path(report_json["ipp2_validation_path"]).exists()
     assert not any(command["variant"] == "original" for command in preview_commands["commands"])
-    assert "--colorSpace" in exposure_command["command"]
-    assert exposure_command["command"][exposure_command["command"].index("--colorSpace") + 1] == "13"
-    assert "--gammaCurve" in exposure_command["command"]
-    assert exposure_command["command"][exposure_command["command"].index("--gammaCurve") + 1] == "32"
+    assert "--colorSpace" in corrected_command["command"]
+    assert corrected_command["command"][corrected_command["command"].index("--colorSpace") + 1] == "13"
+    assert "--gammaCurve" in corrected_command["command"]
+    assert corrected_command["command"][corrected_command["command"].index("--gammaCurve") + 1] == "32"
 
 
 def test_lightweight_analysis_report_generates_customer_facing_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -6741,7 +7209,7 @@ def test_lightweight_analysis_report_generates_customer_facing_summary(tmp_path:
     assert "median strategy" in report_json["executive_synopsis"].lower()
     assert report_json["recommended_strategy"]["strategy_key"] in {"median", "optimal_exposure"}
     assert "exposure_plot_svg" in report_json["visuals"]
-    assert report_json["visuals"]["before_after_exposure_svg"]
+    assert report_json["visuals"]["before_after_exposure_svg"] in {"", None}
     assert "strategy_chart_svg" in report_json["visuals"]
     assert "trust_chart_svg" in report_json["visuals"]
     assert report_json["run_assessment"]["status"] in {"READY", "READY_WITH_WARNINGS", "REVIEW_REQUIRED", "DO_NOT_PUSH"}
@@ -7105,13 +7573,15 @@ def test_render_contact_sheet_html_uses_logo_and_dynamic_grid(tmp_path: Path) ->
         "clip_count": 3,
         "calibration_roi": {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
         "shared_originals": [
-            {
-                "clip_id": f"CAM{i:03d}",
-                "group_key": f"CAM{i:03d}",
-                "original_frame": str(original_path),
-                "display_scalar_log2": -2.5,
-                "sample_1_ire": 24.0,
-                "sample_2_ire": 23.0,
+                {
+                    "clip_id": f"CAM{i:03d}",
+                    "group_key": f"CAM{i:03d}",
+                    "original_frame": str(original_path),
+                    "measurement_valid": True,
+                    "gray_target_measurement_valid": True,
+                    "display_scalar_log2": -2.5,
+                    "sample_1_ire": 24.0,
+                    "sample_2_ire": 23.0,
                 "sample_3_ire": 22.0,
                 "clip_metadata": {"iso": 800, "shutter_seconds": 1 / 48, "kelvin": 5600, "tint": 2.0},
             }
@@ -7144,14 +7614,17 @@ def test_render_contact_sheet_html_uses_logo_and_dynamic_grid(tmp_path: Path) ->
                 "target_log2_luminance": -2.8,
                 "calibration_roi": {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4},
                 "clips": [
-                    {
-                        "clip_id": f"CAM{i:03d}",
-                        "group_key": f"CAM{i:03d}",
-                        "both_corrected": str(corrected_path),
-                        "metrics": {
-                            "exposure": {
-                                "final_offset_stops": 0.1 * i,
-                                "measured_log2_luminance_monitoring": -2.5,
+                        {
+                            "clip_id": f"CAM{i:03d}",
+                            "group_key": f"CAM{i:03d}",
+                            "measurement_valid": True,
+                            "gray_target_measurement_valid": True,
+                            "both_corrected": str(corrected_path),
+                            "metrics": {
+                                "exposure": {
+                                    "measurement_valid": True,
+                                    "final_offset_stops": 0.1 * i,
+                                    "measured_log2_luminance_monitoring": -2.5,
                                 "sample_1_ire": 24.0,
                                 "sample_2_ire": 23.0,
                                 "sample_3_ire": 22.0,
@@ -7194,46 +7667,44 @@ def test_render_contact_sheet_html_uses_logo_and_dynamic_grid(tmp_path: Path) ->
     debug_payload = json.loads((html_path.parent / "contact_sheet_debug.json").read_text(encoding="utf-8"))
     assert "R3DMATCH DEBUG — NEW RENDER PATH ACTIVE" not in html
     assert "R3DMatch Calibration Assessment" in html
-    assert "brand-logo" in html
-    assert "White-balance deviation" in html
-    assert "Array Overview" in html
-    assert "Original + Solve Overlay" in html
-    assert "Corrected Frame" in html
+    assert "landscape-page" in html
+    assert "summary-table" in html
+    assert "Array Calibration Summary" in html
+    assert "ORIGINAL + SOLVE OVERLAY" in html
+    assert "CORRECTED FRAME" in html
     assert "images/CAM001_corrected.jpg" in html
     assert "images/CAM001_mask.jpg" in html
-    assert "Original WB Evaluation" in html
-    assert "S1:" in html
-    assert "S2:" in html
-    assert "S3:" in html
-    assert "Target Sample" in html
-    assert "Scalar" in html
-    assert "Validation Residual" in html
-    assert "Recommended Action" in html
+    assert "White Balance" in html
+    assert "Basis / cast" not in html
+    assert "S1:" not in html
+    assert "S2:" not in html
+    assert "S3:" not in html
+    assert "Target Sample" not in html
+    assert "Hero Center IRE" in html
+    assert "Original → Target" in html
+    assert "Recommended action:" in html
     assert "Exposure Anchor" in html
     assert "Exposure Anchor: Exposure Anchor:" not in html
-    assert "No adjustment needed" in html
-    assert "Scalar:</span> <strong>-2.500 log2" in html
-    assert "Target Sample:</span> <strong>Sample 2" in html
+    assert "Hero-center patch" in html
+    assert "Scalar -2.500 log2" in html
     assert "Original white balance trace" not in html
-    assert "White-balance deviation (ΔK / ΔTint from 5600K / Tint 0)" in html
-    assert "Adjusted white-balance deviation" not in html
-    assert "Target 5600K / Tint 0" in html
-    assert "Detailed export:" in html
+    assert "HOW TO READ THIS REPORT" in html
     assert "Confidence:" not in html
     assert "Zone residuals" not in html
-    assert "display:grid" not in html
-    assert "display:flex" not in html
+    assert "<th>Detection</th>" not in html
+    assert "<th>Result</th>" not in html
     assert asset_validation["all_assets_exist"] is True
     assert debug_payload["validation_status"]["all_within_tolerance"] is True
+    assert debug_payload["measurement_values_per_camera"][0]["measurement_values"]["hero_center_ire"] == pytest.approx(17.68, abs=0.02)
     assert debug_payload["measurement_values_per_camera"][0]["measurement_values"]["sample_2_ire"] == pytest.approx(23.0)
 
 
 def test_gray_target_consistency_summary_blocks_mixed_retained_target_classes() -> None:
     summary = _gray_target_consistency_summary(
         [
-            {"clip_id": "A", "camera_label": "A", "reference_use": "Included", "trust_class": "TRUSTED", "gray_target_class": "sphere"},
-            {"clip_id": "B", "camera_label": "B", "reference_use": "Included", "trust_class": "USE_WITH_CAUTION", "gray_target_class": "gray_card"},
-            {"clip_id": "C", "camera_label": "C", "reference_use": "Excluded", "trust_class": "EXCLUDED", "gray_target_class": "gray_card"},
+            {"clip_id": "A", "camera_label": "A", "reference_use": "Included", "trust_class": "TRUSTED", "gray_target_class": "sphere", "measurement_valid": True},
+            {"clip_id": "B", "camera_label": "B", "reference_use": "Included", "trust_class": "USE_WITH_CAUTION", "gray_target_class": "gray_card", "measurement_valid": True},
+            {"clip_id": "C", "camera_label": "C", "reference_use": "Excluded", "trust_class": "EXCLUDED", "gray_target_class": "gray_card", "measurement_valid": False},
         ]
     )
 
@@ -7259,26 +7730,31 @@ def test_render_contact_sheet_html_large_arrays_default_to_overview_and_outliers
         _write_test_preview(corrected_path, (110 + (index % 10), 120, 130))
         _write_test_preview(overlay_path, (150, 150, 150))
         shared_originals.append(
-            {
-                "clip_id": clip_id,
-                "group_key": clip_id,
-                "original_frame": str(original_path),
-                "display_scalar_log2": -2.5 + index * 0.01,
-                "sample_1_ire": 24.0,
-                "sample_2_ire": 23.0,
+                {
+                    "clip_id": clip_id,
+                    "group_key": clip_id,
+                    "original_frame": str(original_path),
+                    "measurement_valid": True,
+                    "gray_target_measurement_valid": True,
+                    "display_scalar_log2": -2.5 + index * 0.01,
+                    "sample_1_ire": 24.0,
+                    "sample_2_ire": 23.0,
                 "sample_3_ire": 22.0,
                 "clip_metadata": {"kelvin": 5600 + index, "tint": (index % 5) - 2},
             }
         )
         strategy_clips.append(
-            {
-                "clip_id": clip_id,
-                "group_key": clip_id,
-                "both_corrected": str(corrected_path),
-                "metrics": {
-                    "exposure": {
-                        "final_offset_stops": 0.05 * (index % 4),
-                        "measured_log2_luminance_monitoring": -2.5 + index * 0.01,
+                {
+                    "clip_id": clip_id,
+                    "group_key": clip_id,
+                    "measurement_valid": True,
+                    "gray_target_measurement_valid": True,
+                    "both_corrected": str(corrected_path),
+                    "metrics": {
+                        "exposure": {
+                            "measurement_valid": True,
+                            "final_offset_stops": 0.05 * (index % 4),
+                            "measured_log2_luminance_monitoring": -2.5 + index * 0.01,
                         "sample_1_ire": 24.0,
                         "sample_2_ire": 23.0,
                         "sample_3_ire": 22.0,
@@ -7338,11 +7814,14 @@ def test_render_contact_sheet_html_large_arrays_default_to_overview_and_outliers
 
     html = render_contact_sheet_html(payload, html_path=str(tmp_path / "report" / "contact_sheet.html"))
 
-    assert "Array Overview" in html
-    assert "Detailed export:" in html
-    assert "Center IRE Range" in html
-    assert "Recommended Attention:" in html
-    assert html.count("Original + Solve Overlay") < 24
+    assert "Array Calibration Summary" in html
+    assert "summary-table" in html
+    assert "Exposure Spread" in html
+    assert "Hero-center patch" in html
+    assert "HOW TO READ THIS REPORT" in html
+    assert "<th>Detection</th>" not in html
+    assert "<th>Result</th>" not in html
+    assert html.count("ORIGINAL + SOLVE OVERLAY") < 24
 
 
 def test_validate_contact_sheet_html_assets_reports_missing_relative_images(tmp_path: Path) -> None:
@@ -7379,13 +7858,15 @@ def test_render_contact_sheet_html_fails_when_overlay_asset_is_missing(tmp_path:
     _write_test_preview(corrected_path, (120, 120, 120))
     payload = {
         "shared_originals": [
-            {
-                "clip_id": "CAM001",
-                "group_key": "CAM001",
-                "original_frame": str(original_path),
-                "display_scalar_log2": -2.5,
-                "sample_1_ire": 24.0,
-                "sample_2_ire": 23.0,
+                {
+                    "clip_id": "CAM001",
+                    "group_key": "CAM001",
+                    "original_frame": str(original_path),
+                    "measurement_valid": True,
+                    "gray_target_measurement_valid": True,
+                    "display_scalar_log2": -2.5,
+                    "sample_1_ire": 24.0,
+                    "sample_2_ire": 23.0,
                 "sample_3_ire": 22.0,
             }
         ],
@@ -7413,14 +7894,17 @@ def test_render_contact_sheet_html_fails_when_overlay_asset_is_missing(tmp_path:
                 "strategy_key": "median",
                 "strategy_label": "Median",
                 "clips": [
-                    {
-                        "clip_id": "CAM001",
-                        "both_corrected": str(corrected_path),
-                        "metrics": {
-                            "exposure": {
-                                "sample_1_ire": 24.0,
-                                "sample_2_ire": 23.0,
-                                "sample_3_ire": 22.0,
+                        {
+                            "clip_id": "CAM001",
+                            "measurement_valid": True,
+                            "gray_target_measurement_valid": True,
+                            "both_corrected": str(corrected_path),
+                            "metrics": {
+                                "exposure": {
+                                    "measurement_valid": True,
+                                    "sample_1_ire": 24.0,
+                                    "sample_2_ire": 23.0,
+                                    "sample_3_ire": 22.0,
                                 "measured_log2_luminance_monitoring": -2.5,
                             },
                             "commit_values": {"exposureAdjust": 0.1, "kelvin": 5600, "tint": 0.0},
@@ -7460,6 +7944,8 @@ def test_render_contact_sheet_html_prefers_authoritative_sample_payload(tmp_path
                 "clip_id": "CAM001",
                 "group_key": "CAM001",
                 "original_frame": str(original_path),
+                "measurement_valid": True,
+                "gray_target_measurement_valid": True,
                 "display_scalar_log2": -2.5,
                 "sample_1_ire": 24.0,
                 "sample_2_ire": 23.0,
@@ -7492,9 +7978,12 @@ def test_render_contact_sheet_html_prefers_authoritative_sample_payload(tmp_path
                 "clips": [
                     {
                         "clip_id": "CAM001",
+                        "measurement_valid": True,
+                        "gray_target_measurement_valid": True,
                         "both_corrected": str(corrected_path),
                         "metrics": {
                             "exposure": {
+                                "measurement_valid": True,
                                 "sample_1_ire": 24.0,
                                 "sample_2_ire": 23.0,
                                 "sample_3_ire": 22.0,
@@ -7519,8 +8008,8 @@ def test_render_contact_sheet_html_prefers_authoritative_sample_payload(tmp_path
     }
 
     html = render_contact_sheet_html(payload, html_path=str(tmp_path / "report" / "contact_sheet.html"))
-    assert "S1" in html
-    assert "Target Sample" in html
+    assert "Hero Center IRE" in html
+    assert "Original → Target" in html
     debug_payload = json.loads((tmp_path / "report" / "contact_sheet_debug.json").read_text(encoding="utf-8"))
     assert debug_payload["measurement_values_per_camera"][0]["measurement_values"]["sample_1_ire"] == pytest.approx(24.0)
     assert debug_payload["measurement_values_per_camera"][0]["measurement_values"]["target_sample_label"] == "Sample 2"
@@ -7546,6 +8035,8 @@ def test_render_contact_sheet_pdf_paginates_large_camera_counts(tmp_path: Path, 
                 "clip_id": clip_id,
                 "group_key": clip_id,
                 "original_frame": str(original_path),
+                "measurement_valid": True,
+                "gray_target_measurement_valid": True,
                 "confidence": 0.9,
                 "sample_1_ire": 24.0,
                 "sample_2_ire": 23.0,
@@ -7558,9 +8049,11 @@ def test_render_contact_sheet_pdf_paginates_large_camera_counts(tmp_path: Path, 
             {
                 "clip_id": clip_id,
                 "group_key": clip_id,
+                "measurement_valid": True,
+                "gray_target_measurement_valid": True,
                 "both_corrected": str(corrected_path),
                 "metrics": {
-                    "exposure": {"final_offset_stops": 0.25, "measured_log2_luminance_raw": -2.9},
+                    "exposure": {"measurement_valid": True, "final_offset_stops": 0.25, "measured_log2_luminance_raw": -2.9},
                     "color": {"rgb_gains": [1.01, 0.99, 1.0]},
                     "confidence": 0.91,
                     "commit_values": {"exposureAdjust": 0.25, "kelvin": 5600, "tint": 0.0},
@@ -7651,9 +8144,10 @@ def test_render_contact_sheet_pdf_paginates_large_camera_counts(tmp_path: Path, 
     assert Path(captured["target"]) == output_path.resolve()
     assert Path(captured["base_url"]) == html_path.resolve().parent
     html = html_path.read_text(encoding="utf-8")
-    assert "Array Overview" in html
-    assert html.count("class='page'") >= 8
-    assert html.count("Original + Solve Overlay") < 40
+    assert "Array Calibration Summary" in html
+    assert html.count("class='landscape-page'") >= 1
+    assert html.count("class='landscape-page camera-page'") >= 5
+    assert html.count("ORIGINAL + SOLVE OVERLAY") < 40
 
 
 def test_render_contact_sheet_pdf_uses_final_titles_and_skips_original_color_trace(
@@ -7677,6 +8171,8 @@ def test_render_contact_sheet_pdf_uses_final_titles_and_skips_original_color_tra
                 "clip_id": "CAM001",
                 "group_key": "CAM001",
                 "original_frame": str(original_path),
+                "measurement_valid": True,
+                "gray_target_measurement_valid": True,
                 "display_scalar_log2": -2.5,
                 "sample_1_ire": 24.0,
                 "sample_2_ire": 23.0,
@@ -7708,9 +8204,12 @@ def test_render_contact_sheet_pdf_uses_final_titles_and_skips_original_color_tra
                     {
                         "clip_id": "CAM001",
                         "group_key": "CAM001",
+                        "measurement_valid": True,
+                        "gray_target_measurement_valid": True,
                         "both_corrected": str(corrected_path),
                         "metrics": {
                             "exposure": {
+                                "measurement_valid": True,
                                 "final_offset_stops": 0.1,
                                 "measured_log2_luminance_monitoring": -2.5,
                                 "sample_1_ire": 24.0,
@@ -7760,9 +8259,10 @@ def test_render_contact_sheet_pdf_uses_final_titles_and_skips_original_color_tra
     html = output_path.with_suffix(".html").read_text(encoding="utf-8")
     assert "R3DMATCH DEBUG — NEW RENDER PATH ACTIVE" not in html
     assert "Original white balance trace" not in html
-    assert "White-balance deviation (ΔK / ΔTint from 5600K / Tint 0)" in html
+    assert "HOW TO READ THIS REPORT" in html
+    assert "White-balance deviation (ΔK / ΔTint from 5600K / Tint 0)" not in html
     assert "Adjusted white-balance deviation" not in html
-    assert "Target 5600K / Tint 0" in html
+    assert "Target 5600K / Tint 0" not in html
     assert "<title>R3DMatch Review Contact Sheet</title>" in html
 
 
@@ -7818,6 +8318,14 @@ def test_color_deviation_chart_uses_deviation_axes_and_prominent_markers() -> No
     assert "stroke-width='3'" in svg
 
 
+def test_contact_sheet_chromaticity_visual_uses_explicit_operator_labels() -> None:
+    svg = _contact_sheet_chromaticity_visual([0.345, 0.333, 0.322])
+
+    assert "Warm ←→ Cool" in svg
+    assert "Green ←→ Magenta" in svg
+    assert "Neutral" in svg
+
+
 def test_report_preview_keeps_rmd_as_canonical_path_without_printmeta_validation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(command, cwd=None, env=None, text=True):  # type: ignore[no-untyped-def]
         from PIL import Image
@@ -7860,7 +8368,13 @@ def test_report_preview_keeps_rmd_as_canonical_path_without_printmeta_validation
         image[..., 1] = np.clip(image[..., 1] * (2.0 ** float(state["exposure"])) * float(state["green_gain"]), 0.0, 1.0)
         image[..., 2] = np.clip(image[..., 2] * (2.0 ** float(state["exposure"])) * float(state["blue_gain"]), 0.0, 1.0)
         image_u8 = np.clip(image * 255.0, 0.0, 255.0).astype(np.uint8)
-        Image.fromarray(image_u8, mode="RGB").save(generated_path, format="JPEG")
+        if output_path.suffix.lower() in {".tif", ".tiff"}:
+            Image.fromarray(image_u8, mode="RGB").resize((96, 96), resample=Image.Resampling.NEAREST).save(
+                generated_path,
+                format="TIFF",
+            )
+        else:
+            Image.fromarray(image_u8, mode="RGB").save(generated_path, format="JPEG")
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("r3dmatch.report.run_cancellable_subprocess", fake_run)
@@ -7901,17 +8415,16 @@ def test_report_preview_keeps_rmd_as_canonical_path_without_printmeta_validation
         target_strategies=["median"],
     )
     preview_commands = json.loads((tmp_path / "analysis-out" / "previews" / "preview_commands.json").read_text(encoding="utf-8"))
-    exposure_command = next(command for command in preview_commands["commands"] if command["variant"] == "exposure" and command["strategy"] == "median")
-    assert "--useMeta" in exposure_command["command"]
-    assert "--exposureAdjust" in exposure_command["command"]
-    assert "--loadRMD" not in exposure_command["command"]
+    assert not any(command["variant"] == "exposure" and command["strategy"] == "median" for command in preview_commands["commands"])
     strategy_command = next(command for command in preview_commands["commands"] if command["variant"] == "both" and command["strategy"] == "median")
     assert strategy_command["mode"] == "corrected"
-    assert strategy_command["command"] is None
-    assert strategy_command["pixel_diff_from_baseline"] == pytest.approx(0.0)
+    assert strategy_command["command"] is not None
+    assert "--useMeta" in strategy_command["command"]
+    assert "--loadRMD" not in strategy_command["command"]
+    assert strategy_command["pixel_diff_from_baseline"] > 0.0
     assert strategy_command["error"] is None
-    assert strategy_command["application_method"] == "preview_color_disabled"
-    assert strategy_command["validation_method"] == "preview_fallback_copy"
+    assert strategy_command["application_method"] == "direct_redline_flags"
+    assert strategy_command["validation_method"] == "pixel_diff_from_baseline"
 
 
 def test_render_preview_frame_corrected_image_differs_from_baseline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -8000,8 +8513,8 @@ def test_generate_preview_stills_retries_missing_output_and_records_recovery(tmp
                 "stderr": "",
                 "output_path": output_path,
             }
-        pixel_value = 180 if "exposure" in key else 140
-        Image.fromarray(np.full((12, 12, 3), pixel_value, dtype=np.uint8), mode="RGB").save(output_path, format="TIFF")
+        pixel_value = 180 if ("exposure" in key or "both" in key) else 140
+        Image.fromarray(np.full((96, 96, 3), pixel_value, dtype=np.uint8), mode="RGB").save(output_path, format="TIFF")
         return {
             "command": ["REDLine", "--i", input_r3d, "--o", output_path],
             "returncode": 0,
@@ -8047,6 +8560,52 @@ def test_generate_preview_stills_retries_missing_output_and_records_recovery(tmp
     assert original_command["attempt_count"] == 2
     assert original_command["recovered_after_retry"] is True
     assert len(original_command["attempt_diagnostics"]) == 2
+
+
+def test_render_preview_frame_with_retries_rerenders_after_tiny_tiff_stub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_path = tmp_path / "preview.tiff"
+    attempts = {"count": 0}
+
+    def fake_render_preview_frame(*args, **kwargs):  # type: ignore[no-untyped-def]
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            output_path.write_bytes(b"II*\x00" + (b"\x00" * 160))
+        else:
+            Image.fromarray(np.full((64, 64, 3), 180, dtype=np.uint8), mode="RGB").save(output_path, format="TIFF")
+        return {
+            "command": ["REDLine", "--o", str(output_path)],
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "output_path": str(output_path),
+        }
+
+    monkeypatch.setattr("r3dmatch.report.render_preview_frame", fake_render_preview_frame)
+    monkeypatch.setattr("r3dmatch.report.time.sleep", lambda _seconds: None)
+
+    rendered = _render_preview_frame_with_retries(
+        "clip.R3D",
+        str(output_path),
+        clip_id="CAM001",
+        variant="measurement_original",
+        frame_index=0,
+        redline_executable="REDLine",
+        redline_capabilities={},
+        preview_settings={"preview_still_format": "tiff"},
+        use_as_shot_metadata=True,
+        max_attempts=3,
+    )
+
+    assert attempts["count"] == 2
+    assert rendered["attempt_count"] == 2
+    assert rendered["recovered_after_retry"] is True
+    assert int(rendered["output_size_bytes"]) > 4096
+    diagnostics = list(rendered["attempt_diagnostics"])
+    assert diagnostics[0]["output_size_bytes"] < 4096
+    assert "minimum_size_bytes" in diagnostics[0]
+    assert diagnostics[1]["reason"] == "success"
 
 
 def test_generate_preview_stills_raises_after_repeated_missing_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -8178,7 +8737,7 @@ def test_contact_sheet_report_writes_corrected_residual_validation_from_correcte
     html = Path(payload["report_html"]).read_text(encoding="utf-8")
     assert "Gray Exposure" in html
     assert "aperture" in html
-    assert "Recommended Action" in html
+    assert "Recommended action:" in html
     assert "In range" in html or "Needs adjustment" in html or "Outside tolerance" in html
 
 
@@ -8292,10 +8851,10 @@ def test_hero_camera_review_marks_identity_correction_and_cdl_payload(tmp_path: 
     assert hero_clip["metrics"]["color"]["lift_gamma_gain_saturation"]["gain"] == pytest.approx([1.0, 1.0, 1.0])
     preview_commands = json.loads((tmp_path / "analysis-out" / "previews" / "preview_commands.json").read_text(encoding="utf-8"))
     hero_both = next(command for command in preview_commands["commands"] if command["variant"] == "both" and command["strategy"] == "hero_camera" and command["clip_id"] == "G007_B057_0324YT_001")
-    assert hero_both["application_method"] == "preview_color_disabled"
+    assert hero_both["application_method"] == "direct_redline_flags"
     assert hero_both["preview_color_applied"] is False
     assert hero_both["cdl_enabled"] is False
-    assert Path(hero_both["rmd_path"]).exists()
+    assert hero_both["rmd_path"] in {"", None}
     html = Path(payload["report_html"]).read_text(encoding="utf-8")
     assert "Hero Camera" in html
     assert "Anchor / Hero" in html

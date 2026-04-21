@@ -94,6 +94,7 @@ def _run_review_calibration(
     artifact_mode: str,
     sphere_assist_file: Optional[str],
     focus_validation: bool,
+    measurement_workers: Optional[int],
 ) -> Dict[str, object]:
     try:
         resolved_source_mode = normalize_source_mode(source_mode)
@@ -188,6 +189,7 @@ def _run_review_calibration(
         artifact_mode=artifact_mode,
         sphere_assist_file=sphere_assist_file,
         focus_validation=focus_validation,
+        measurement_workers=measurement_workers,
     )
 
 
@@ -481,6 +483,7 @@ def review_calibration_command(
     sphere_assist_file: Optional[str] = typer.Option(None, "--sphere-assist-file", help="Optional JSON file with manual sphere center/radius overrides for failed cameras"),
     require_real_redline: bool = typer.Option(False, "--require-real-redline", help="Require real REDLine plus real source media; fail explicitly instead of accepting mock-backed validation"),
     focus_validation: bool = typer.Option(False, "--focus-validation/--no-focus-validation", help="Enable OpenCV-based sharpness chart detection and focus validation"),
+    measurement_workers: Optional[int] = typer.Option(None, "--measurement-workers", min=1, help="Optional bounded worker count for clip-level rendered preview measurement"),
 ) -> None:
     payload = _run_review_calibration(
         input_path=input_path,
@@ -531,6 +534,7 @@ def review_calibration_command(
         artifact_mode=artifact_mode,
         sphere_assist_file=sphere_assist_file,
         focus_validation=focus_validation,
+        measurement_workers=measurement_workers,
     )
     typer.echo(str(payload))
 
@@ -624,6 +628,7 @@ def ftps_download_process_command(
     sphere_assist_file: Optional[str] = typer.Option(None, "--sphere-assist-file", help="Optional JSON file with manual sphere center/radius overrides for failed cameras"),
     require_real_redline: bool = typer.Option(False, "--require-real-redline", help="Require real REDLine plus real source media; fail explicitly instead of accepting mock-backed validation"),
     focus_validation: bool = typer.Option(False, "--focus-validation/--no-focus-validation", help="Enable OpenCV-based sharpness chart detection and focus validation"),
+    measurement_workers: Optional[int] = typer.Option(None, "--measurement-workers", min=1, help="Optional bounded worker count for clip-level rendered preview measurement"),
 ) -> None:
     payload = _run_review_calibration(
         input_path=None,
@@ -673,6 +678,7 @@ def ftps_download_process_command(
         artifact_mode=artifact_mode,
         sphere_assist_file=sphere_assist_file,
         focus_validation=focus_validation,
+        measurement_workers=measurement_workers,
     )
     typer.echo(str(payload))
 

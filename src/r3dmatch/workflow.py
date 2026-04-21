@@ -1490,6 +1490,7 @@ def review_calibration(
     artifact_mode: str = "production",
     sphere_assist_file: Optional[str] = None,
     focus_validation: bool = False,
+    measurement_workers: Optional[int] = None,
 ) -> Dict[str, object]:
     workflow_started_at = time.perf_counter()
     invocation_source = str(os.getenv("R3DMATCH_INVOCATION_SOURCE", "direct_cli") or "direct_cli")
@@ -1579,6 +1580,8 @@ def review_calibration(
         invocation_source=invocation_source,
         measurement_source="rendered_preview_ipp2",
         sphere_assist_path=sphere_assist_file,
+        measurement_workers=measurement_workers,
+        emit_sidecars=str(artifact_mode).strip().lower() != "production",
     )
     raise_if_cancelled("Run cancelled before review package generation.")
     emit_review_progress(
