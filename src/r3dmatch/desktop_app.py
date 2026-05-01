@@ -14,9 +14,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
-    QFormLayout,
     QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -32,6 +30,11 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QListWidgetItem,
+    QFrame,
+    QTableWidget,
+    QTableWidgetItem,
+    QProgressBar,
+    QToolButton,
 )
 
 from .ftps_ingest import (
@@ -74,141 +77,29 @@ DEFAULT_LOGO_PATH = Path(__file__).resolve().parent / "static" / "r3dmatch_logo.
 DEFAULT_PREVIEW_STILL_FORMAT = "tiff"
 DEFAULT_ARTIFACT_MODE = "production"
 APP_STYLESHEET = """
-QMainWindow, QWidget {
-    background: #1e1f22;
-    color: #e6e6e6;
-    font-size: 13px;
+QMainWindow, QWidget { background: #d7dde3; color: #0f172a; font-size: 13px; }
+QScrollArea { border: none; background: transparent; }
+QFrame#card { background: #f8fafc; border: 1px solid #d8dee6; border-radius: 10px; }
+QFrame#hero { background: #111827; border: 1px solid #111827; border-radius: 18px; }
+QLabel { color: #0f172a; }
+QFrame#hero QLabel { color: #d7dee8; }
+QPushButton { background: #ffffff; color: #344054; border: 1px solid #d8dee6; border-radius: 9px; padding: 10px 14px; font-weight: 800; }
+QPushButton:hover { background: #f8fafc; }
+QPushButton:disabled { background: #eef2f7; color: #98a2b3; }
+QLineEdit, QComboBox, QPlainTextEdit, QTextBrowser, QListWidget, QProgressBar {
+  background: #fbfcfd; color: #0f172a; border: 1px solid #d8dee6; border-radius: 9px; padding: 8px 10px;
 }
-QScrollArea {
-    border: none;
-    background: transparent;
-}
-QGroupBox {
-    background: #2a2c30;
-    border: 1px solid #3a3d42;
-    border-radius: 16px;
-    margin-top: 14px;
-    font-weight: 700;
-    color: #f3f4f6;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 14px;
-    padding: 0 8px;
-    color: #b9c0cb;
-}
-QLabel#headerTitle {
-    color: #f8fafc;
-    font-size: 28px;
-    font-weight: 800;
-}
-QLabel#headerSubtitle {
-    color: #c0c7d2;
-    font-size: 14px;
-}
-QLabel#sectionLead {
-    color: #d5d9e0;
-    font-size: 14px;
-    line-height: 1.5;
-}
-QLabel#panelTitle {
-    color: #f8fafc;
-    font-size: 18px;
-    font-weight: 800;
-}
-QLabel#panelHint {
-    color: #a5afbd;
-    font-size: 13px;
-}
-QLabel#bannerTitle {
-    color: #f8fafc;
-    font-size: 20px;
-    font-weight: 800;
-}
-QLabel#bannerCopy {
-    color: #cad1db;
-    font-size: 14px;
-}
-QLabel[badgeRole="status"] {
-    border-radius: 999px;
-    padding: 7px 12px;
-    font-size: 12px;
-    font-weight: 700;
-}
-QLabel[badgeState="good"] {
-    background: #1f3a23;
-    color: #d8f0db;
-    border: 1px solid #2e7d32;
-}
-QLabel[badgeState="warn"] {
-    background: #3f2c10;
-    color: #ffe0b3;
-    border: 1px solid #b26a00;
-}
-QLabel[badgeState="bad"] {
-    background: #402127;
-    color: #ffd6dc;
-    border: 1px solid #b00020;
-}
-QLabel[badgeState="info"] {
-    background: #223348;
-    color: #d7e7ff;
-    border: 1px solid #4d7ea8;
-}
-QPushButton {
-    background: #3a3d42;
-    color: #ffffff;
-    border: 1px solid #4a4d52;
-    border-radius: 10px;
-    padding: 9px 14px;
-    font-weight: 700;
-}
-QPushButton:hover {
-    background: #4a4d52;
-}
-QPushButton:disabled {
-    background: #2e3136;
-    color: #818894;
-    border-color: #3a3d42;
-}
-QLineEdit, QComboBox, QPlainTextEdit, QTextBrowser {
-    background: #202225;
-    color: #f3f4f6;
-    border: 1px solid #3a3d42;
-    border-radius: 10px;
-    padding: 8px 10px;
-    selection-background-color: #4d7ea8;
-}
-QTextBrowser, QPlainTextEdit {
-    line-height: 1.5;
-}
-QComboBox QAbstractItemView {
-    background: #202225;
-    color: #f3f4f6;
-    border: 1px solid #3a3d42;
-    selection-background-color: #4d7ea8;
-    selection-color: #ffffff;
-}
-QTabWidget::pane {
-    border: none;
-}
-QTabBar::tab {
-    background: #2f3237;
-    color: #d6dbe3;
-    border-radius: 12px;
-    padding: 10px 16px;
-    margin-right: 8px;
-    font-weight: 700;
-}
-QTabBar::tab:selected {
-    background: #4d7ea8;
-    color: #ffffff;
-}
-QStatusBar {
-    background: #16171a;
-    color: #e2e8f0;
-}
+QTabWidget::pane { border: none; }
+QTabBar::tab { background: #ffffff; border: 1px solid #d8dee6; border-radius: 10px; padding: 12px 14px; margin-right: 8px; min-width: 170px; font-weight: 800; color: #344054; }
+QTabBar::tab:selected { background: #111827; border-color: #111827; color: #ffffff; }
+QLabel[badgeRole="status"] { border-radius: 999px; padding: 8px 12px; font-size: 12px; font-weight: 900; border: 1px solid #d8dee6; background: #fff; }
+QLabel[badgeState="good"] { background: #e7f4ea; color: #166534; border-color: #b8e5c5; }
+QLabel[badgeState="warn"] { background: #fbf5e6; color: #92400e; border-color: #f5dda2; }
+QLabel[badgeState="bad"] { background: #fdecec; color: #991b1b; border-color: #fecaca; }
+QLabel[badgeState="info"] { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
+QStatusBar { background: #f4f6f8; color: #475467; }
 """
+
 
 DESKTOP_SURFACE_STYLES = """
 <style>
@@ -891,422 +782,162 @@ class R3DMatchDesktopWindow(QMainWindow):
         outer.setContentsMargins(18, 18, 18, 18)
         outer.setSpacing(14)
 
-        header_card = QGroupBox()
+        header_card = self.make_card()
         header = QVBoxLayout(header_card)
-        header.setContentsMargins(18, 18, 18, 18)
-        header.setSpacing(14)
-
         top_row = QHBoxLayout()
-        top_row.setSpacing(14)
         logo_label = QLabel()
-        logo_label.setFixedWidth(240)
-        logo_label.setMinimumHeight(72)
+        logo_label.setFixedWidth(150)
         if DEFAULT_LOGO_PATH.exists():
             pixmap = QPixmap(str(DEFAULT_LOGO_PATH))
             if not pixmap.isNull():
-                logo_label.setPixmap(pixmap.scaledToWidth(220, Qt.TransformationMode.SmoothTransformation))
+                logo_label.setPixmap(pixmap.scaledToWidth(130, Qt.TransformationMode.SmoothTransformation))
         title_box = QVBoxLayout()
-        title = QLabel("R3DMatch")
-        title.setObjectName("headerTitle")
-        subtitle = QLabel("Operator desktop for ingest, calibration review, reporting, and verification")
-        subtitle.setObjectName("headerSubtitle")
-        workflow_copy = QLabel("Workflow: Ingest / Configure / Review / Inspect / Apply")
-        workflow_copy.setObjectName("sectionLead")
-        workflow_copy.setWordWrap(True)
-        title_box.addWidget(title)
-        title_box.addWidget(subtitle)
-        title_box.addWidget(workflow_copy)
+        title_box.addWidget(QLabel('<span style="font-size:34px;font-weight:800;color:#f8fafc;">R3DMatch</span>'))
+        title_box.addWidget(QLabel('Operator desktop for ingest, calibration review, reporting, and verification'))
+        title_box.addWidget(QLabel('Workflow: Ingest / Configure / Review / Inspect / Apply'))
         top_row.addWidget(logo_label)
         top_row.addLayout(title_box, 1)
         header.addLayout(top_row)
 
         badge_row = QHBoxLayout()
-        badge_row.setSpacing(10)
-        self.runtime_chip = self._status_badge("Runtime: Checking", "info")
-        self.redline_chip = self._status_badge("REDLine: Checking", "info")
-        self.pdf_chip = self._status_badge("HTML/PDF: Checking", "info")
-        self.context_chip = self._status_badge("Desktop Shell", "info")
-        for widget in [self.runtime_chip, self.redline_chip, self.pdf_chip, self.context_chip]:
-            badge_row.addWidget(widget)
+        self.runtime_chip = self._status_badge('RED SDK Runtime: Checking', 'info')
+        self.redline_chip = self._status_badge('REDLine: Checking', 'info')
+        self.pdf_chip = self._status_badge('HTML/PDF: Checking', 'info')
+        self.context_chip = self._status_badge('Packaged App', 'info')
+        for w in [self.runtime_chip,self.redline_chip,self.pdf_chip,self.context_chip]: badge_row.addWidget(w)
         badge_row.addStretch(1)
-        refresh_health = QPushButton("Refresh Runtime Health")
+        refresh_health = QPushButton('Refresh Runtime Health')
         refresh_health.clicked.connect(self._refresh_runtime_health)
         badge_row.addWidget(refresh_health)
         header.addLayout(badge_row)
-
         self.workflow_banner = QLabel()
-        self.workflow_banner.setObjectName("bannerCopy")
         self.workflow_banner.setWordWrap(True)
         header.addWidget(self.workflow_banner)
-
         outer.addWidget(header_card)
 
-        refresh_health = QPushButton("Refresh Runtime Health")
-        refresh_health.hide()
+        self.log_output = QPlainTextEdit(); self.log_output.setReadOnly(True); self.log_output.setMinimumHeight(200)
+        self.tabs = QTabWidget(); outer.addWidget(self.tabs,1)
 
-        self.log_output = QPlainTextEdit()
-        self.log_output.setReadOnly(True)
-        self.log_output.setMinimumHeight(220)
+        ingest_tab=QWidget(); calibrate_tab=QWidget(); review_tab=QWidget(); push_tab=QWidget(); settings_tab=QWidget()
+        self.review_tab=ingest_tab; self.results_tab=review_tab; self.apply_tab=push_tab; self.settings_tab=runtime_tab
+        self.tabs.addTab(ingest_tab,'Ingest'); self.tabs.addTab(calibrate_tab,'Scan'); self.tabs.addTab(review_tab,'Calibrate'); self.tabs.addTab(push_tab,'Review'); self.tabs.addTab(settings_tab,'Push Looks To Camera'); runtime_tab=QWidget(); self.tabs.addTab(runtime_tab,'Settings')
+        self._build_ingest_tab(ingest_tab)
+        self._build_scan_tab(calibrate_tab)
+        self._build_calibrate_tab(review_tab)
+        self._build_results_tab(push_tab)
+        self._build_apply_tab(settings_tab)
+        self._build_runtime_tab(runtime_tab)
 
-        self.tabs = QTabWidget()
-        outer.addWidget(self.tabs, 1)
+    def make_card(self) -> QFrame:
+        c=QFrame(); c.setObjectName('card'); return c
 
-        review_tab = QWidget()
-        results_tab = QWidget()
-        apply_tab = QWidget()
-        settings_tab = QWidget()
-        self.review_tab = review_tab
-        self.results_tab = results_tab
-        self.apply_tab = apply_tab
-        self.settings_tab = settings_tab
-        self.tabs.addTab(review_tab, "Review")
-        self.tabs.addTab(results_tab, "Results")
-        self.tabs.addTab(apply_tab, "Apply / Verify")
-        self.tabs.addTab(settings_tab, "Settings")
+    def make_hero(self, kicker:str, title:str, subtitle:str) -> QWidget:
+        card=self.make_card(); card.setObjectName('hero')
+        lay=QVBoxLayout(card)
+        lay.addWidget(QLabel(f"<span style='font-size:13px;letter-spacing:1px;color:#93c5fd;font-weight:700'>{kicker.upper()}</span>"))
+        lay.addWidget(QLabel(f"<span style='font-size:44px;font-weight:800;color:#fff'>{title}</span>"))
+        sub=QLabel(subtitle); sub.setWordWrap(True); lay.addWidget(sub)
+        return card
 
-        self._build_review_tab(review_tab)
-        self._build_results_tab(results_tab)
-        self._build_apply_tab(apply_tab)
-        self._build_runtime_tab(settings_tab)
+    def _build_ingest_tab(self, tab: QWidget) -> None:
+        layout = QVBoxLayout(tab); layout.setSpacing(12)
+        layout.addWidget(self.make_hero('Ingest','R3DMatch Ingest','Set source/destination, scan source, then run.'))
+        top=QHBoxLayout();
+        source=self.make_card(); sg=QGridLayout(source)
+        self.source_mode=QComboBox(); self.source_mode.addItem('Local Folder','local_folder'); self.source_mode.addItem('FTPS Camera Pull','ftps_camera_pull')
+        self.input_path=QLineEdit(); self.output_path=QLineEdit(); self.local_ingest_root=QLineEdit(); self.verification_after_path=QLineEdit(); self.ftps_reel=QLineEdit(); self.ftps_clips=QLineEdit(); self.ftps_cameras=QLineEdit()
+        self.backend=QComboBox(); self.backend.addItems(['red','mock'])
+        self.target_type=QComboBox(); self.target_type.addItems(['gray_sphere','gray_card','color_chart'])
+        self.processing_mode=QComboBox(); self.processing_mode.addItems(['both','exposure','color'])
+        self.review_mode=QComboBox(); [self.review_mode.addItem(review_mode_label(v),v) for v in ['full_contact_sheet','lightweight_analysis']]
+        self.report_focus=QComboBox(); [self.report_focus.addItem(report_focus_label(v),v) for v in ['auto','full','outliers','anchors','cluster_extremes']]
+        self.preview_mode=QComboBox(); self.preview_mode.addItem('Monitoring (IPP2 / BT.709 / BT.1886)','monitoring')
+        self.preview_lut=QLineEdit(); self.preview_still_format=QComboBox(); self.preview_still_format.addItem('TIFF','tiff'); self.preview_still_format.addItem('JPEG','jpeg')
+        self.focus_validation_check=QCheckBox('Enable focus validation'); self.artifact_mode=QComboBox(); self.artifact_mode.addItem('Production','production'); self.artifact_mode.addItem('Debug','debug')
+        self.matching_domain=QComboBox(); self.matching_domain.addItem('Display (IPP2 / BT.709 / BT.1886)','perceptual'); self.matching_domain.addItem('Scene','scene')
+        self.reference_clip_id=QLineEdit(); self.hero_clip_id=QLineEdit(); self.roi_x=QLineEdit(); self.roi_y=QLineEdit(); self.roi_w=QLineEdit(); self.roi_h=QLineEdit()
+        self.strategy_checks={}
+        rr=QHBoxLayout();
+        for n in ['median','optimal-exposure','manual','hero-camera']:
+            b=QCheckBox(n); b.setChecked(n in DEFAULT_TARGET_STRATEGIES); self.strategy_checks[n]=b; rr.addWidget(b)
+        rr.addStretch(1)
+        fields=[('Source Mode',self.source_mode),('Calibration Folder',self._wrap_layout(self._path_row(self.input_path,self._browse_input))),('Output Folder',self._wrap_layout(self._path_row(self.output_path,self._browse_output))),('Camera Subset',self.ftps_cameras),('Target',self.target_type),('Strategy',self._wrap_layout(rr)),('Processing',self.processing_mode),('Report',self.review_mode)]
+        for i,(k,w) in enumerate(fields): sg.addWidget(self.make_field_row(k,w),i,0)
+        adv=QToolButton(); adv.setText('Advanced'); adv.setCheckable(True); adv.setChecked(False)
+        adv_panel=self.make_card(); adv_l=QGridLayout(adv_panel)
+        for i,(k,w) in enumerate([('Local Ingest Cache Root',self._wrap_layout(self._path_row(self.local_ingest_root,self._browse_ingest_root))),('After-Apply Review Folder',self._wrap_layout(self._path_row(self.verification_after_path,self._browse_after_apply))),('FTPS Reel',self.ftps_reel),('FTPS Clips / Ranges',self.ftps_clips),('normalized ROI',self.roi_x),('reference clip',self.reference_clip_id),('hero clip',self.hero_clip_id),('preview LUT',self.preview_lut),('matching internals',self.matching_domain)]): adv_l.addWidget(self.make_field_row(k,w),i,0)
+        adv_panel.setVisible(False); adv.toggled.connect(adv_panel.setVisible)
+        left=QVBoxLayout(); left.addWidget(source); left.addWidget(adv); left.addWidget(adv_panel)
+        layout.addLayout(left)
+        self.scan_button=QPushButton('Scan Source'); self.scan_button.clicked.connect(self._scan_source)
+        self.discover_button=QPushButton('Discover'); self.discover_button.clicked.connect(self._discover_ftps)
+        self.download_button=QPushButton('Download'); self.download_button.clicked.connect(self._download_ftps)
+        self.download_process_button=QPushButton('Download + Process'); self.download_process_button.clicked.connect(self._download_then_process)
+        self.retry_failed_button=QPushButton('Retry Failed'); self.retry_failed_button.clicked.connect(self._retry_failed_ftps)
+        row=QHBoxLayout(); [row.addWidget(w) for w in [self.scan_button,self.discover_button,self.download_button,self.download_process_button,self.retry_failed_button]]; row.addStretch(1); layout.addLayout(row)
+        self.source_summary=QTextBrowser(); self.source_summary.setMinimumHeight(90); self.source_summary.setHtml('<h3>Awaiting source scan</h3><p>Use Continue to Scan to run source scan.</p>')
+        self.clip_group_summary=QLabel('No clip groups yet. Scan source to populate groups.')
+        self.clip_group_list=QListWidget(); self.clip_group_list.setMinimumHeight(90)
+        self.run_review_button=QPushButton('Run Review'); self.run_review_button.clicked.connect(self._run_review)
+        self.approve_button=QPushButton('Approve Master RMD'); self.approve_button.clicked.connect(self._approve_master)
+        self.clear_preview_button=QPushButton('Clear Preview Cache'); self.clear_preview_button.clicked.connect(self._clear_preview_cache)
+        go_scan=QPushButton('Continue to Scan / Scan Source'); go_scan.clicked.connect(lambda: self.tabs.setCurrentIndex(1)); layout.addWidget(go_scan)
 
-        file_menu = self.menuBar().addMenu("File")
-        quit_action = QAction("Quit", self)
-        quit_action.triggered.connect(self.close)
-        file_menu.addAction(quit_action)
 
-    def _build_review_tab(self, tab: QWidget) -> None:
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(12)
-
-        review_intro = QLabel("Choose the source, confirm the clip-group selection, then run review. Results and apply state move to their own tabs after the package exists, so this page stays focused on setup and the active run.")
-        review_intro.setObjectName("bannerCopy")
-        review_intro.setWordWrap(True)
-        layout.addWidget(review_intro)
-
-        top_row = QHBoxLayout()
-        top_row.setSpacing(12)
-
-        source_group = QGroupBox("1. Source & Ingest")
-        source_grid = QGridLayout(source_group)
-        self.source_mode = QComboBox()
-        self.source_mode.addItem("Local Folder", "local_folder")
-        self.source_mode.addItem("FTPS Camera Pull", "ftps_camera_pull")
-        self.input_path = QLineEdit()
-        self.output_path = QLineEdit()
-        self.local_ingest_root = QLineEdit()
-        self.verification_after_path = QLineEdit()
-        self.ftps_reel = QLineEdit()
-        self.ftps_clips = QLineEdit()
-        self.ftps_cameras = QLineEdit()
-
-        source_grid.addWidget(QLabel("Source Mode"), 0, 0)
-        source_grid.addWidget(self.source_mode, 0, 1)
-        source_grid.addWidget(QLabel("Calibration Folder"), 1, 0)
-        source_grid.addLayout(self._path_row(self.input_path, self._browse_input), 1, 1)
-        source_grid.addWidget(QLabel("Output Folder"), 2, 0)
-        source_grid.addLayout(self._path_row(self.output_path, self._browse_output), 2, 1)
-        source_grid.addWidget(QLabel("Local Ingest Cache Root"), 3, 0)
-        source_grid.addLayout(self._path_row(self.local_ingest_root, self._browse_ingest_root), 3, 1)
-        source_grid.addWidget(QLabel("After-Apply Review Folder"), 4, 0)
-        source_grid.addLayout(self._path_row(self.verification_after_path, self._browse_after_apply), 4, 1)
-        source_grid.addWidget(QLabel("FTPS Reel"), 5, 0)
-        source_grid.addWidget(self.ftps_reel, 5, 1)
-        source_grid.addWidget(QLabel("FTPS Clips / Ranges"), 6, 0)
-        source_grid.addWidget(self.ftps_clips, 6, 1)
-        source_grid.addWidget(QLabel("Camera Subset"), 7, 0)
-        source_grid.addWidget(self.ftps_cameras, 7, 1)
-        top_row.addWidget(source_group, 7)
-
-        if self.minimal_mode:
-            layout.addLayout(top_row)
-            return
-
-        review_group = QGroupBox("2. Review Setup")
-        review_layout = QVBoxLayout(review_group)
-        review_layout.setSpacing(10)
-        review_hint = QLabel("Keep this section to the run-shaping choices first. Advanced controls stay available below, but they should not distract from the default operator path.")
-        review_hint.setObjectName("panelHint")
-        review_hint.setWordWrap(True)
-        review_layout.addWidget(review_hint)
-
-        review_form = QFormLayout()
-        self.backend = QComboBox()
-        self.backend.addItems(["red", "mock"])
-        self.target_type = QComboBox()
-        self.target_type.addItems(["gray_sphere", "gray_card", "color_chart"])
-        self.processing_mode = QComboBox()
-        self.processing_mode.addItems(["both", "exposure", "color"])
-        self.review_mode = QComboBox()
-        for value in ["full_contact_sheet", "lightweight_analysis"]:
-            self.review_mode.addItem(review_mode_label(value), value)
-        self.report_focus = QComboBox()
-        for value in ["auto", "full", "outliers", "anchors", "cluster_extremes"]:
-            self.report_focus.addItem(report_focus_label(value), value)
-        self.preview_mode = QComboBox()
-        self.preview_mode.addItem("Monitoring (IPP2 / BT.709 / BT.1886)", "monitoring")
-        self.preview_lut = QLineEdit()
-        self.preview_still_format = QComboBox()
-        self.preview_still_format.addItem("TIFF", "tiff")
-        self.preview_still_format.addItem("JPEG", "jpeg")
-        self.focus_validation_check = QCheckBox("Enable focus validation")
-        self.focus_validation_check.setChecked(False)
-        self.artifact_mode = QComboBox()
-        self.artifact_mode.addItem("Production", "production")
-        self.artifact_mode.addItem("Debug", "debug")
-        self.matching_domain = QComboBox()
-        self.matching_domain.addItem("Display (IPP2 / BT.709 / BT.1886)", "perceptual")
-        self.matching_domain.addItem("Scene", "scene")
-        self.reference_clip_id = QLineEdit()
-        self.hero_clip_id = QLineEdit()
-        self.roi_x = QLineEdit()
-        self.roi_y = QLineEdit()
-        self.roi_w = QLineEdit()
-        self.roi_h = QLineEdit()
-        self.strategy_checks: Dict[str, QCheckBox] = {}
-        strategy_row = QHBoxLayout()
-        for name in ["median", "optimal-exposure", "manual", "hero-camera"]:
-            box = QCheckBox(name)
-            box.setChecked(name in DEFAULT_TARGET_STRATEGIES)
-            self.strategy_checks[name] = box
-            strategy_row.addWidget(box)
-        strategy_row.addStretch(1)
-        roi_row = QHBoxLayout()
-        for widget, placeholder in [
-            (self.roi_x, "x"),
-            (self.roi_y, "y"),
-            (self.roi_w, "w"),
-            (self.roi_h, "h"),
-        ]:
-            widget.setPlaceholderText(placeholder)
-            widget.setMaximumWidth(90)
-            roi_row.addWidget(widget)
-        roi_row.addStretch(1)
-        preview_lut_row = self._path_row(self.preview_lut, self._browse_preview_lut, button_text="Browse LUT")
-
-        review_form.addRow("Backend", self.backend)
-        review_form.addRow("Target Type", self.target_type)
-        review_form.addRow("Processing Mode", self.processing_mode)
-        review_form.addRow("Review Mode", self.review_mode)
-        review_form.addRow("Report Focus", self.report_focus)
-        review_form.addRow("Target Strategies", self._wrap_layout(strategy_row))
-        review_form.addRow("Preview Still Format", self.preview_still_format)
-        review_form.addRow("Focus Validation", self.focus_validation_check)
-        review_layout.addLayout(review_form)
-
-        advanced_group = QGroupBox("Advanced Review Controls")
-        advanced_form = QFormLayout(advanced_group)
-        advanced_form.addRow("Reference Clip", self.reference_clip_id)
-        advanced_form.addRow("Hero Clip", self.hero_clip_id)
-        advanced_form.addRow("Preview Mode", self.preview_mode)
-        advanced_form.addRow("Preview LUT", self._wrap_layout(preview_lut_row))
-        advanced_form.addRow("Artifact Mode", self.artifact_mode)
-        advanced_form.addRow("Matching Domain", self.matching_domain)
-        advanced_form.addRow("Normalized ROI", self._wrap_layout(roi_row))
-        review_layout.addWidget(advanced_group)
-        top_row.addWidget(review_group, 6)
-        layout.addLayout(top_row)
-
-        controls_row = QHBoxLayout()
-        self.scan_button = QPushButton("Scan / Plan")
-        self.scan_button.clicked.connect(self._scan_source)
-        self.discover_button = QPushButton("Discover")
-        self.discover_button.clicked.connect(self._discover_ftps)
-        self.download_button = QPushButton("Download")
-        self.download_button.clicked.connect(self._download_ftps)
-        self.download_process_button = QPushButton("Download + Process")
-        self.download_process_button.clicked.connect(self._download_then_process)
-        self.retry_failed_button = QPushButton("Retry Failed")
-        self.retry_failed_button.clicked.connect(self._retry_failed_ftps)
-        for widget in [
-            self.scan_button,
-            self.discover_button,
-            self.download_button,
-            self.download_process_button,
-            self.retry_failed_button,
-        ]:
-            controls_row.addWidget(widget)
-        controls_row.addStretch(1)
-        self.source_summary = QTextBrowser()
-        self.source_summary.setOpenExternalLinks(False)
-        self.source_summary.setMinimumHeight(140)
-        self.source_summary.setHtml(
-            "<h3>Awaiting source scan</h3>"
-            "<p>Scan a source to confirm clip groups, clip count, and the exact subset selection before running review.</p>"
-        )
-        layout.addWidget(self._wrap_group("Source Summary", self.source_summary))
-
-        subset_group = QGroupBox("3. Clip Group Selection")
-        subset_layout = QVBoxLayout(subset_group)
-        subset_hint = QLabel("Choose the subset groups for this run. All groups start selected, but the selection remains visible so accidental multi-group runs are obvious before Run Review.")
-        subset_hint.setObjectName("panelHint")
-        subset_hint.setWordWrap(True)
-        subset_layout.addWidget(subset_hint)
-        self.clip_group_summary = QLabel("Scan a local folder to populate clip groups.")
-        self.clip_group_summary.setObjectName("panelHint")
-        self.clip_group_summary.setWordWrap(True)
-        subset_layout.addWidget(self.clip_group_summary)
-        self.clip_group_list = QListWidget()
-        self.clip_group_list.setMinimumHeight(140)
-        subset_layout.addWidget(self.clip_group_list)
-        layout.addWidget(subset_group)
-
-        actions_group = QGroupBox("4. Run")
-        actions_layout = QVBoxLayout(actions_group)
-        self.scan_hint = QLabel("1. Scan or discover the source. 2. Confirm the clip groups. 3. Run review. The live log below is the active run surface; completed results move to the Results tab.")
-        self.scan_hint.setObjectName("panelHint")
-        self.scan_hint.setWordWrap(True)
-        actions_layout.addWidget(self.scan_hint)
-        actions_layout.addLayout(controls_row)
-
-        actions = QGroupBox("Run / Approve / Cache")
-        actions_row = QHBoxLayout(actions)
-        self.run_review_button = QPushButton("Run Review")
-        self.run_review_button.clicked.connect(self._run_review)
-        self.approve_button = QPushButton("Approve Master RMD")
-        self.approve_button.clicked.connect(self._approve_master)
-        self.clear_preview_button = QPushButton("Clear Preview Cache")
-        self.clear_preview_button.clicked.connect(self._clear_preview_cache)
-        for widget in [self.run_review_button, self.approve_button, self.clear_preview_button]:
-            actions_row.addWidget(widget)
-        actions_row.addStretch(1)
-        actions_layout.addWidget(actions)
-        live_log_hint = QLabel("Live Processing Log is only for the active run. Completed recommendations, artifacts, and commit readiness appear in Results and Apply / Verify.")
-        live_log_hint.setObjectName("panelHint")
-        live_log_hint.setWordWrap(True)
-        actions_layout.addWidget(live_log_hint)
-        actions_layout.addWidget(self._wrap_group("Live Processing Log", self.log_output))
-        layout.addWidget(actions_group)
+    def _build_scan_tab(self, tab: QWidget) -> None:
+        layout = QVBoxLayout(tab); layout.setSpacing(12)
+        layout.addWidget(self.make_hero('Scan','Source Scan','Scan source, review groups, then run review.'))
+        row=QHBoxLayout(); [row.addWidget(w) for w in [self.scan_button,self.discover_button,self.download_button,self.download_process_button,self.retry_failed_button]]; row.addStretch(1); layout.addLayout(row)
+        self.source_summary.setMinimumHeight(120); layout.addWidget(self.source_summary)
+        layout.addWidget(self.clip_group_summary)
+        self.clip_group_list.setMinimumHeight(90); layout.addWidget(self.clip_group_list)
+        r2=QHBoxLayout(); [r2.addWidget(w) for w in [self.run_review_button,self.approve_button,self.clear_preview_button]]; r2.addStretch(1); layout.addLayout(r2)
+        self.log_output.setMinimumHeight(140); layout.addWidget(self.log_output)
+    def _build_calibrate_tab(self, tab: QWidget) -> None:
+        l=QVBoxLayout(tab); l.addWidget(self.make_hero('Calibrate','Calibrate','Track run status, ETA, and terminal output.'))
+        self.calibrate_progress=QProgressBar(); self.calibrate_progress.setValue(0); l.addWidget(self.calibrate_progress)
+        self.progress_surface=QPlainTextEdit(); self.progress_surface.setReadOnly(True); self.progress_surface.setMinimumHeight(80); l.addWidget(self.progress_surface)
 
     def _build_runtime_tab(self, tab: QWidget) -> None:
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(12)
-
-        runtime_intro = QLabel("Settings / Preferences keeps environment and REDLine configuration out of the main workflow. The readiness panel below mirrors the same backend truth used by packaged checks, report export, and RED-backed review runs.")
-        runtime_intro.setObjectName("bannerCopy")
-        runtime_intro.setWordWrap(True)
-        layout.addWidget(runtime_intro)
-
-        self.runtime_health = QTextBrowser()
-        self.runtime_health.setOpenExternalLinks(False)
-        self.runtime_health.setMinimumHeight(260)
-        layout.addWidget(self._wrap_group("Runtime / Environment Health", self.runtime_health))
-
-        redline_group = QGroupBox("REDLine Configuration")
-        form = QFormLayout(redline_group)
-        self.redline_path = QLineEdit(redline_configured_path())
-        redline_row = self._path_row(self.redline_path, self._browse_redline, button_text="Browse")
-        buttons = QHBoxLayout()
-        self.save_redline_button = QPushButton("Save / Apply")
-        self.save_redline_button.clicked.connect(self._save_redline)
-        refresh_redline = QPushButton("Reload")
-        refresh_redline.clicked.connect(self._reload_redline)
-        buttons.addWidget(self.save_redline_button)
-        buttons.addWidget(refresh_redline)
-        buttons.addStretch(1)
-        self.redline_feedback = QLabel("")
-        self.redline_feedback.setWordWrap(True)
-        form.addRow("Executable Path", self._wrap_layout(redline_row))
-        form.addRow("", self._wrap_layout(buttons))
-        form.addRow("Status", self.redline_feedback)
-        layout.addWidget(redline_group)
-        layout.addStretch(1)
+        layout=QVBoxLayout(tab); layout.addWidget(self.make_hero('Settings','Settings','Runtime health, REDLine configuration, diagnostics.'))
+        self.runtime_health=QTextBrowser(); self.runtime_health.setMinimumHeight(260); layout.addWidget(self.runtime_health)
+        self.redline_path=QLineEdit(redline_configured_path())
+        self.save_redline_button=QPushButton('Save / Apply'); self.save_redline_button.clicked.connect(self._save_redline)
+        reload=QPushButton('Reload'); reload.clicked.connect(self._reload_redline)
+        self.redline_feedback=QLabel('')
+        layout.addWidget(self.make_field_row('REDLine path',self._wrap_layout(self._path_row(self.redline_path,self._browse_redline))))
+        rr=QHBoxLayout(); rr.addWidget(self.save_redline_button); rr.addWidget(reload); rr.addStretch(1); layout.addLayout(rr); layout.addWidget(self.redline_feedback)
 
     def _build_results_tab(self, tab: QWidget) -> None:
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(12)
-        self.results_banner = QLabel()
-        self.results_banner.setObjectName("bannerCopy")
-        self.results_banner.setWordWrap(True)
-        layout.addWidget(self.results_banner)
-        self.results_summary = QTextBrowser()
-        self.results_summary.setOpenExternalLinks(False)
-        self.results_summary.setMinimumHeight(300)
-        layout.addWidget(self._wrap_group("Artifacts / Results", self.results_summary))
-
-        buttons = QHBoxLayout()
-        self.open_html_button = QPushButton("Open Report (HTML)")
-        self.open_html_button.clicked.connect(self._open_report_html)
-        self.open_pdf_button = QPushButton("Open PDF")
-        self.open_pdf_button.clicked.connect(self._open_report_pdf)
-        self.open_output_button = QPushButton("Open Output Folder")
-        self.open_output_button.clicked.connect(self._open_output_folder)
-        self.refresh_results_button = QPushButton("Refresh Results")
-        self.refresh_results_button.clicked.connect(self._refresh_artifacts)
-        for widget in [self.open_html_button, self.open_pdf_button, self.open_output_button, self.refresh_results_button]:
-            buttons.addWidget(widget)
-        buttons.addStretch(1)
-        layout.addLayout(buttons)
-        layout.addStretch(1)
+        layout=QVBoxLayout(tab); layout.addWidget(self.make_hero('Review','Review','Summary, camera results, and manual sphere assist.'))
+        self.results_banner=QLabel(); self.results_banner.setWordWrap(True); layout.addWidget(self.results_banner)
+        self.results_summary=QTextBrowser(); self.results_summary.setMinimumHeight(260); layout.addWidget(self.results_summary)
+        buttons=QHBoxLayout();
+        self.open_html_button=QPushButton('Open HTML'); self.open_html_button.clicked.connect(self._open_report_html)
+        self.open_pdf_button=QPushButton('Open PDF'); self.open_pdf_button.clicked.connect(self._open_report_pdf)
+        self.open_output_button=QPushButton('Open Output Folder'); self.open_output_button.clicked.connect(self._open_output_folder)
+        self.refresh_results_button=QPushButton('Open Diagnostics'); self.refresh_results_button.clicked.connect(self._refresh_artifacts)
+        [buttons.addWidget(w) for w in [self.open_html_button,self.open_pdf_button,self.open_output_button,self.refresh_results_button]]; buttons.addStretch(1); layout.addLayout(buttons)
 
     def _build_apply_tab(self, tab: QWidget) -> None:
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(12)
-        self.apply_banner = QLabel()
-        self.apply_banner.setObjectName("bannerCopy")
-        self.apply_banner.setWordWrap(True)
-        layout.addWidget(self.apply_banner)
-        self.apply_summary = QTextBrowser()
-        self.apply_summary.setOpenExternalLinks(False)
-        self.apply_summary.setMinimumHeight(300)
-        layout.addWidget(self._wrap_group("Apply / Verification", self.apply_summary))
+        layout=QVBoxLayout(tab); layout.addWidget(self.make_hero('Push Looks To Camera','Push Looks To Camera','Network readiness, payload readiness, and push actions.'))
+        self.apply_banner=QLabel(); self.apply_banner.setWordWrap(True); layout.addWidget(self.apply_banner)
+        self.apply_summary=QTextBrowser(); self.apply_summary.setMinimumHeight(260); layout.addWidget(self.apply_summary)
+        row=QHBoxLayout()
+        self.read_current_values_button=QPushButton('Read Current Values'); self.read_current_values_button.clicked.connect(self._read_current_camera_values)
+        self.dry_run_push_button=QPushButton('Dry Run Push'); self.dry_run_push_button.clicked.connect(self._apply_dry_run)
+        self.live_push_button=QPushButton('Push Looks'); self.live_push_button.clicked.connect(self._apply_live)
+        self.verify_push_button=QPushButton('Verify Last Push'); self.verify_push_button.clicked.connect(self._verify_last_push)
+        [row.addWidget(w) for w in [self.read_current_values_button,self.dry_run_push_button,self.live_push_button,self.verify_push_button]]; row.addStretch(1); layout.addLayout(row)
 
-        row = QHBoxLayout()
-        self.read_current_values_button = QPushButton("Read Current Camera Values")
-        self.read_current_values_button.clicked.connect(self._read_current_camera_values)
-        self.dry_run_push_button = QPushButton("Dry Run Push")
-        self.dry_run_push_button.clicked.connect(self._apply_dry_run)
-        self.live_push_button = QPushButton("Live Push")
-        self.live_push_button.clicked.connect(self._apply_live)
-        self.verify_push_button = QPushButton("Verify Last Push")
-        self.verify_push_button.clicked.connect(self._verify_last_push)
-        for widget in [
-            self.read_current_values_button,
-            self.dry_run_push_button,
-            self.live_push_button,
-            self.verify_push_button,
-        ]:
-            row.addWidget(widget)
-        row.addStretch(1)
-        layout.addLayout(row)
-        layout.addStretch(1)
-
-    def _wrap_group(self, title: str, widget: QWidget) -> QGroupBox:
-        group = QGroupBox(title)
-        layout = QVBoxLayout(group)
-        layout.addWidget(widget)
-        return group
-
-    def _status_badge(self, text: str, state: str) -> QLabel:
-        label = QLabel(text)
-        label.setProperty("badgeRole", "status")
-        label.setProperty("badgeState", state)
-        return label
-
-    def _set_badge_state(self, label: Optional[QLabel], text: str, state: str) -> None:
-        if label is None:
-            return
-        label.setText(text)
-        label.setProperty("badgeState", state)
-        label.style().unpolish(label)
-        label.style().polish(label)
+    def make_field_row(self, label:str, widget:QWidget) -> QWidget:
+        w=self.make_card(); l=QVBoxLayout(w); l.addWidget(QLabel(f"<span style='font-size:11px;font-weight:700;letter-spacing:1px'>{label.upper()}</span>")); l.addWidget(widget); return w
 
     def _wrap_layout(self, layout) -> QWidget:  # type: ignore[no-untyped-def]
-        widget = QWidget()
-        widget.setLayout(layout)
-        return widget
+        widget=QWidget(); widget.setLayout(layout); return widget
 
-    def _path_row(self, line_edit: QLineEdit, callback, *, button_text: str = "Browse") -> QHBoxLayout:  # type: ignore[no-untyped-def]
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.addWidget(line_edit, 1)
-        button = QPushButton(button_text)
-        button.clicked.connect(callback)
-        row.addWidget(button)
-        return row
+    def _path_row(self, line_edit: QLineEdit, callback, *, button_text: str = 'Browse') -> QHBoxLayout:  # type: ignore[no-untyped-def]
+        row=QHBoxLayout(); row.setContentsMargins(0,0,0,0); row.addWidget(line_edit,1); b=QPushButton(button_text); b.clicked.connect(callback); row.addWidget(b); return row
 
     def _bind_signals(self) -> None:
         self.source_mode.currentIndexChanged.connect(self._refresh_source_mode_visibility)
