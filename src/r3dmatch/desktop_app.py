@@ -79,7 +79,7 @@ DEFAULT_ARTIFACT_MODE = "production"
 APP_STYLESHEET = """
 QMainWindow, QWidget { background: #d7dde3; color: #0f172a; font-size: 13px; }
 QScrollArea { border: none; background: transparent; }
-QFrame#card { background: #f8fafc; border: 1px solid #d8dee6; border-radius: 10px; }
+QFrame#card { background: #fbfcfd; border: 1px solid #d8dde3; border-radius: 10px; }
 QFrame#hero { background: #111827; border: 1px solid #111827; border-radius: 18px; }
 QLabel { color: #0f172a; }
 QFrame#hero QLabel { color: #d7dee8; }
@@ -92,11 +92,11 @@ QLineEdit, QComboBox, QPlainTextEdit, QTextBrowser, QListWidget, QProgressBar {
 QTabWidget::pane { border: none; }
 QTabBar::tab { background: #ffffff; border: 1px solid #d8dee6; border-radius: 10px; padding: 12px 14px; margin-right: 8px; min-width: 170px; font-weight: 800; color: #344054; }
 QTabBar::tab:selected { background: #111827; border-color: #111827; color: #ffffff; }
-QLabel[badgeRole="status"] { border-radius: 999px; padding: 8px 12px; font-size: 12px; font-weight: 900; border: 1px solid #d8dee6; background: #fff; }
+QLabel[badgeRole="status"] { border-radius: 10px; padding: 6px 10px; font-size: 11px; font-weight: 800; border: 1px solid #d8dde3; background: #fbfcfd; }
 QLabel[badgeState="good"] { background: #e7f4ea; color: #166534; border-color: #b8e5c5; }
 QLabel[badgeState="warn"] { background: #fbf5e6; color: #92400e; border-color: #f5dda2; }
-QLabel[badgeState="bad"] { background: #fdecec; color: #991b1b; border-color: #fecaca; }
-QLabel[badgeState="info"] { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
+QLabel[badgeState="bad"] { background: #fef2f2; color: #991b1b; border-color: #fecaca; }
+QLabel[badgeState="info"] { background: #eef4ff; color: #1d4ed8; border-color: #bfdbfe; }
 QStatusBar { background: #f4f6f8; color: #475467; }
 """
 
@@ -784,34 +784,38 @@ class R3DMatchDesktopWindow(QMainWindow):
 
         header_card = self.make_card()
         header = QVBoxLayout(header_card)
-        top_row = QHBoxLayout()
-        logo_label = QLabel()
-        logo_label.setFixedWidth(150)
-        if DEFAULT_LOGO_PATH.exists():
-            pixmap = QPixmap(str(DEFAULT_LOGO_PATH))
-            if not pixmap.isNull():
-                logo_label.setPixmap(pixmap.scaledToWidth(130, Qt.TransformationMode.SmoothTransformation))
-        title_box = QVBoxLayout()
-        title_box.addWidget(QLabel('<span style="font-size:34px;font-weight:800;color:#f8fafc;">R3DMatch</span>'))
-        title_box.addWidget(QLabel('Operator desktop for ingest, calibration review, reporting, and verification'))
-        title_box.addWidget(QLabel('Workflow: Ingest / Configure / Review / Inspect / Apply'))
-        top_row.addWidget(logo_label)
-        top_row.addLayout(title_box, 1)
-        header.addLayout(top_row)
+        header.setContentsMargins(14, 12, 14, 12)
+        header.setSpacing(6)
 
-        badge_row = QHBoxLayout()
-        self.runtime_chip = self._status_badge('RED SDK Runtime: Checking', 'info')
-        self.redline_chip = self._status_badge('REDLine: Checking', 'info')
-        self.pdf_chip = self._status_badge('HTML/PDF: Checking', 'info')
-        self.context_chip = self._status_badge('Packaged App', 'info')
-        for w in [self.runtime_chip,self.redline_chip,self.pdf_chip,self.context_chip]: badge_row.addWidget(w)
-        badge_row.addStretch(1)
+        top_row = QHBoxLayout()
+        top_row.setSpacing(12)
+
+        left = QVBoxLayout()
+        left.setSpacing(2)
+        left.addWidget(QLabel("<span style='font-size:11px;font-weight:900;letter-spacing:1.6px;color:#667085;'>R3DMATCH OPERATOR CONSOLE</span>"))
+        left.addWidget(QLabel("<span style='font-size:40px;font-weight:900;color:#101828;'>R3DMatch</span>"))
+        left.addWidget(QLabel("<span style='font-size:15px;color:#475467;'>Ingest / Scan / Calibrate / Review / Push Looks</span>"))
+        left.addWidget(QLabel("<span style='font-size:14px;color:#475467;'>Operator desktop for ingest, camera analysis, calibration review, manual sphere assist, and camera writeback.</span>"))
+        top_row.addLayout(left, 1)
+
+        right = QVBoxLayout()
+        right.setSpacing(6)
+        self.runtime_chip = self._status_badge('RED SDK · Checking', 'info')
+        self.redline_chip = self._status_badge('REDLine · Checking', 'info')
+        self.pdf_chip = self._status_badge('HTML/PDF · Checking', 'info')
+        self.context_chip = self._status_badge('Packaged App · Checking', 'info')
+        for w in [self.runtime_chip, self.redline_chip, self.pdf_chip, self.context_chip]:
+            right.addWidget(w)
         refresh_health = QPushButton('Refresh Runtime Health')
         refresh_health.clicked.connect(self._refresh_runtime_health)
-        badge_row.addWidget(refresh_health)
-        header.addLayout(badge_row)
+        refresh_health.setMaximumWidth(180)
+        right.addWidget(refresh_health, alignment=Qt.AlignmentFlag.AlignRight)
+        top_row.addLayout(right)
+
+        header.addLayout(top_row)
         self.workflow_banner = QLabel()
         self.workflow_banner.setWordWrap(True)
+        self.workflow_banner.hide()
         header.addWidget(self.workflow_banner)
         outer.addWidget(header_card)
 
@@ -819,8 +823,9 @@ class R3DMatchDesktopWindow(QMainWindow):
         self.tabs = QTabWidget(); outer.addWidget(self.tabs,1)
 
         ingest_tab=QWidget(); calibrate_tab=QWidget(); review_tab=QWidget(); push_tab=QWidget(); settings_tab=QWidget()
+        runtime_tab=QWidget()
         self.review_tab=ingest_tab; self.results_tab=review_tab; self.apply_tab=push_tab; self.settings_tab=runtime_tab
-        self.tabs.addTab(ingest_tab,'Ingest'); self.tabs.addTab(calibrate_tab,'Scan'); self.tabs.addTab(review_tab,'Calibrate'); self.tabs.addTab(push_tab,'Review'); self.tabs.addTab(settings_tab,'Push Looks To Camera'); runtime_tab=QWidget(); self.tabs.addTab(runtime_tab,'Settings')
+        self.tabs.addTab(ingest_tab,'Ingest'); self.tabs.addTab(calibrate_tab,'Scan'); self.tabs.addTab(review_tab,'Calibrate'); self.tabs.addTab(push_tab,'Review'); self.tabs.addTab(settings_tab,'Push Looks To Camera'); self.tabs.addTab(runtime_tab,'Settings')
         self._build_ingest_tab(ingest_tab)
         self._build_scan_tab(calibrate_tab)
         self._build_calibrate_tab(review_tab)
