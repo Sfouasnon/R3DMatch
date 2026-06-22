@@ -1,0 +1,657 @@
+{
+  "schema_version": "r3dmatch2_sphere_profile_v1",
+  "project_id": "Test_Footage_064_UnderExposedGD",
+  "created_at": "2026-05-26T15:43:01.082200+00:00",
+  "updated_at": "2026-06-01T02:40:43.681316+00:00",
+  "cameras": {
+    "G007_A064": {
+      "camera_label": "G007_A064",
+      "samples": [
+        {
+          "clip_id": "G007_A064_0325RN_001",
+          "run_id": "run_1780281453",
+          "recorded_at": "2026-06-01T02:37:44.117540+00:00",
+          "trust": "verified_manual",
+          "geometry": {
+            "cx_norm": 0.5669,
+            "cy_norm": 0.4966,
+            "radius_ratio": 0.0861
+          },
+          "photometrics": {
+            "ire_spread": -0.307,
+            "chroma_distance": 0.0,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 23.16
+          }
+        }
+      ]
+    },
+    "G007_B064": {
+      "camera_label": "G007_B064",
+      "samples": [
+        {
+          "clip_id": "G007_B064_032526_001",
+          "run_id": "run_1780281453",
+          "recorded_at": "2026-06-01T02:37:44.708323+00:00",
+          "trust": "verified_manual",
+          "geometry": {
+            "cx_norm": 0.4936,
+            "cy_norm": 0.3535,
+            "radius_ratio": 0.0935
+          },
+          "photometrics": {
+            "ire_spread": -0.531,
+            "chroma_distance": 0.0,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 22.88
+          }
+        }
+      ]
+    },
+    "G007_C064": {
+      "camera_label": "G007_C064",
+      "samples": [
+        {
+          "clip_id": "G007_C064_03256P_001",
+          "run_id": "run_1779810180",
+          "recorded_at": "2026-05-26T15:44:26.510602+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.55,
+            "cy_norm": 0.4658,
+            "radius_ratio": 0.0938
+          },
+          "photometrics": {
+            "ire_spread": 3.375,
+            "chroma_distance": 0.0332,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 22.04
+          }
+        },
+        {
+          "clip_id": "G007_C064_03256P_001",
+          "run_id": "run_1780261904",
+          "recorded_at": "2026-05-31T21:13:26.388172+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.55,
+            "cy_norm": 0.4658,
+            "radius_ratio": 0.0938
+          },
+          "photometrics": {
+            "ire_spread": 3.375,
+            "chroma_distance": 0.0332,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 22.04
+          }
+        },
+        {
+          "clip_id": "G007_C064_03256P_001",
+          "run_id": "run_1780275208",
+          "recorded_at": "2026-06-01T00:55:08.809161+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.55,
+            "cy_norm": 0.4658,
+            "radius_ratio": 0.0938
+          },
+          "photometrics": {
+            "ire_spread": 3.375,
+            "chroma_distance": 0.0332,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 22.04
+          }
+        },
+        {
+          "clip_id": "G007_C064_03256P_001",
+          "run_id": "run_1780281453",
+          "recorded_at": "2026-06-01T02:38:14.663478+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.55,
+            "cy_norm": 0.4658,
+            "radius_ratio": 0.0938
+          },
+          "photometrics": {
+            "ire_spread": 3.375,
+            "chroma_distance": 0.0332,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 22.04
+          }
+        }
+      ]
+    },
+    "H007_A064": {
+      "camera_label": "H007_A064",
+      "samples": [
+        {
+          "clip_id": "H007_A064_0325ZT_001",
+          "run_id": "run_1780281453",
+          "recorded_at": "2026-06-01T02:38:15.856270+00:00",
+          "trust": "verified_manual",
+          "geometry": {
+            "cx_norm": 0.5325,
+            "cy_norm": 0.5123,
+            "radius_ratio": 0.0843
+          },
+          "photometrics": {
+            "ire_spread": -0.055,
+            "chroma_distance": 0.0,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 24.2
+          }
+        }
+      ]
+    },
+    "H007_B064": {
+      "camera_label": "H007_B064",
+      "samples": [
+        {
+          "clip_id": "H007_B064_032530_001",
+          "run_id": "run_1779810180",
+          "recorded_at": "2026-05-26T15:45:51.429803+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.5093,
+            "cy_norm": 0.4576,
+            "radius_ratio": 0.0889
+          },
+          "photometrics": {
+            "ire_spread": 1.625,
+            "chroma_distance": 0.0324,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 23.16
+          }
+        },
+        {
+          "clip_id": "H007_B064_032530_001",
+          "run_id": "run_1780261904",
+          "recorded_at": "2026-05-31T21:14:59.024645+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.5093,
+            "cy_norm": 0.4576,
+            "radius_ratio": 0.0889
+          },
+          "photometrics": {
+            "ire_spread": 1.625,
+            "chroma_distance": 0.0324,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 23.16
+          }
+        },
+        {
+          "clip_id": "H007_B064_032530_001",
+          "run_id": "run_1780275208",
+          "recorded_at": "2026-06-01T00:56:38.036391+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.5093,
+            "cy_norm": 0.4576,
+            "radius_ratio": 0.0889
+          },
+          "photometrics": {
+            "ire_spread": 1.625,
+            "chroma_distance": 0.0324,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 23.16
+          }
+        },
+        {
+          "clip_id": "H007_B064_032530_001",
+          "run_id": "run_1780281453",
+          "recorded_at": "2026-06-01T02:38:45.845134+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.5093,
+            "cy_norm": 0.4576,
+            "radius_ratio": 0.0889
+          },
+          "photometrics": {
+            "ire_spread": 1.625,
+            "chroma_distance": 0.0324,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 23.16
+          }
+        }
+      ]
+    },
+    "H007_C064": {
+      "camera_label": "H007_C064",
+      "samples": [
+        {
+          "clip_id": "H007_C064_0325NN_001",
+          "run_id": "run_1779810180",
+          "recorded_at": "2026-05-26T15:46:18.800088+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.563,
+            "cy_norm": 0.6008,
+            "radius_ratio": 0.0938
+          },
+          "photometrics": {
+            "ire_spread": 3.207,
+            "chroma_distance": 0.0335,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 22.37
+          }
+        },
+        {
+          "clip_id": "H007_C064_0325NN_001",
+          "run_id": "run_1780261904",
+          "recorded_at": "2026-05-31T21:15:29.989942+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.563,
+            "cy_norm": 0.6008,
+            "radius_ratio": 0.0938
+          },
+          "photometrics": {
+            "ire_spread": 3.207,
+            "chroma_distance": 0.0335,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 22.37
+          }
+        },
+        {
+          "clip_id": "H007_C064_0325NN_001",
+          "run_id": "run_1780275208",
+          "recorded_at": "2026-06-01T00:57:07.238845+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.563,
+            "cy_norm": 0.6008,
+            "radius_ratio": 0.0938
+          },
+          "photometrics": {
+            "ire_spread": 3.207,
+            "chroma_distance": 0.0335,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 22.37
+          }
+        },
+        {
+          "clip_id": "H007_C064_0325NN_001",
+          "run_id": "run_1780281453",
+          "recorded_at": "2026-06-01T02:39:15.189710+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.563,
+            "cy_norm": 0.6008,
+            "radius_ratio": 0.0938
+          },
+          "photometrics": {
+            "ire_spread": 3.207,
+            "chroma_distance": 0.0335,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 22.37
+          }
+        }
+      ]
+    },
+    "I007_A064": {
+      "camera_label": "I007_A064",
+      "samples": [
+        {
+          "clip_id": "I007_A064_0325XY_001",
+          "run_id": "run_1780281453",
+          "recorded_at": "2026-06-01T02:39:16.362245+00:00",
+          "trust": "verified_manual",
+          "geometry": {
+            "cx_norm": 0.553,
+            "cy_norm": 0.4964,
+            "radius_ratio": 0.0884
+          },
+          "photometrics": {
+            "ire_spread": -0.674,
+            "chroma_distance": 0.0,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 26.05
+          }
+        }
+      ]
+    },
+    "I007_B064": {
+      "camera_label": "I007_B064",
+      "samples": [
+        {
+          "clip_id": "I007_B064_032597_001",
+          "run_id": "run_1779810180",
+          "recorded_at": "2026-05-26T15:47:41.463380+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.5111,
+            "cy_norm": 0.5745,
+            "radius_ratio": 0.0856
+          },
+          "photometrics": {
+            "ire_spread": 2.212,
+            "chroma_distance": 0.0331,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 22.63
+          }
+        },
+        {
+          "clip_id": "I007_B064_032597_001",
+          "run_id": "run_1779942653",
+          "recorded_at": "2026-05-28T04:35:53.309256+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.0509,
+            "cy_norm": 0.8346,
+            "radius_ratio": 0.0724
+          },
+          "photometrics": {
+            "ire_spread": 1.144,
+            "chroma_distance": 0.0308,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 49.82
+          }
+        },
+        {
+          "clip_id": "I007_B064_032597_001",
+          "run_id": "run_1780261904",
+          "recorded_at": "2026-05-31T21:17:02.559757+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.5111,
+            "cy_norm": 0.5745,
+            "radius_ratio": 0.0856
+          },
+          "photometrics": {
+            "ire_spread": 2.212,
+            "chroma_distance": 0.0331,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 22.63
+          }
+        },
+        {
+          "clip_id": "I007_B064_032597_001",
+          "run_id": "run_1780275208",
+          "recorded_at": "2026-06-01T00:58:35.380160+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.5111,
+            "cy_norm": 0.5745,
+            "radius_ratio": 0.0856
+          },
+          "photometrics": {
+            "ire_spread": 2.212,
+            "chroma_distance": 0.0331,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 22.63
+          }
+        },
+        {
+          "clip_id": "I007_B064_032597_001",
+          "run_id": "run_1780281453",
+          "recorded_at": "2026-06-01T02:39:45.965955+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.5111,
+            "cy_norm": 0.5745,
+            "radius_ratio": 0.0856
+          },
+          "photometrics": {
+            "ire_spread": 2.212,
+            "chroma_distance": 0.0331,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 22.63
+          }
+        }
+      ]
+    },
+    "I007_C064": {
+      "camera_label": "I007_C064",
+      "samples": [
+        {
+          "clip_id": "I007_C064_0325US_001",
+          "run_id": "run_1779810180",
+          "recorded_at": "2026-05-26T15:48:08.404919+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.5176,
+            "cy_norm": 0.535,
+            "radius_ratio": 0.1004
+          },
+          "photometrics": {
+            "ire_spread": 4.257,
+            "chroma_distance": 0.0338,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 20.86
+          }
+        },
+        {
+          "clip_id": "I007_C064_0325US_001",
+          "run_id": "run_1780261904",
+          "recorded_at": "2026-05-31T21:17:32.601286+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.5176,
+            "cy_norm": 0.535,
+            "radius_ratio": 0.1004
+          },
+          "photometrics": {
+            "ire_spread": 4.257,
+            "chroma_distance": 0.0338,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 20.86
+          }
+        },
+        {
+          "clip_id": "I007_C064_0325US_001",
+          "run_id": "run_1780275208",
+          "recorded_at": "2026-06-01T00:59:03.960254+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.5176,
+            "cy_norm": 0.535,
+            "radius_ratio": 0.1004
+          },
+          "photometrics": {
+            "ire_spread": 4.257,
+            "chroma_distance": 0.0338,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 20.86
+          }
+        },
+        {
+          "clip_id": "I007_C064_0325US_001",
+          "run_id": "run_1780281453",
+          "recorded_at": "2026-06-01T02:40:14.634724+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.5176,
+            "cy_norm": 0.535,
+            "radius_ratio": 0.1004
+          },
+          "photometrics": {
+            "ire_spread": 4.257,
+            "chroma_distance": 0.0338,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 20.86
+          }
+        }
+      ]
+    },
+    "I007_D064": {
+      "camera_label": "I007_D064",
+      "samples": [
+        {
+          "clip_id": "I007_D064_03258H_001",
+          "run_id": "run_1779810180",
+          "recorded_at": "2026-05-26T15:48:35.670490+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.5731,
+            "cy_norm": 0.5333,
+            "radius_ratio": 0.0872
+          },
+          "photometrics": {
+            "ire_spread": 4.789,
+            "chroma_distance": 0.0339,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 20.95
+          }
+        },
+        {
+          "clip_id": "I007_D064_03258H_001",
+          "run_id": "run_1780261904",
+          "recorded_at": "2026-05-31T21:18:03.853290+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.5731,
+            "cy_norm": 0.5333,
+            "radius_ratio": 0.0872
+          },
+          "photometrics": {
+            "ire_spread": 4.789,
+            "chroma_distance": 0.0339,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 20.95
+          }
+        },
+        {
+          "clip_id": "I007_D064_03258H_001",
+          "run_id": "run_1780275208",
+          "recorded_at": "2026-06-01T00:59:32.877385+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.5731,
+            "cy_norm": 0.5333,
+            "radius_ratio": 0.0872
+          },
+          "photometrics": {
+            "ire_spread": 4.789,
+            "chroma_distance": 0.0339,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 20.95
+          }
+        },
+        {
+          "clip_id": "I007_D064_03258H_001",
+          "run_id": "run_1780281453",
+          "recorded_at": "2026-06-01T02:40:43.681288+00:00",
+          "trust": "verified_auto",
+          "geometry": {
+            "cx_norm": 0.5731,
+            "cy_norm": 0.5333,
+            "radius_ratio": 0.0872
+          },
+          "photometrics": {
+            "ire_spread": 4.789,
+            "chroma_distance": 0.0339,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 20.95
+          }
+        }
+      ]
+    },
+    "H007_D064": {
+      "camera_label": "H007_D064",
+      "samples": [
+        {
+          "clip_id": "H007_D064_0325BP_001",
+          "run_id": "run_1780281453",
+          "recorded_at": "2026-06-01T02:39:15.779688+00:00",
+          "trust": "verified_manual",
+          "geometry": {
+            "cx_norm": 0.6015,
+            "cy_norm": 0.5114,
+            "radius_ratio": 0.0926
+          },
+          "photometrics": {
+            "ire_spread": -0.898,
+            "chroma_distance": 0.0,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 20.19
+          }
+        }
+      ]
+    },
+    "G007_D064": {
+      "camera_label": "G007_D064",
+      "samples": [
+        {
+          "clip_id": "G007_D064_0325O7_001",
+          "run_id": "run_1780281453",
+          "recorded_at": "2026-06-01T02:38:15.285468+00:00",
+          "trust": "verified_manual",
+          "geometry": {
+            "cx_norm": 0.5657,
+            "cy_norm": 0.4,
+            "radius_ratio": 0.0938
+          },
+          "photometrics": {
+            "ire_spread": -0.504,
+            "chroma_distance": 0.0,
+            "lambertian_score": 0.0,
+            "interior_lum_mean": 0.0,
+            "interior_lum_stddev": 0.0,
+            "hero_ire": 8.26
+          }
+        }
+      ]
+    }
+  }
+}

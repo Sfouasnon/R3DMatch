@@ -740,20 +740,14 @@ class SetupScreen(QWidget):
 
     def _on_wb_changed(self, _index: int = 0):
         descs = {
-            "scene_match": "Per-camera Kelvin trims (small, ~±90K) match warm/cool; "
-                           "per-camera tint matches green/magenta. Array stays "
-                           "anchored at the as-shot scene Kelvin (e.g. 5600K) — "
-                           "cameras matched on both axes, scene-honest. Recommended.",
-            "match": "v3 legacy: one shared Kelvin for all cameras; only green/"
-                     "magenta is corrected (tint). Warm/cool left uncorrected. "
-                     "Kept for regression parity.",
-            "neutral": "Per-camera Kelvin + tint, but targets absolute neutral "
-                       "(WC→0, GM→0). The average Kelvin shifts OFF the scene "
-                       "temperature to cancel the IPP2 display cast. Special-case.",
-            "exposure_only": "Exposure matching only. White balance is left "
-                             "untouched — no Kelvin or tint is solved or pushed, "
-                             "and the report omits all WB metrics and charts. "
-                             "Only exposureAdjust is committed.",
+            "scene_match": "Each camera gets its own Kelvin and its own Tint, but "
+                           "the array stays anchored on the as-shot scene Kelvin.",
+            "match": "All cameras forced to the same Kelvin; only Tint is solved "
+                     "per camera.",
+            "neutral": "Per-camera Kelvin and Tint, but pushes the correction to "
+                       "perfectly neutral.",
+            "exposure_only": "Exposure matching only — white balance is left "
+                             "untouched (no Kelvin or Tint solved or pushed).",
         }
         self._wb_desc.setText(descs.get(self._wb_combo.currentData(), ""))
 

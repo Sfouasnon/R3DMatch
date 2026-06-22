@@ -171,7 +171,14 @@ shopt -s nullglob
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OFFSETS="$HERE/camera_offsets.csv"
 DEFAULT_MEDIA_ROOT="__MEDIA_ROOT__"
-DEFAULT_FLAGS="--colorSciVersion 3 --format 2"
+
+# Output presets. --useMeta loads each clip's as-shot settings (WB/ISO) as the
+# base; the script adds --exposureAdjust on top. Safe in this fallback path
+# because RCP2 was not pushed, so no exposure correction lives in the metadata.
+#   IPP2  = R3DMatch's exact calibration display transform (compare to the report)
+#   EXR   = scene-referred ACES AP0 linear
+PRESET_IPP2='--useMeta --colorSciVersion 3 --colorSpace 13 --gammaCurve 32 --outputToneMap 1 --rollOff 3 --shadow 0.0 --format 1'
+PRESET_EXR='--useMeta --colorSciVersion 3 --format 2 --exrACES 1 --enableGpuDecode --numOclStreams 4 --exrMaxWriters 12 --exrCompression 4'
 
 ask() {  # ask "Prompt" "default" -> echoes answer on stdout
   local prompt="$1" def="${2:-}" ans
@@ -210,21 +217,41 @@ else
   echo "REDLine not found automatically."
   REDLINE_BIN="$(ask 'Full path to REDLine binary')"
 fi
+REDLINE_BIN="${REDLINE_BIN/#\~/$HOME}"          # expand a leading ~ to $HOME
 [[ -x "$REDLINE_BIN" ]] || { echo "Not executable: $REDLINE_BIN" >&2; exit 1; }
 
 # 2) Media root (any folder above the .RDC clips — foldered OR flat layout)
 MEDIA_ROOT="$(ask 'Media root (folder above the day media)' "$DEFAULT_MEDIA_ROOT")"
+MEDIA_ROOT="${MEDIA_ROOT/#\~/$HOME}"          # expand a leading ~ to $HOME
 [[ -d "$MEDIA_ROOT" ]] || { echo "Not a folder: $MEDIA_ROOT" >&2; exit 1; }
 
 # 3) Output directory
 OUTDIR="$(ask 'Output directory for renders')"
+OUTDIR="${OUTDIR/#\~/$HOME}"                   # expand a leading ~ to $HOME
 [[ -n "$OUTDIR" ]] || { echo "Output dir is required" >&2; exit 1; }
 mkdir -p "$OUTDIR" || { echo "Cannot create $OUTDIR" >&2; exit 1; }
 
-# 4) Post's REDLine flags (everything EXCEPT --i / --outDir / --exposureAdjust)
-echo "Enter your REDLine flags. Do NOT include --i, --outDir, or --exposureAdjust"
-echo "(the script manages those). Quotes are respected, e.g. --exportPreset \"My Preset\"."
-FLAGS="$(ask 'REDLine flags' "$DEFAULT_FLAGS")"
+# 4) Output preset (or custom flags). The script always adds --i / --outDir /
+#    --exposureAdjust itself, so presets/flags must NOT include those.
+echo "Output preset:"
+echo "  1) IPP2 Rec.709 / BT.1886 / Medium / Medium — 16-bit TIFF (matches R3DMatch calibration)"
+echo "  2) EXR / ACES AP0 linear (scene-referred)"
+echo "  3) Custom flags"
+case "$(ask 'Choose preset' '1')" in
+  2) FLAGS="$PRESET_EXR" ;;
+  3)
+    echo "Common REDLine values:"
+    echo "  --format       0=DPX  1=TIFF  2=OpenEXR  3=JPEG  201=Apple ProRes"
+    echo "  --gammaCurve  -1=linear  1=Rec.709  2=sRGB  32=BT.1886"
+    echo "  --colorSpace   1/13=Rec.709  15=sRGB  24=Rec.2020  25=REDWideGamutRGB"
+    echo "  --outputToneMap 0=Low  1=Medium  2=High  3=None"
+    echo "  --rollOff       0=None  1=Hard  2=Default  3=Medium  4=Soft"
+    echo "  (IPP2 calibration look = --outputToneMap 1 --rollOff 3)"
+    echo "Enter REDLine flags (no --i / --outDir / --exposureAdjust). Quotes respected."
+    FLAGS="$(ask 'REDLine flags' "$PRESET_IPP2")"
+    ;;
+  *) FLAGS="$PRESET_IPP2" ;;
+esac
 eval "EXTRA=($FLAGS)" 2>/dev/null || EXTRA=($FLAGS)
 
 # 5) Dry run?
