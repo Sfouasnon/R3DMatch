@@ -37,10 +37,12 @@ Flask).
 
 ## Setup
 
-Create a dedicated virtual environment for v4 (one time):
+Clone the repository, then create a dedicated virtual environment (one time):
 
 ```zsh
-bash /Users/sfouasnon/Desktop/R3DMatch_v4/setup_venv.command
+git clone https://github.com/Sfouasnon/R3DMatch.git
+cd R3DMatch
+bash setup_venv.command
 ```
 
 or double-click `setup_venv.command` in Finder. This builds `./.venv`, installs
@@ -49,8 +51,10 @@ interpreter: `PYTHON=/path/to/python3 bash setup_venv.command`.
 
 ## Running
 
+From the repository root:
+
 ```zsh
-source /Users/sfouasnon/Desktop/R3DMatch_v4/.venv/bin/activate
+source .venv/bin/activate
 r3dmatch                 # console entry point
 # or:  python -m r3dmatch3.app
 ```
