@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "r3dmatch3"
+version = "4.0.0"
+description = "Multi-Camera Exposure & Color Alignment System for RED cameras"
+requires-python = ">=3.9"
+dependencies = [
+    "flask>=3.0",
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8",
+    "pillow>=10.0",
+    "PySide6>=6.6",
+    "scikit-image>=0.21",
+    "scipy>=1.11",
+    "tifffile>=2023.7",
+    "websockets>=12.0",
+]
+
+[project.scripts]
+r3dmatch = "r3dmatch3.app:main"
+r3dmatch3-web = "r3dmatch3.web_app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

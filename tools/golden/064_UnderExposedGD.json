@@ -1,0 +1,310 @@
+{
+  "anchor_ire": 22.59945092859378,
+  "anchor_log2": -2.1456403732299805,
+  "assessment_status": "SOLVED",
+  "cameras": [
+    {
+      "camera_label": "G007_A064",
+      "clip_id": "G007_A064_0325RN_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": -0.040556,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 23.243763417521375,
+      "hero_log2": -2.1050844192504883,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.26015397906303406,
+        0.22811827063560486,
+        0.22468367218971252
+      ],
+      "roi": {
+        "cx": 2181.3333333333335,
+        "cy": 1072.0,
+        "r": 184.92229546440973
+      },
+      "status": "SOLVED",
+      "tint": 1.58,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "G007_B064",
+      "clip_id": "G007_B064_032526_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": -0.012528,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 22.796548744792034,
+      "hero_log2": -2.133112668991089,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.25187948346138,
+        0.22454991936683655,
+        0.2157907783985138
+      ],
+      "roi": {
+        "cx": 1893.3333333333333,
+        "cy": 762.6666666666666,
+        "r": 200.615966796875
+      },
+      "status": "SOLVED",
+      "tint": -0.43,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "G007_C064",
+      "clip_id": "G007_C064_03256P_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": 0.037982,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 22.01223650678001,
+      "hero_log2": -2.183622360229492,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.23731587827205658,
+        0.21242843568325043,
+        0.19932864606380463
+      ],
+      "roi": {
+        "cx": 2112.0,
+        "cy": 1008.0,
+        "r": 203.33738878038196
+      },
+      "status": "SOLVED",
+      "tint": -1.75,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "G007_D064",
+      "clip_id": "G007_D064_0325O7_001",
+      "detection_source": "needs_assist",
+      "detection_status": "NEEDS_ASSIST",
+      "exposure_adjust": 1.427746,
+      "exposure_match_pct": 4.152456919352209,
+      "hero_ire": 8.400471094771452,
+      "hero_log2": -3.5733859539031982,
+      "kelvin": 5600,
+      "match_pct": 4.152456919352209,
+      "measured_rgb_mean": [
+        0.09673372656106949,
+        0.08372938632965088,
+        0.07842599600553513
+      ],
+      "roi": {
+        "cx": 2181.3333333333335,
+        "cy": 864.0,
+        "r": 201.4886474609375
+      },
+      "status": "SOLVED",
+      "tint": 0.01,
+      "wb_match_pct": 99.97133452582383
+    },
+    {
+      "camera_label": "H007_A064",
+      "clip_id": "H007_A064_0325ZT_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": -0.111789,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 24.420232706448797,
+      "hero_log2": -2.033851146697998,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.2679125666618347,
+        0.240803062915802,
+        0.2333412915468216
+      ],
+      "roi": {
+        "cx": 2053.3333333333335,
+        "cy": 1109.3333333333333,
+        "r": 183.29378255208334
+      },
+      "status": "SOLVED",
+      "tint": -0.49,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "H007_B064",
+      "clip_id": "H007_B064_032530_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": -0.037135,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 23.188706860683787,
+      "hero_log2": -2.1085057258605957,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.25249725580215454,
+        0.22566761076450348,
+        0.21561329066753387
+      ],
+      "roi": {
+        "cx": 1957.3333333333333,
+        "cy": 986.6666666666666,
+        "r": 192.82081434461804
+      },
+      "status": "SOLVED",
+      "tint": -0.84,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "H007_C064",
+      "clip_id": "H007_C064_0325NN_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": 0.008965,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 22.459451675480338,
+      "hero_log2": -2.1546053886413574,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.24384766817092896,
+        0.21761953830718994,
+        0.20420613884925842
+      ],
+      "roi": {
+        "cx": 2165.3333333333335,
+        "cy": 1296.0,
+        "r": 202.28074815538196
+      },
+      "status": "SOLVED",
+      "tint": -1.59,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "H007_D064",
+      "clip_id": "H007_D064_0325BP_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": 0.144638,
+      "exposure_match_pct": 99.81706407335069,
+      "hero_ire": 20.443608922177532,
+      "hero_log2": -2.290278196334839,
+      "kelvin": 5600,
+      "match_pct": 99.81706407335069,
+      "measured_rgb_mean": [
+        0.22226734459400177,
+        0.19646257162094116,
+        0.1898844838142395
+      ],
+      "roi": {
+        "cx": 2314.6666666666665,
+        "cy": 1098.6666666666667,
+        "r": 202.88693576388889
+      },
+      "status": "SOLVED",
+      "tint": 0.29,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "I007_A064",
+      "clip_id": "I007_A064_0325XY_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": -0.192206,
+      "exposure_match_pct": 95.96761067708334,
+      "hero_ire": 25.820078541511432,
+      "hero_log2": -1.953434705734253,
+      "kelvin": 5600,
+      "match_pct": 95.96761067708334,
+      "measured_rgb_mean": [
+        0.28090041875839233,
+        0.24956467747688293,
+        0.24737276136875153
+      ],
+      "roi": {
+        "cx": 2117.3333333333335,
+        "cy": 1072.0,
+        "r": 189.44019911024304
+      },
+      "status": "SOLVED",
+      "tint": 1.18,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "I007_B064",
+      "clip_id": "I007_B064_032597_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": 0.0,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 22.59945092859378,
+      "hero_log2": -2.1456403732299805,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.2483348250389099,
+        0.2204318344593048,
+        0.21288329362869263
+      ],
+      "roi": {
+        "cx": 1962.6666666666667,
+        "cy": 1237.3333333333333,
+        "r": 185.36093478732639
+      },
+      "status": "SOLVED",
+      "tint": 0.03,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "I007_C064",
+      "clip_id": "I007_C064_0325US_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": 0.107564,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 20.975766208219625,
+      "hero_log2": -2.253204584121704,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.23723410069942474,
+        0.2095433473587036,
+        0.2043793946504593
+      ],
+      "roi": {
+        "cx": 1989.3333333333333,
+        "cy": 1162.6666666666667,
+        "r": 217.28049045138889
+      },
+      "status": "SOLVED",
+      "tint": 0.75,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "I007_D064",
+      "clip_id": "I007_D064_03258H_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": 0.109513,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 20.9474506760699,
+      "hero_log2": -2.2551534175872803,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.23031669855117798,
+        0.20400848984718323,
+        0.19638876616954803
+      ],
+      "roi": {
+        "cx": 2202.6666666666665,
+        "cy": 1146.6666666666667,
+        "r": 188.00679524739584
+      },
+      "status": "SOLVED",
+      "tint": -0.01,
+      "wb_match_pct": 100.0
+    }
+  ],
+  "input_path": "/Users/sfouasnon/Desktop/Test_Footage/064_UnderExposedGD",
+  "priors_disabled": true,
+  "shared_kelvin": 5600
+}

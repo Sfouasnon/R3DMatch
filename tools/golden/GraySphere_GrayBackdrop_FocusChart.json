@@ -1,0 +1,310 @@
+{
+  "anchor_ire": 35.42452106591061,
+  "anchor_log2": -1.4971797466278076,
+  "assessment_status": "SOLVED",
+  "cameras": [
+    {
+      "camera_label": "G007_A106",
+      "clip_id": "G007_A106_0511R9_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": -0.129791,
+      "exposure_match_pct": 98.4149244096544,
+      "hero_ire": 38.75921227604875,
+      "hero_log2": -1.3673888444900513,
+      "kelvin": 5600,
+      "match_pct": 98.4149244096544,
+      "measured_rgb_mean": [
+        0.4229752719402313,
+        0.3732476532459259,
+        0.3707313537597656
+      ],
+      "roi": {
+        "cx": 4056.0,
+        "cy": 1272.0,
+        "r": 197.5159912109375
+      },
+      "status": "SOLVED",
+      "tint": 1.37,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "G007_B106",
+      "clip_id": "G007_B106_0511C3_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": -0.097136,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 37.891765701599574,
+      "hero_log2": -1.4000437259674072,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.4191969037055969,
+        0.37684717774391174,
+        0.37407559156417847
+      ],
+      "roi": {
+        "cx": 4416.0,
+        "cy": 1312.0,
+        "r": 197.69989013671875
+      },
+      "status": "SOLVED",
+      "tint": 0.36,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "G007_C106",
+      "clip_id": "G007_C106_0511BO_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": -0.013696,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 35.76243028996654,
+      "hero_log2": -1.4834833145141602,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.3814000189304352,
+        0.34205949306488037,
+        0.3320373594760895
+      ],
+      "roi": {
+        "cx": 4288.0,
+        "cy": 1192.0,
+        "r": 203.77705891927084
+      },
+      "status": "SOLVED",
+      "tint": -0.56,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "G007_D106",
+      "clip_id": "G007_D106_0511BI_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": 0.0475,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 34.2771778814753,
+      "hero_log2": -1.5446797609329224,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.3883897662162781,
+        0.3470650613307953,
+        0.3415635824203491
+      ],
+      "roi": {
+        "cx": 4344.0,
+        "cy": 1304.0,
+        "r": 186.66109212239584
+      },
+      "status": "SOLVED",
+      "tint": 0.27,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "H007_A106",
+      "clip_id": "H007_A106_05114E_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": -0.102543,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 38.034040905865815,
+      "hero_log2": -1.394636869430542,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.4039095938205719,
+        0.36688321828842163,
+        0.3562392294406891
+      ],
+      "roi": {
+        "cx": 3888.0,
+        "cy": 1416.0,
+        "r": 198.9749552408854
+      },
+      "status": "SOLVED",
+      "tint": -1.22,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "H007_B106",
+      "clip_id": "H007_B106_0511YM_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": -0.100316,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 37.97537045010769,
+      "hero_log2": -1.3968640565872192,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.4035348892211914,
+        0.36390140652656555,
+        0.35485002398490906
+      ],
+      "roi": {
+        "cx": 4200.0,
+        "cy": 1264.0,
+        "r": 193.8807169596354
+      },
+      "status": "SOLVED",
+      "tint": -0.64,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "H007_C106",
+      "clip_id": "H007_C106_0511QP_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": 0.013696,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 35.089804651816884,
+      "hero_log2": -1.510876178741455,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.3720390498638153,
+        0.33558204770088196,
+        0.32154738903045654
+      ],
+      "roi": {
+        "cx": 4216.0,
+        "cy": 1416.0,
+        "r": 202.24853515625
+      },
+      "status": "SOLVED",
+      "tint": -1.47,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "H007_D106",
+      "clip_id": "H007_D106_0511OB_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": 0.111339,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 32.79349108601813,
+      "hero_log2": -1.6085186004638672,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.3477924168109894,
+        0.3132608234882355,
+        0.308359295129776
+      ],
+      "roi": {
+        "cx": 4432.0,
+        "cy": 1288.0,
+        "r": 184.6204833984375
+      },
+      "status": "SOLVED",
+      "tint": -0.14,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "I007_A106",
+      "clip_id": "I007_A106_0511AJ_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": 0.042741,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 34.39043033633684,
+      "hero_log2": -1.5399209260940552,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.3805430829524994,
+        0.33668744564056396,
+        0.34229353070259094
+      ],
+      "roi": {
+        "cx": 4544.0,
+        "cy": 1336.0,
+        "r": 218.6607666015625
+      },
+      "status": "SOLVED",
+      "tint": 2.31,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "I007_B106",
+      "clip_id": "I007_B106_0511P6_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": -0.061498,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 36.96721589463017,
+      "hero_log2": -1.435681700706482,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.3944222927093506,
+        0.3537234663963318,
+        0.3462833762168884
+      ],
+      "roi": {
+        "cx": 4152.0,
+        "cy": 1288.0,
+        "r": 197.4491984049479
+      },
+      "status": "SOLVED",
+      "tint": -0.16,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "I007_C106",
+      "clip_id": "I007_C106_0511SW_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": 0.220022,
+      "exposure_match_pct": 91.82402822706435,
+      "hero_ire": 30.41380637614318,
+      "hero_log2": -1.7172017097473145,
+      "kelvin": 5600,
+      "match_pct": 91.82402822706435,
+      "measured_rgb_mean": [
+        0.3468387722969055,
+        0.31054869294166565,
+        0.3119968771934509
+      ],
+      "roi": {
+        "cx": 4256.0,
+        "cy": 1416.0,
+        "r": 222.6790568033854
+      },
+      "status": "SOLVED",
+      "tint": 1.13,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "I007_D106",
+      "clip_id": "I007_D106_0511RC_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": 0.176157,
+      "exposure_match_pct": 96.88578711615673,
+      "hero_ire": 31.352741292477802,
+      "hero_log2": -1.6733365058898926,
+      "kelvin": 5600,
+      "match_pct": 96.88578711615673,
+      "measured_rgb_mean": [
+        0.3353056311607361,
+        0.2997545897960663,
+        0.29428574442863464
+      ],
+      "roi": {
+        "cx": 4320.0,
+        "cy": 1376.0,
+        "r": 176.68023681640625
+      },
+      "status": "SOLVED",
+      "tint": 0.14,
+      "wb_match_pct": 100.0
+    }
+  ],
+  "input_path": "/Users/sfouasnon/Desktop/Test_Footage/GraySphere_GrayBackdrop_FocusChart",
+  "priors_disabled": true,
+  "shared_kelvin": 5600
+}

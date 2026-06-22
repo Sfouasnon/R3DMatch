@@ -1,0 +1,16 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+dist/
+build/
+*.egg-info/
+*.log
+.DS_Store
+.codex_runs/
+tools/*_out/
+*.tif
+*.tiff
+*.R3D
+*.exr
+*.mov

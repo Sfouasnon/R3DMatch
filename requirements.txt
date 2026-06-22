@@ -1,0 +1,9 @@
+flask>=3.0
+numpy>=1.24
+opencv-python-headless>=4.8
+pillow>=10.0
+PySide6>=6.6
+scikit-image>=0.21
+scipy>=1.11
+tifffile>=2023.7        # full-bit-depth render reads (exposure measurement + tools/)
+websockets>=12.0

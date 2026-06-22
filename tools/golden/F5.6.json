@@ -1,0 +1,294 @@
+{
+  "anchor_ire": 45.63936126022825,
+  "anchor_log2": -1.1316494941711426,
+  "assessment_status": "PARTIAL",
+  "cameras": [
+    {
+      "camera_label": "G007_A067",
+      "clip_id": "G007_A067_04036V_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": -0.073687,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 48.030982488819575,
+      "hero_log2": -1.0579627752304077,
+      "kelvin": 5600,
+      "match_pct": 96.7071308664487,
+      "measured_rgb_mean": [
+        0.5147014856338501,
+        0.46544837951660156,
+        0.4651370942592621
+      ],
+      "roi": {
+        "cx": 3530.6666666666665,
+        "cy": 661.3333333333334,
+        "r": 204.06070963541666
+      },
+      "status": "SOLVED",
+      "tint": 0.85,
+      "wb_match_pct": 96.7071308664487
+    },
+    {
+      "camera_label": "G007_B067",
+      "clip_id": "G007_B067_0403P3_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": 0.099566,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 42.59584227998667,
+      "hero_log2": -1.231215476989746,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.46688172221183777,
+        0.4218093156814575,
+        0.41805577278137207
+      ],
+      "roi": {
+        "cx": 3322.6666666666665,
+        "cy": 874.6666666666666,
+        "r": 198.09229871961804
+      },
+      "status": "SOLVED",
+      "tint": 0.51,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "G007_C067",
+      "clip_id": "G007_C067_040399_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": -0.096278,
+      "exposure_match_pct": 98.68001937866211,
+      "hero_ire": 48.78902162428292,
+      "hero_log2": -1.0353715419769287,
+      "kelvin": 5600,
+      "match_pct": 98.68001937866211,
+      "measured_rgb_mean": [
+        0.5112813115119934,
+        0.46927452087402344,
+        0.45961856842041016
+      ],
+      "roi": {
+        "cx": 3456.0,
+        "cy": 917.3333333333334,
+        "r": 201.88199869791666
+      },
+      "status": "SOLVED",
+      "tint": -0.88,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "G007_D067",
+      "clip_id": "G007_D067_0403UE_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": 0.232581,
+      "exposure_match_pct": 87.10914187961154,
+      "hero_ire": 38.844156430511056,
+      "hero_log2": -1.3642305135726929,
+      "kelvin": 5600,
+      "match_pct": 87.10914187961154,
+      "measured_rgb_mean": [
+        0.4377811849117279,
+        0.39349550008773804,
+        0.39831677079200745
+      ],
+      "roi": {
+        "cx": 3344.0,
+        "cy": 1002.6666666666666,
+        "r": 182.35546875
+      },
+      "status": "SOLVED",
+      "tint": 1.78,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "H007_A067",
+      "clip_id": "H007_A067_0403ZT_001",
+      "detection_source": "auto_hough",
+      "detection_status": "FAILED",
+      "exposure_adjust": null,
+      "exposure_match_pct": null,
+      "hero_ire": null,
+      "hero_log2": null,
+      "kelvin": null,
+      "match_pct": null,
+      "measured_rgb_mean": null,
+      "roi": null,
+      "status": "NEEDS_ASSIST",
+      "tint": null,
+      "wb_match_pct": null
+    },
+    {
+      "camera_label": "H007_B067",
+      "clip_id": "H007_B067_0403QK_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": -0.031891,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 46.65945544170971,
+      "hero_log2": -1.0997586250305176,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.49066200852394104,
+        0.44976717233657837,
+        0.4397074282169342
+      ],
+      "roi": {
+        "cx": 3269.3333333333335,
+        "cy": 789.3333333333334,
+        "r": 191.250244140625
+      },
+      "status": "SOLVED",
+      "tint": -0.9,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "H007_C067",
+      "clip_id": "H007_C067_0403RE_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": -0.05254,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 47.33207949131368,
+      "hero_log2": -1.079109787940979,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.49497178196907043,
+        0.45557209849357605,
+        0.4426818788051605
+      ],
+      "roi": {
+        "cx": 3514.6666666666665,
+        "cy": 880.0,
+        "r": 199.29299587673611
+      },
+      "status": "SOLVED",
+      "tint": -1.4,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "H007_D067",
+      "clip_id": "H007_D067_0403YU_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": 0.121485,
+      "exposure_match_pct": 97.93477588229709,
+      "hero_ire": 41.95357073128088,
+      "hero_log2": -1.2531344890594482,
+      "kelvin": 5600,
+      "match_pct": 97.93477588229709,
+      "measured_rgb_mean": [
+        0.4412075877189636,
+        0.402086079120636,
+        0.39713722467422485
+      ],
+      "roi": {
+        "cx": 3450.6666666666665,
+        "cy": 901.3333333333334,
+        "r": 180.30609809027777
+      },
+      "status": "SOLVED",
+      "tint": -0.11,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "I007_A067",
+      "clip_id": "I007_A067_0403YR_001",
+      "detection_source": "auto_hough",
+      "detection_status": "FAILED",
+      "exposure_adjust": null,
+      "exposure_match_pct": null,
+      "hero_ire": null,
+      "hero_log2": null,
+      "kelvin": null,
+      "match_pct": null,
+      "measured_rgb_mean": null,
+      "roi": null,
+      "status": "NEEDS_ASSIST",
+      "tint": null,
+      "wb_match_pct": null
+    },
+    {
+      "camera_label": "I007_B067",
+      "clip_id": "I007_B067_0403F7_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": -0.137902,
+      "exposure_match_pct": 93.2352277967665,
+      "hero_ire": 50.21717463114531,
+      "hero_log2": -0.9937472343444824,
+      "kelvin": 5600,
+      "match_pct": 93.2352277967665,
+      "measured_rgb_mean": [
+        0.5261424779891968,
+        0.4845516085624695,
+        0.4790586233139038
+      ],
+      "roi": {
+        "cx": 3200.0,
+        "cy": 826.6666666666666,
+        "r": 191.30349392361111
+      },
+      "status": "SOLVED",
+      "tint": -0.61,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "I007_C067",
+      "clip_id": "I007_C067_0403TP_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": 0.031891,
+      "exposure_match_pct": 100.0,
+      "hero_ire": 44.64156892794844,
+      "hero_log2": -1.1635403633117676,
+      "kelvin": 5600,
+      "match_pct": 100.0,
+      "measured_rgb_mean": [
+        0.49226149916648865,
+        0.4511139392852783,
+        0.4503220021724701
+      ],
+      "roi": {
+        "cx": 3461.3333333333335,
+        "cy": 960.0,
+        "r": 219.47535536024304
+      },
+      "status": "SOLVED",
+      "tint": 0.11,
+      "wb_match_pct": 100.0
+    },
+    {
+      "camera_label": "I007_D067",
+      "clip_id": "I007_D067_0403PU_001",
+      "detection_source": "auto_hough",
+      "detection_status": "SUCCESS",
+      "exposure_adjust": 0.186515,
+      "exposure_match_pct": 91.51254759894478,
+      "hero_ire": 40.104472874291716,
+      "hero_log2": -1.3181649446487427,
+      "kelvin": 5600,
+      "match_pct": 91.51254759894478,
+      "measured_rgb_mean": [
+        0.42764124274253845,
+        0.3864729106426239,
+        0.38249802589416504
+      ],
+      "roi": {
+        "cx": 3280.0,
+        "cy": 810.6666666666666,
+        "r": 176.02125379774304
+      },
+      "status": "SOLVED",
+      "tint": 0.43,
+      "wb_match_pct": 100.0
+    }
+  ],
+  "input_path": "/Users/sfouasnon/Desktop/Test_Footage/F5.6",
+  "priors_disabled": true,
+  "shared_kelvin": 5600
+}
