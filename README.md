@@ -2,8 +2,6 @@
 
 Multi-camera exposure & color alignment for RED KOMODO-X arrays.
 
-**Related:** [MediaRunner](https://github.com/Sfouasnon/MediaRunner) — R3D-centric transfer & checksum-verification tool (xxHash128, ASC MHL, R3D metadata scraping).
-
 R3DMatch measures an 18% gray sphere seen by every camera in a volumetric array,
 solves a per-camera correction, and pushes the corrections back to the cameras over RCP2 so
 the array matches. Corrections travel with each clip in its R3D
