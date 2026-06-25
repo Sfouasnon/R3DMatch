@@ -4,21 +4,18 @@ Multi-camera exposure & color alignment for RED KOMODO-X arrays.
 
 **Related:** [MediaRunner](https://github.com/Sfouasnon/MediaRunner) — R3D-centric transfer & checksum-verification tool (xxHash128, ASC MHL, R3D metadata scraping).
 
-R3DMatch measures a single 18% gray sphere shot by every camera in an array,
-solves a per-camera correction, and pushes it back to the cameras over RCP2 so
-the array intercuts cleanly. Corrections travel with each clip in its R3D
-metadata; post-production reproduces them with REDLine's `--useMeta` flag.
+R3DMatch measures an 18% gray sphere seen by every camera in a volumetric array,
+solves a per-camera correction, and pushes the corrections back to the cameras over RCP2 so
+the array matches. Corrections travel with each clip in its R3D
+metadata; post-production reproduces them with REDLine's `--useMeta` flag, or with a specialty batching script output during calibration.
 
-- **Exposure** is solved in **scene-linear** (the only correct space for a
-  stop-based correction) and verified at the sensor via a closed-loop re-render.
+- **Exposure** is solved in **scene-linear** and verified prior to output via a closed-loop re-render / verification.
 - **White balance** is matched per camera (green/magenta via tint, warm/cool via
   per-camera Kelvin trims toward the working temperature).
-- An **Exposure-only** mode matches exposure alone and omits all WB from the
-  report — for when only luminance alignment is required.
 
 **Accuracy:** exposure matched to within **±0.5 IRE** across the array (the
 repeatable benchmark), approaching **±0.1 IRE** per camera under ideal lighting —
-the floor set by the camera's own exposureAdjust resolution. Every figure in the
+the floor set by the RED's --exposureAdjust granularity. Every figure in the
 report is *measured* from a corrected re-render, not estimated.
 
 ---
@@ -65,7 +62,7 @@ r3dmatch                 # console entry point
 
 ## Workflow
 
-1. **Ingest** — point at the card folder (one R3D frame per camera). Choose the
+1. **Ingest** — point at the card folder (single frame R3D per camera). Choose the
    matching strategy (Median is the robust default), the delivery look the
    match is scored through, and the white-balance mode (scene-temp per-camera
    Kelvin is recommended; **Exposure only** skips WB entirely).
@@ -82,7 +79,8 @@ r3dmatch                 # console entry point
 
 The HTML report (written to the output folder) is the chain-of-custody document:
 an overview, the IRE-convergence chart, a before/after **Array Coherence**
-contact sheet, and a per-camera page with the measured closed-loop result.
+contact sheet, and a per-camera page with the measured closed-loop result. 
+Post renders with --useMeta to inherit the changes.
 
 ---
 
