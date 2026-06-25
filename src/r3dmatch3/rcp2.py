@@ -43,10 +43,13 @@ GET_TIMEOUT = 5.0           # seconds to wait for rcp_cur_int response
 SET_VERIFY_TIMEOUT = 6.0    # seconds to wait for verified readback after rcp_set
 MAX_RETRIES = 2             # per-camera retry attempts on connect/timeout failure
 
-# Verification tolerances (matching v1 rcp2_layer_summary.md)
+# Verification tolerances — match v1's validated values exactly (rcp2_apply.py:
+# KELVIN_VERIFY_TOLERANCE=50, TINT_VERIFY_TOLERANCE=0.5, EXPOSURE_VERIFY_TOLERANCE
+# =0.001). v1 was validated on a live KOMODO-X; the previous v4 values (0.02 tint,
+# 0.02 exposure) did NOT match and made exposure verification 20x too loose.
 TOL_KELVIN = 50             # ±50 K is WITHIN_TOLERANCE
-TOL_TINT = 0.02             # ±0.02 tint units
-TOL_EXPOSURE = 0.02         # ±0.02 stops
+TOL_TINT = 0.5              # ±0.5 tint units
+TOL_EXPOSURE = 0.001        # ±0.001 stops
 
 # Write order: camera-stable WB first, then exposure
 _WRITE_ORDER = ["kelvin", "tint", "exposureAdjust"]
@@ -62,9 +65,12 @@ _PARAM_ID = {
 # The camera reports authoritative dividers via rcp_cur_int_edit_info — we
 # read those live and fall back to these only if the get times out.
 _FALLBACK_DIVIDER = {
-    "kelvin":         1,     # COLOR_TEMPERATURE: raw Kelvin integer, divider=1
-    "tint":           100,   # TINT: e.g. raw 150 → 1.5 tint
-    "exposureAdjust": 100,   # EXPOSURE_ADJUST: e.g. raw -41 → -0.41 stops
+    "kelvin":         1,      # COLOR_TEMPERATURE: raw Kelvin integer, divider=1
+    "tint":           1000,   # TINT: confirmed live on KOMODO-X — divider=1000,
+                              # e.g. raw 1500 → 1.5 tint
+    "exposureAdjust": 1000,   # EXPOSURE_ADJUST: confirmed live on KOMODO-X
+                              # (FW 2.2.4): divider=1000,
+                              # e.g. raw -410 → -0.41 stops
 }
 
 # ── Data classes ───────────────────────────────────────────────────────────────
@@ -74,6 +80,7 @@ class VerifyStatus(str, Enum):
     WITHIN_TOLERANCE = "WITHIN_TOLERANCE"
     MISMATCH         = "MISMATCH"
     TIMEOUT          = "TIMEOUT"
+    OUT_OF_RANGE     = "OUT_OF_RANGE"   # target outside camera-reported min/max
     NOT_AVAILABLE    = "NOT_AVAILABLE"
 
 
@@ -279,12 +286,14 @@ class RCP2Session:
 
     # ── Parameter read ────────────────────────────────────────────────────────
 
-    async def get_param(self, field: str) -> Tuple[float, int]:
+    async def _get_param_raw(
+        self, field: str
+    ) -> Tuple[int, int, Optional[int], Optional[int]]:
         """
-        Read current value of a parameter.
+        Read a parameter and its edit_info.
 
-        Returns (operator_value, divider) tuple.
-        operator_value = raw_int / divider
+        Returns (raw_value, divider, min_raw, max_raw). min/max are the camera's
+        authoritative limits when reported, else None.
         """
         param_id = _PARAM_ID[field]
         await self._send({"type": "rcp_get", "id": param_id})
@@ -298,15 +307,25 @@ class RCP2Session:
         raw_val = msg.get("cur", {}).get("val", 0)
         edit_info = msg.get("edit_info", {})
         divider = edit_info.get("divider", _FALLBACK_DIVIDER[field])
-        if divider == 0:
+        if not divider:
             divider = _FALLBACK_DIVIDER[field]
-
-        operator_val = raw_val / divider
+        min_raw = edit_info.get("min")
+        max_raw = edit_info.get("max")
         logger.debug(
-            "[%s] GET %s: raw=%d divider=%d → %.4f",
-            self.label, param_id, raw_val, divider, operator_val
+            "[%s] GET %s: raw=%d divider=%d min=%s max=%s",
+            self.label, param_id, raw_val, divider, min_raw, max_raw
         )
-        return operator_val, divider
+        return raw_val, divider, min_raw, max_raw
+
+    async def get_param(self, field: str) -> Tuple[float, int]:
+        """
+        Read current value of a parameter.
+
+        Returns (operator_value, divider) tuple.
+        operator_value = raw_int / divider
+        """
+        raw_val, divider, _min, _max = await self._get_param_raw(field)
+        return raw_val / divider, divider
 
     async def read_state(self, dividers: Optional[Dict[str, int]] = None) -> CameraStateSnapshot:
         """
@@ -336,20 +355,25 @@ class RCP2Session:
         field: str,
         requested_value: float,
         divider: int,
+        *,
+        min_raw: Optional[int] = None,
+        max_raw: Optional[int] = None,
     ) -> FieldResult:
         """
-        Write one parameter and verify readback.
+        Write one parameter and verify with an INDEPENDENT readback.
 
         Steps:
-        1. Clamp requested_value to sane bounds
-        2. Convert to raw integer: round(requested_value * divider)
-        3. Send rcp_set
-        4. Wait for rcp_cur_int (camera confirms applied value)
-        5. Classify: EXACT_MATCH / WITHIN_TOLERANCE / MISMATCH / TIMEOUT
+        1. Convert to raw integer: round(requested_value * divider)
+        2. Enforce the camera-reported min/max (reject out-of-range — do NOT
+           silently clamp). Fall back to static safe bounds only when the camera
+           did not report limits.
+        3. Send rcp_set.
+        4. Consume the set echo, then issue a fresh rcp_get and use THAT as the
+           authoritative readback (matches v1 — never trust only the set echo).
+        5. Classify: EXACT_MATCH / WITHIN_TOLERANCE / MISMATCH / TIMEOUT.
         """
         param_id = _PARAM_ID[field]
         raw_to_send = int(round(requested_value * divider))
-        raw_to_send = _clamp_raw(field, raw_to_send)
 
         result = FieldResult(
             field=field,
@@ -358,6 +382,21 @@ class RCP2Session:
             raw_sent=raw_to_send,
             divider=divider,
         )
+
+        # ── Enforce limits (reject, don't clamp) ────────────────────────────────
+        lo_static, hi_static = _STATIC_RAW_BOUNDS.get(field, (None, None))
+        lo = min_raw if min_raw is not None else lo_static
+        hi = max_raw if max_raw is not None else hi_static
+        if (lo is not None and raw_to_send < lo) or (hi is not None and raw_to_send > hi):
+            src = "camera" if (min_raw is not None or max_raw is not None) else "safe"
+            result.verify_status = VerifyStatus.OUT_OF_RANGE
+            result.error = (
+                f"target raw {raw_to_send} ({requested_value:.4f}) outside "
+                f"{src} range [{lo}, {hi}]")
+            logger.error(
+                "[%s] %s target %d outside %s range [%s, %s] — REJECTED",
+                self.label, param_id, raw_to_send, src, lo, hi)
+            return result
 
         if self.dry_run:
             # Simulate success without touching hardware
@@ -376,39 +415,45 @@ class RCP2Session:
             self.label, param_id, requested_value, raw_to_send, divider
         )
 
-        # Clear any stale messages for this param_id
+        # Clear any stale messages for this param_id, then write.
         self._drain_param(param_id)
-
         await self._send({
             "type": "rcp_set",
             "id": param_id,
             "value": raw_to_send,
         })
 
-        # Wait for the camera's CURRENT message confirming the applied value
+        # Consume the camera's set-echo (best effort) — but do NOT trust it as the
+        # verification. We re-read with an independent rcp_get below.
         try:
-            readback_msg = await self._wait_for_type(
-                "rcp_cur_int",
-                timeout=SET_VERIFY_TIMEOUT,
-                filter_id=param_id,
-            )
-            rb_raw = readback_msg.get("cur", {}).get("val", raw_to_send)
-            result.readback_raw = rb_raw
-            result.readback_value = rb_raw / divider
-            result.delta = abs(result.readback_value - requested_value)
-            result.verify_status = _classify(field, result.delta)
+            await self._wait_for_type(
+                "rcp_cur_int", timeout=SET_VERIFY_TIMEOUT, filter_id=param_id)
+        except asyncio.TimeoutError:
+            pass
 
+        # ── Independent confirmation read ───────────────────────────────────────
+        self._drain_param(param_id)
+        try:
+            rb_raw, rb_div, _, _ = await self._get_param_raw(field)
+            result.readback_raw = rb_raw
+            result.readback_value = rb_raw / rb_div
+            intended = raw_to_send / divider          # quantized target we sent
+            result.delta = abs(result.readback_value - intended)
+            if rb_raw == raw_to_send:
+                result.verify_status = VerifyStatus.EXACT_MATCH
+            else:
+                result.verify_status = _classify(field, result.delta)
         except asyncio.TimeoutError:
             result.verify_status = VerifyStatus.TIMEOUT
-            result.error = f"No readback within {SET_VERIFY_TIMEOUT}s"
+            result.error = f"No independent readback within {GET_TIMEOUT}s"
             logger.warning("[%s] TIMEOUT verifying %s", self.label, param_id)
 
         logger.info(
             "[%s] VERIFY %s: sent=%.4f readback=%.4f Δ=%.4f → %s",
             self.label, param_id,
             requested_value,
-            result.readback_value or float("nan"),
-            result.delta or float("nan"),
+            result.readback_value if result.readback_value is not None else float("nan"),
+            result.delta if result.delta is not None else float("nan"),
             result.verify_status.value,
         )
         return result
@@ -586,14 +631,17 @@ async def push_camera(
                            if getattr(commit, "exposure_only", False)
                            else _WRITE_ORDER)
 
-            # ── Re-read dividers from live camera (most accurate) ─────────────
-            # We already did get_param in read_state but those dividers weren't
-            # captured. Do a lightweight re-read for dividers only.
+            # ── Re-read dividers + limits from live camera (most accurate) ────
+            # We already did get_param in read_state but its edit_info wasn't
+            # captured. Re-read divider AND min/max so we can enforce the camera's
+            # own limits before writing.
             dividers: Dict[str, int] = {}
+            bounds: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
             for field_name in write_order:
                 try:
-                    _, div = await session.get_param(field_name)
+                    _, div, min_raw, max_raw = await session._get_param_raw(field_name)
                     dividers[field_name] = div
+                    bounds[field_name] = (min_raw, max_raw)
                 except asyncio.TimeoutError:
                     # Fail-closed: a wrong divider produces a silent wrong commit
                     # because the camera applies an incorrect raw value and
@@ -608,10 +656,13 @@ async def push_camera(
             all_ok = True
             for field_name in write_order:
                 await _cb("write", field_name)
+                min_raw, max_raw = bounds[field_name]
                 fr = await session.set_and_verify(
                     field_name,
                     values[field_name],
                     dividers[field_name],
+                    min_raw=min_raw,
+                    max_raw=max_raw,
                 )
                 result.field_results.append(fr)
 
@@ -894,20 +945,26 @@ def _classify(field: str, delta: float) -> VerifyStatus:
     return VerifyStatus.MISMATCH
 
 
+# Static safe raw bounds — used ONLY as a fallback when the camera does not
+# report min/max in edit_info. Ranges from the RED KOMODO-X RCP2 parameter list.
+# When the camera reports its own limits, those take precedence (see
+# set_and_verify). Targets outside the active range are rejected, not clamped.
+_STATIC_RAW_BOUNDS = {
+    # COLOR_TEMPERATURE: 1700–10000 K (divider=1)
+    "kelvin":         (1700,  10000),
+    # TINT: ±100000 raw (±100.0 tint units with divider=1000) — confirmed live
+    # on KOMODO-X (FW 2.2.4).
+    "tint":           (-100000, 100000),
+    # EXPOSURE_ADJUST: ±8000 raw (±8.0 stops with divider=1000) — confirmed live
+    # on KOMODO-X (FW 2.2.4).
+    "exposureAdjust": (-8000, 8000),
+}
+
+
 def _clamp_raw(field: str, raw: int) -> int:
-    """
-    Clamp raw integer to camera-safe range before sending.
-    Ranges from RED KOMODO-X RCP2 parameter list observed ranges.
-    """
-    clamp_ranges = {
-        # COLOR_TEMPERATURE: 1700–10000 K
-        "kelvin":         (1700,  10000),
-        # TINT: ±450 raw (±4.5 tint units with divider=100)
-        "tint":           (-450,  450),
-        # EXPOSURE_ADJUST: ±300 raw (±3.0 stops with divider=100)
-        "exposureAdjust": (-300,  300),
-    }
-    lo, hi = clamp_ranges.get(field, (-999999, 999999))
+    """Deprecated: retained for compatibility. Prefer the reject-on-violation
+    enforcement in set_and_verify, which uses camera-reported limits."""
+    lo, hi = _STATIC_RAW_BOUNDS.get(field, (-999999, 999999))
     return max(lo, min(hi, raw))
 
 

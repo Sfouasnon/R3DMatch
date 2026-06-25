@@ -25,6 +25,7 @@ APP = ["R3DMatch_launch.py"]
 
 OPTIONS = {
     "argv_emulation": False,
+    "iconfile": "assets/R3DMatch.icns",   # app icon — R3D Match brand mark
     "packages": [
         "r3dmatch3",
         "numpy",
@@ -55,6 +56,7 @@ OPTIONS = {
         "CFBundleIdentifier": "com.ilm.r3dmatch",
         "CFBundleVersion": "4.0.0",
         "CFBundleShortVersionString": "4.0.0",
+        "CFBundleIconFile": "R3DMatch.icns",
         "NSHighResolutionCapable": True,
         "LSMinimumSystemVersion": "11.0",
         "NSHumanReadableCopyright": "ILM — R3DMatch v4",

@@ -23,7 +23,11 @@ Sphere QC re-measure:
 from __future__ import annotations
 
 import inspect
+import ipaddress
 import json
+import re
+import socket
+import subprocess
 import traceback
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -477,6 +481,229 @@ def _table_style() -> str:
             f"border:none;border-bottom:1px solid {BORDER_COLOR};"
             f"padding:6px 8px;font-size:10px;font-weight:700;"
             f"text-transform:uppercase;letter-spacing:0.05em;}}")
+
+
+# ── Camera-network discovery helpers ────────────────────────────────────────────
+#
+# Reliable detection model ported from R3DMatch v1 (camera_network.py), which was
+# validated against a live KOMODO-X. We enumerate real interfaces via `ifconfig`
+# instead of socket.gethostbyname(socket.gethostname()) — the latter returns
+# 127.0.0.1 (or raises) on macOS and can never surface a direct-attached camera on
+# a 169.254.x.x link-local interface.
+
+DEFAULT_CAMERA_CIDR = "172.20.114.0/24"   # current stage network (255.255.255.0)
+RCP2_SCAN_PORT = 9998
+MAX_SCAN_HOSTS = 1024
+
+_IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+
+def _normalize_mask(token: str) -> str:
+    """Convert a netmask token (dotted or 0x-hex, as ifconfig prints) to dotted."""
+    token = str(token or "").strip()
+    if not token:
+        return ""
+    if token.startswith("0x"):
+        try:
+            return socket.inet_ntoa(int(token, 16).to_bytes(4, "big"))
+        except Exception:
+            return ""
+    return token
+
+
+def _list_ipv4_interfaces() -> List[Dict[str, str]]:
+    """Enumerate non-loopback IPv4 interfaces via `ifconfig` (macOS/BSD)."""
+    try:
+        out = subprocess.run(
+            ["/sbin/ifconfig"], check=True, capture_output=True, text=True
+        ).stdout
+    except Exception:
+        return []
+    interfaces: List[Dict[str, str]] = []
+    name = ""
+    for raw in out.splitlines():
+        if raw and not raw[0].isspace():
+            name = raw.split(":", 1)[0].strip()
+            continue
+        line = raw.strip()
+        if not line.startswith("inet "):
+            continue
+        parts = line.split()
+        addr = parts[1].strip()
+        if addr.startswith("127."):
+            continue
+        mask = ""
+        if "netmask" in parts:
+            try:
+                mask = _normalize_mask(parts[parts.index("netmask") + 1])
+            except Exception:
+                mask = ""
+        try:
+            net = ipaddress.IPv4Network(f"{addr}/{mask}", strict=False) if mask \
+                else ipaddress.IPv4Network(f"{addr}/24", strict=False)
+        except Exception:
+            continue
+        interfaces.append({
+            "name": name,
+            "ipv4": addr,
+            "mask": mask,
+            "cidr": str(net),
+            "link_local": addr.startswith("169.254."),
+        })
+    return interfaces
+
+
+def _interface_scan_cidr(itf: Dict[str, str]) -> str:
+    """Scan target for one interface, capped to a /24-sized sweep.
+
+    Camera networks are frequently link-local /16 (255.255.0.0) — scanning the
+    whole /16 is 65,534 hosts. We scan the /24 block that contains the host's own
+    address instead (e.g. NIC 169.245.5.x → 169.245.5.0/24), which keeps the
+    sweep <=254 hosts and covers a directly-attached camera on the same block.
+    A wider/narrower range can still be typed manually in the dialog.
+    """
+    try:
+        prefix = ipaddress.IPv4Network(itf["cidr"]).prefixlen
+    except Exception:
+        prefix = 24
+    if prefix < 24:
+        return str(ipaddress.ip_network(f"{itf['ipv4']}/24", strict=False))
+    return itf["cidr"]
+
+
+def _candidate_scan_cidrs() -> List[str]:
+    """Ordered, de-duplicated scan targets: stage network first, then live NICs.
+
+    Link-local interfaces (direct-attached cameras, no DHCP) are promoted ahead
+    of ordinary LAN interfaces.
+    """
+    ordered: List[str] = [DEFAULT_CAMERA_CIDR]
+    link_local: List[str] = []
+    normal: List[str] = []
+    for itf in _list_ipv4_interfaces():
+        cidr = _interface_scan_cidr(itf)
+        (link_local if itf["link_local"] else normal).append(cidr)
+    seen = set()
+    result: List[str] = []
+    for cidr in ordered + link_local + normal:
+        if cidr not in seen:
+            seen.add(cidr)
+            result.append(cidr)
+    return result
+
+
+def _hosts_for_cidr(cidr: str) -> List[str]:
+    """Host addresses for a CIDR, capped at MAX_SCAN_HOSTS."""
+    net = ipaddress.IPv4Network(cidr, strict=False)
+    hosts = [str(h) for h in net.hosts()] or [str(net.network_address)]
+    if len(hosts) > MAX_SCAN_HOSTS:
+        raise ValueError(
+            f"Scan range too large ({len(hosts)} hosts). "
+            f"Limit to {MAX_SCAN_HOSTS} or fewer.")
+    return hosts
+
+
+def _parse_bulk_pairs(text: str) -> List[Tuple[str, str]]:
+    """Parse pasted label/IP rows tolerantly.
+
+    Accepts tab, comma, semicolon, or whitespace separators, either column
+    order (label-first or IP-first), and skips blank/header lines that contain
+    no IP address.
+    """
+    pairs: List[Tuple[str, str]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        tokens = [t for t in re.split(r"[\t,;]+|\s+", line) if t]
+        if not tokens:
+            continue
+        ip = next((t for t in tokens if _IP_RE.match(t)), None)
+        if ip is None:
+            continue   # header row or junk — no IP present
+        labels = [t for t in tokens if t != ip]
+        pairs.append((labels[0] if labels else ip, ip))
+    return pairs
+
+
+class _NetworkScanWorker(QThread):
+    """Background RCP2 camera scan — keeps the UI thread responsive.
+
+    Phase 1: fast concurrent TCP probe of port 9998 across the host list.
+    Phase 2: confirm each open host is a camera via a real RCP2 session
+             (reads CAMERA_INFO), so an unrelated service on 9998 is not
+             mistaken for a camera.
+    """
+    found = Signal(str, str)        # ip, info string ("" until confirmed)
+    progress = Signal(int, int)     # done, total
+    done = Signal(list)             # [(ip, info), ...] confirmed/open
+
+    def __init__(self, hosts: List[str], port: int = RCP2_SCAN_PORT,
+                 timeout: float = 0.3):
+        super().__init__()
+        self._hosts = hosts
+        self._port = port
+        self._timeout = timeout
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def _probe(self, ip: str) -> Optional[str]:
+        if self._stop:
+            return None
+        try:
+            socket.create_connection((ip, self._port), timeout=self._timeout).close()
+            return ip
+        except Exception:
+            return None
+
+    def _confirm(self, ip: str) -> str:
+        """Best-effort RCP2 identity read. Returns a label or '' if unconfirmed."""
+        import asyncio
+        from r3dmatch3.rcp2 import RCP2Session
+
+        async def _ping():
+            s = RCP2Session(ip, ip, dry_run=False,
+                            connect_timeout=3.0, handshake_timeout=3.0)
+            try:
+                await s.connect()
+                info = await s.get_camera_info()
+                cam = (info.get("camera_type") or {}).get("str", "")
+                sn = info.get("serial_number", "")
+                return f"{cam} {sn}".strip()
+            finally:
+                await s.close()
+        try:
+            return asyncio.run(_ping())
+        except Exception:
+            return ""
+
+    def run(self):
+        import concurrent.futures
+        open_hosts: List[str] = []
+        total = len(self._hosts)
+        done_n = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
+            futs = {ex.submit(self._probe, h): h for h in self._hosts}
+            for fut in concurrent.futures.as_completed(futs):
+                if self._stop:
+                    break
+                done_n += 1
+                ip = fut.result()
+                if ip:
+                    open_hosts.append(ip)
+                    self.found.emit(ip, "")
+                self.progress.emit(done_n, total)
+        open_hosts.sort(key=lambda x: tuple(int(p) for p in x.split(".")))
+        confirmed: List[Tuple[str, str]] = []
+        for ip in open_hosts:
+            if self._stop:
+                break
+            info = self._confirm(ip)
+            confirmed.append((ip, info))
+            self.found.emit(ip, info)
+        self.done.emit(confirmed)
 
 
 # ── Screen 0: Setup ────────────────────────────────────────────────────────────
@@ -2329,17 +2556,25 @@ class CameraNetworkScreen(QWidget):
         root.addLayout(br)
 
     def _bulk_import(self):
-        """Paste tab/space-separated label↔IP pairs from a spreadsheet."""
+        """Paste label/IP pairs from a spreadsheet (tolerant of format)."""
+        try:
+            self._open_bulk_import_dialog()
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Bulk Import failed",
+                f"{type(exc).__name__}: {exc}")
+
+    def _open_bulk_import_dialog(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("Bulk Import Camera IPs")
         dlg.setMinimumWidth(480)
         dlg.setStyleSheet(f"background:{BG};color:{TEXT_PRIMARY};")
         vl = QVBoxLayout(dlg)
         vl.addWidget(_label(
-            "Paste camera label and IP address columns (tab or space separated).\n"
-            "One camera per line — e.g. copied from a spreadsheet:",
+            "Paste camera label and IP columns — tab, comma, or space separated.\n"
+            "Either column order works; lines without an IP are ignored:",
             size=12, color=TEXT_MUTED))
-        ex = _label("AA   172.20.114.141\nAB   172.20.114.142", size=11,
+        ex = _label("AA   172.20.114.141\nAB,172.20.114.142", size=11,
                      color=TEXT_MUTED, mono=True)
         ex.setIndent(12)
         vl.addWidget(ex)
@@ -2350,22 +2585,23 @@ class CameraNetworkScreen(QWidget):
                          f"font-family:{MONO_FONT};font-size:12px;padding:8px;")
         ta.setMinimumHeight(200)
         vl.addWidget(ta)
+        status = _label("", size=12, color=WARNING)
+        status.setWordWrap(True)
+        vl.addWidget(status)
         btns = QHBoxLayout()
-        ok_btn = _button("Import")
+        ok_btn = _button("Import", primary=True)
         cn_btn = _button("Cancel")
         btns.addWidget(ok_btn); btns.addWidget(cn_btn); btns.addStretch()
         vl.addLayout(btns)
         cn_btn.clicked.connect(dlg.reject)
 
         def _do_import():
-            pairs = []
-            for line in ta.toPlainText().splitlines():
-                parts = line.strip().replace('\t', ' ').split()
-                if len(parts) >= 2:
-                    pairs.append((parts[0], parts[1]))
+            pairs = _parse_bulk_pairs(ta.toPlainText())
             if not pairs:
+                status.setText(
+                    "No valid rows found — each line needs an IP address "
+                    "(e.g. \"AA 172.20.114.141\").")
                 return
-            # Expand rows if needed
             while len(self._ip_rows) < len(pairs):
                 self._add_row()
             for i, (label, ip) in enumerate(pairs):
@@ -2404,59 +2640,130 @@ class CameraNetworkScreen(QWidget):
         self._ip_rows.append((le, ie, sl))
 
     def _detect_on_network(self):
-        """Scan the local network subnet for RCP2 cameras on port 9998."""
-        import socket, ipaddress, concurrent.futures
-        local_ip = socket.gethostbyname(socket.gethostname())
+        """Scan a subnet for RCP2 cameras on port 9998 (threaded, non-blocking)."""
         try:
-            subnet = str(ipaddress.IPv4Interface(f"{local_ip}/24").network)
-        except Exception:
-            subnet = "172.20.114.0/24"
+            self._open_detect_dialog()
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Detect on Network failed",
+                f"{type(exc).__name__}: {exc}")
+
+    def _open_detect_dialog(self):
+        interfaces = _list_ipv4_interfaces()
+        cidrs = _candidate_scan_cidrs()
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("Detecting Cameras…")
-        dlg.setMinimumWidth(360)
+        dlg.setWindowTitle("Detect Cameras on Network")
+        dlg.setMinimumWidth(460)
         dlg.setStyleSheet(f"background:{BG};color:{TEXT_PRIMARY};")
         vl = QVBoxLayout(dlg)
-        lbl = _label(f"Scanning {subnet} on port 9998…", size=12, color=TEXT_MUTED)
-        vl.addWidget(lbl)
+
+        if interfaces:
+            hint = "  •  ".join(
+                f"{i['name']} {i['ipv4']}" + (" (link-local)" if i['link_local'] else "")
+                for i in interfaces)
+        else:
+            hint = "No active network interfaces detected."
+        vl.addWidget(_label("Detected interfaces:", size=11, bold=True, color=TEXT_MUTED))
+        il = _label(hint, size=11, color=TEXT_MUTED, mono=True)
+        il.setWordWrap(True)
+        vl.addWidget(il)
+
+        vl.addWidget(_label("Subnet to scan (CIDR):", size=11, bold=True, color=TEXT_MUTED))
+        cidr_combo = QComboBox()
+        cidr_combo.setEditable(True)
+        cidr_combo.addItems(cidrs)
+        cidr_combo.setCurrentText(cidrs[0] if cidrs else DEFAULT_CAMERA_CIDR)
+        cidr_combo.setStyleSheet(_field_style(mono=True))
+        vl.addWidget(cidr_combo)
+
+        status_lbl = _label("Ready.", size=12, color=TEXT_MUTED)
+        vl.addWidget(status_lbl)
         result_lbl = _label("", size=12, mono=True)
         result_lbl.setWordWrap(True)
         vl.addWidget(result_lbl)
+
+        btns = QHBoxLayout()
+        scan_btn = _button("Scan", primary=True)
+        stop_btn = _button("Stop"); stop_btn.setEnabled(False)
         close_btn = _button("Close")
-        close_btn.clicked.connect(dlg.accept)
-        vl.addWidget(close_btn)
-        dlg.show()
-        QApplication.processEvents()
+        btns.addWidget(scan_btn); btns.addWidget(stop_btn)
+        btns.addStretch(); btns.addWidget(close_btn)
+        vl.addLayout(btns)
 
-        found = []
-        def _probe(ip):
-            try:
-                s = socket.create_connection((ip, 9998), timeout=0.3)
-                s.close()
-                return ip
-            except Exception:
-                return None
+        found_map: Dict[str, str] = {}
 
-        network = ipaddress.IPv4Network(subnet, strict=False)
-        hosts = [str(h) for h in network.hosts()]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
-            for r in concurrent.futures.as_completed({ex.submit(_probe, h): h for h in hosts}):
-                ip = r.result()
-                if ip:
-                    found.append(ip)
-                    result_lbl.setText("\n".join(sorted(found)))
-                    QApplication.processEvents()
+        def _render():
+            if not found_map:
+                result_lbl.setText("")
+                return
+            lines = []
+            for ip in sorted(found_map, key=lambda x: tuple(int(p) for p in x.split("."))):
+                info = found_map[ip]
+                lines.append(f"{ip}   {info}" if info else f"{ip}   (port open)")
+            result_lbl.setText(f"Found {len(lines)} device(s):\n" + "\n".join(lines))
 
-        if not found:
-            result_lbl.setText("No cameras found on port 9998.")
-        else:
-            result_lbl.setText(f"Found {len(found)} camera(s):\n" + "\n".join(sorted(found)))
-            # Auto-populate empty rows
-            empty_rows = [(le, ie, sl) for le, ie, sl in self._ip_rows
-                          if not ie.text().strip()]
-            for (le, ie, sl), ip in zip(empty_rows, sorted(found)):
+        def _on_found(ip, info):
+            if ip not in found_map or info:
+                found_map[ip] = info
+            _render()
+
+        def _on_progress(done, total):
+            status_lbl.setText(f"Scanning… {done}/{total}")
+
+        def _on_done(confirmed):
+            scan_btn.setEnabled(True); stop_btn.setEnabled(False)
+            cameras = [ip for ip, info in confirmed if info]
+            if not found_map:
+                status_lbl.setText("No devices found on port 9998.")
+            elif cameras:
+                status_lbl.setText(f"Done — {len(cameras)} camera(s) confirmed.")
+            else:
+                status_lbl.setText("Done — ports open but no camera confirmed.")
+            # Auto-populate empty rows: confirmed cameras first, then open ports.
+            ordered = cameras + [ip for ip in sorted(found_map) if ip not in cameras]
+            empty = [(le, ie, sl) for le, ie, sl in self._ip_rows if not ie.text().strip()]
+            for (le, ie, sl), ip in zip(empty, ordered):
                 ie.setText(ip)
-            self._save_ips()
+            if ordered:
+                self._save_ips()
+
+        def _start():
+            found_map.clear(); _render()
+            try:
+                hosts = _hosts_for_cidr(cidr_combo.currentText().strip())
+            except Exception as exc:
+                status_lbl.setText(f"Invalid subnet: {exc}")
+                return
+            scan_btn.setEnabled(False); stop_btn.setEnabled(True)
+            status_lbl.setText(f"Scanning {len(hosts)} hosts on port {RCP2_SCAN_PORT}…")
+            self._scan_worker = _NetworkScanWorker(hosts)
+            self._scan_worker.found.connect(_on_found)
+            self._scan_worker.progress.connect(_on_progress)
+            self._scan_worker.done.connect(_on_done)
+            self._scan_worker.start()
+
+        def _stop():
+            if getattr(self, "_scan_worker", None):
+                self._scan_worker.stop()
+            stop_btn.setEnabled(False)
+            status_lbl.setText("Stopping…")
+
+        def _close():
+            w = getattr(self, "_scan_worker", None)
+            if w:
+                w.stop()
+                for sig in (w.found, w.progress, w.done):
+                    try:
+                        sig.disconnect()
+                    except Exception:
+                        pass
+            dlg.accept()
+
+        scan_btn.clicked.connect(_start)
+        stop_btn.clicked.connect(_stop)
+        close_btn.clicked.connect(_close)
+        dlg.exec()
 
     def _test(self, label: str, ip: str, status_lbl: QLabel):
         if not ip:
