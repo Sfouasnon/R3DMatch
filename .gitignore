@@ -28,3 +28,17 @@ __pycache__/
 build/
 dist/
 *.spec
+
+# Working scratch / experiment output — not for publication
+tools/__pycache__/
+tools/*_out/
+tools/golden/
+tools/profiles/
+tools/*BACKUP*.json
+
+# Build artifacts
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
