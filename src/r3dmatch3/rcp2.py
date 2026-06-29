@@ -288,12 +288,13 @@ class RCP2Session:
 
     async def _get_param_raw(
         self, field: str
-    ) -> Tuple[int, int, Optional[int], Optional[int]]:
+    ) -> Tuple[int, int, Optional[int], Optional[int], Optional[int]]:
         """
         Read a parameter and its edit_info.
 
-        Returns (raw_value, divider, min_raw, max_raw). min/max are the camera's
-        authoritative limits when reported, else None.
+        Returns (raw_value, divider, min_raw, max_raw, step). min/max/step are
+        the camera's authoritative edit limits when reported, else None. `step`
+        is the valid-value granularity in raw units (rcp_cur_int_edit_info.step).
         """
         param_id = _PARAM_ID[field]
         await self._send({"type": "rcp_get", "id": param_id})
@@ -311,11 +312,12 @@ class RCP2Session:
             divider = _FALLBACK_DIVIDER[field]
         min_raw = edit_info.get("min")
         max_raw = edit_info.get("max")
+        step = edit_info.get("step")
         logger.debug(
-            "[%s] GET %s: raw=%d divider=%d min=%s max=%s",
-            self.label, param_id, raw_val, divider, min_raw, max_raw
+            "[%s] GET %s: raw=%d divider=%d min=%s max=%s step=%s",
+            self.label, param_id, raw_val, divider, min_raw, max_raw, step
         )
-        return raw_val, divider, min_raw, max_raw
+        return raw_val, divider, min_raw, max_raw, step
 
     async def get_param(self, field: str) -> Tuple[float, int]:
         """
@@ -324,7 +326,7 @@ class RCP2Session:
         Returns (operator_value, divider) tuple.
         operator_value = raw_int / divider
         """
-        raw_val, divider, _min, _max = await self._get_param_raw(field)
+        raw_val, divider, _min, _max, _step = await self._get_param_raw(field)
         return raw_val / divider, divider
 
     async def read_state(self, dividers: Optional[Dict[str, int]] = None) -> CameraStateSnapshot:
@@ -358,6 +360,7 @@ class RCP2Session:
         *,
         min_raw: Optional[int] = None,
         max_raw: Optional[int] = None,
+        step: Optional[int] = None,
     ) -> FieldResult:
         """
         Write one parameter and verify with an INDEPENDENT readback.
@@ -434,7 +437,7 @@ class RCP2Session:
         # ── Independent confirmation read ───────────────────────────────────────
         self._drain_param(param_id)
         try:
-            rb_raw, rb_div, _, _ = await self._get_param_raw(field)
+            rb_raw, rb_div, _, _, rb_step = await self._get_param_raw(field)
             result.readback_raw = rb_raw
             result.readback_value = rb_raw / rb_div
             intended = raw_to_send / divider          # quantized target we sent
@@ -442,7 +445,12 @@ class RCP2Session:
             if rb_raw == raw_to_send:
                 result.verify_status = VerifyStatus.EXACT_MATCH
             else:
-                result.verify_status = _classify(field, result.delta)
+                # Use the camera-reported step (prefer the value seen on readback,
+                # else the one passed in) so a legal snap to granularity is not a
+                # MISMATCH.
+                eff_step = rb_step if rb_step is not None else step
+                tol = _effective_tol(field, rb_div, eff_step)
+                result.verify_status = _classify(field, result.delta, tol=tol)
         except asyncio.TimeoutError:
             result.verify_status = VerifyStatus.TIMEOUT
             result.error = f"No independent readback within {GET_TIMEOUT}s"
@@ -637,11 +645,13 @@ async def push_camera(
             # own limits before writing.
             dividers: Dict[str, int] = {}
             bounds: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
+            steps: Dict[str, Optional[int]] = {}
             for field_name in write_order:
                 try:
-                    _, div, min_raw, max_raw = await session._get_param_raw(field_name)
+                    _, div, min_raw, max_raw, step = await session._get_param_raw(field_name)
                     dividers[field_name] = div
                     bounds[field_name] = (min_raw, max_raw)
+                    steps[field_name] = step
                 except asyncio.TimeoutError:
                     # Fail-closed: a wrong divider produces a silent wrong commit
                     # because the camera applies an incorrect raw value and
@@ -663,6 +673,7 @@ async def push_camera(
                     dividers[field_name],
                     min_raw=min_raw,
                     max_raw=max_raw,
+                    step=steps[field_name],
                 )
                 result.field_results.append(fr)
 
@@ -930,19 +941,42 @@ async def verify_camera_state(
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _classify(field: str, delta: float) -> VerifyStatus:
-    """Classify a readback delta as EXACT / WITHIN / MISMATCH."""
-    tolerances = {
-        "kelvin":         TOL_KELVIN,
-        "tint":           TOL_TINT,
-        "exposureAdjust": TOL_EXPOSURE,
-    }
-    tol = tolerances.get(field, 0.01)
+_BASE_TOL = {
+    "kelvin":         TOL_KELVIN,
+    "tint":           TOL_TINT,
+    "exposureAdjust": TOL_EXPOSURE,
+}
+
+
+def _classify(field: str, delta: float, tol: Optional[float] = None) -> VerifyStatus:
+    """Classify a readback delta as EXACT / WITHIN / MISMATCH.
+
+    tol: effective tolerance in operator units. When None, falls back to the
+    static per-field constant. Callers pass a step-derived tolerance so a
+    legitimate snap to the camera's valid-value granularity is not flagged as
+    a MISMATCH.
+    """
+    if tol is None:
+        tol = _BASE_TOL.get(field, 0.01)
     if delta == 0.0:
         return VerifyStatus.EXACT_MATCH
     if delta <= tol:
         return VerifyStatus.WITHIN_TOLERANCE
     return VerifyStatus.MISMATCH
+
+
+def _effective_tol(field: str, divider: int, step: Optional[int]) -> float:
+    """Tolerance that absorbs the camera's valid-value granularity.
+
+    The camera legally snaps a written value to the nearest `step` (raw units),
+    so the readback can differ from the target by up to one step. We widen the
+    static tolerance to max(base, step/divider) when the camera reports a step
+    coarser than 1 raw unit; otherwise the base constant is used unchanged.
+    """
+    base = _BASE_TOL.get(field, 0.01)
+    if step and step > 1 and divider:
+        return max(base, step / divider)
+    return base
 
 
 # Static safe raw bounds — used ONLY as a fallback when the camera does not
