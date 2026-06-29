@@ -60,7 +60,8 @@ from r3dmatch3.workflow import run_analysis, verify_run
 from r3dmatch3.colorpipeline import ColorPipeline
 from r3dmatch3.workflow_qc import remeasure_cameras
 from r3dmatch3.report import build_report
-from r3dmatch3.rcp2 import push_all_cameras_sync, summarize_push_results
+from r3dmatch3.rcp2 import (push_all_cameras_sync, reset_all_cameras_sync,
+                            summarize_push_results)
 from r3dmatch3.redline import REDLineNotFoundError, resolve_redline_executable, check_redline_available
 from r3dmatch3.models import SphereROI
 from r3dmatch3.settings import load_settings, save_settings
@@ -135,6 +136,10 @@ class AppState:
         self.report_path:  Optional[str]  = None
         self.camera_ips:   Dict[str, str] = {}
         self.push_results: List           = []
+        # Calibration commit — set when the operator commits on the Match screen,
+        # carrying the per-camera CommitValues forward to the Push screen.
+        self.calibration_committed: bool  = False
+        self.committed_at: Optional[str]  = None
         # Sphere QC state
         self.qc_rois:      Dict[str, SphereROI] = {}  # clip_id → corrected ROI
         self.qc_accepted:  Dict[str, bool]       = {}  # clip_id → operator accepted
@@ -315,18 +320,24 @@ class PushWorker(QThread):
     finished      = Signal(list)
     errored       = Signal(str)
 
-    def __init__(self, targets: list, dry_run: bool = False):
+    def __init__(self, targets: list, dry_run: bool = False, mode: str = "push"):
         super().__init__()
         self.targets = targets
         self.dry_run = dry_run
+        self.mode = mode          # "push" → calibration values; "reset" → neutral defaults
 
     def run(self):
         try:
-            results = push_all_cameras_sync(self.targets, dry_run=self.dry_run)
+            if self.mode == "reset":
+                results = reset_all_cameras_sync(self.targets, dry_run=self.dry_run)
+                ok_word = "reset to default"
+            else:
+                results = push_all_cameras_sync(self.targets, dry_run=self.dry_run)
+                ok_word = "pushed"
             for r in results:
                 self.camera_update.emit(
                     r.camera_label, r.success,
-                    r.error or ("dry-run OK" if r.dry_run else "pushed"),
+                    r.error or ("dry-run OK" if r.dry_run else ok_word),
                 )
             self.finished.emit(results)
         except Exception as exc:
@@ -2096,8 +2107,9 @@ class SphereQCScreen(QWidget):
 # ── Screen 3: Results ─────────────────────────────────────────────────────────
 
 class ResultsScreen(QWidget):
-    push_requested  = Signal()
-    rerun_requested = Signal()
+    push_requested   = Signal()
+    rerun_requested  = Signal()
+    commit_requested = Signal()
 
     def __init__(self, state: AppState):
         super().__init__()
@@ -2158,6 +2170,25 @@ class ResultsScreen(QWidget):
             fb.setStyleSheet(f"color:{TEXT_MUTED};font-size:14px;background:{DARK_BG};")
             root.addWidget(fb)
 
+        # ── Bottom action bar: commit the calibration → Push ──
+        footer = QWidget()
+        footer.setFixedHeight(64)
+        footer.setStyleSheet(
+            f"background:{DARK_BG};border-top:1px solid {BORDER_COLOR};")
+        fl = QHBoxLayout(footer)
+        fl.setContentsMargins(20, 0, 20, 0)
+        fl.setSpacing(14)
+        self._commit_status = _label(
+            "Run a match to compute calibration values.",
+            size=12, color=TEXT_MUTED)
+        fl.addWidget(self._commit_status)
+        fl.addStretch()
+        self._commit_btn = _button("Commit Calibration →", primary=True)
+        self._commit_btn.setEnabled(False)
+        self._commit_btn.clicked.connect(self.commit_requested)
+        fl.addWidget(self._commit_btn)
+        root.addWidget(footer)
+
     def load_result(self, run_result, report_path: Optional[str]):
         self.state.run_result  = run_result
         self.state.report_path = report_path
@@ -2217,6 +2248,23 @@ class ResultsScreen(QWidget):
             self._sum_layout.addWidget(_label(val, size=11, mono=True))
         self._sum_layout.addStretch()
 
+        # A new result invalidates any prior commit; re-arm the commit button.
+        self.state.calibration_committed = False
+        self.state.committed_at = None
+        self._commit_btn.setEnabled(solved_count > 0)
+        self._commit_btn.setText("Commit Calibration →")
+        if solved_count > 0:
+            self._commit_status.setText(
+                f"{solved_count}/{len(cameras)} cameras calibrated — "
+                "commit to carry these values to Push.")
+            self._commit_status.setStyleSheet(
+                f"color:{TEXT_PRIMARY};font-size:12px;background:transparent;")
+        else:
+            self._commit_status.setText(
+                "No cameras solved — nothing to commit. Check Sphere QC.")
+            self._commit_status.setStyleSheet(
+                f"color:{TEXT_MUTED};font-size:12px;background:transparent;")
+
         if report_path and _WEB_OK:
             rp = Path(report_path).expanduser().resolve()
             if rp.exists():
@@ -2224,6 +2272,14 @@ class ResultsScreen(QWidget):
             else:
                 # Report file missing — show inline fallback with key stats
                 self._web.setHtml(self._build_inline_html(run_result))
+
+    def mark_committed(self):
+        """Reflect that the calibration has been committed and sent to Push."""
+        self._commit_btn.setText("Committed ✓")
+        self._commit_status.setText(
+            "Calibration committed — values carried to the Push screen.")
+        self._commit_status.setStyleSheet(
+            f"color:{SUCCESS};font-size:12px;background:transparent;")
 
     def _build_inline_html(self, run_result) -> str:
         rows = ""
@@ -2374,6 +2430,13 @@ class PushScreen(QWidget):
             b = _button(text)
             b.clicked.connect(fn)
             br.addWidget(b)
+        br.addSpacing(16)
+        detect_btn = _button("Detect Cameras…")
+        detect_btn.clicked.connect(self._detect_cameras)
+        br.addWidget(detect_btn)
+        self._reset_btn = _button("Reset to Default")
+        self._reset_btn.clicked.connect(self._start_reset)
+        br.addWidget(self._reset_btn)
         br.addStretch()
         self._dry_btn  = _button("Dry Run (no write)")
         self._push_btn = _button("Push to Cameras", primary=True)
@@ -2422,12 +2485,205 @@ class PushScreen(QWidget):
             self._table.setItem(row, 6, si)
             self._camera_rows[cr.camera_label] = {
                 "checkbox": cb, "row": row, "commit": cr.commit, "ip": ip}
+        if getattr(self.state, "calibration_committed", False):
+            n_ip = sum(1 for i in self._camera_rows.values() if i["ip"])
+            self._log.append(
+                f"[COMMIT] Calibration committed {self.state.committed_at or ''} — "
+                f"{len(self._camera_rows)} camera(s) carried over, {n_ip} with IPs."
+                + ("" if n_ip else " Use Detect Cameras to map IPs."))
 
     def _sel_all(self):
         for i in self._camera_rows.values(): i["checkbox"].setChecked(True)
 
     def _sel_none(self):
         for i in self._camera_rows.values(): i["checkbox"].setChecked(False)
+
+    # ── Detect Cameras (on Push) ────────────────────────────────────────────
+    def _detect_cameras(self):
+        """Scan the network for RCP2 cameras and auto-fill push rows lacking IPs."""
+        try:
+            self._open_detect_dialog()
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Detect Cameras failed",
+                f"{type(exc).__name__}: {exc}")
+
+    def _unmapped_labels(self) -> List[str]:
+        """Push-row camera labels currently without an IP, in table order."""
+        return [lbl for lbl, info in sorted(
+                    self._camera_rows.items(), key=lambda kv: kv[1]["row"])
+                if not info.get("ip")]
+
+    def _open_detect_dialog(self):
+        interfaces = _list_ipv4_interfaces()
+        cidrs = _candidate_scan_cidrs()
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Detect Cameras on Network")
+        dlg.setMinimumWidth(460)
+        dlg.setStyleSheet(f"background:{BG};color:{TEXT_PRIMARY};")
+        vl = QVBoxLayout(dlg)
+
+        if interfaces:
+            hint = "  •  ".join(
+                f"{i['name']} {i['ipv4']}" + (" (link-local)" if i['link_local'] else "")
+                for i in interfaces)
+        else:
+            hint = "No active network interfaces detected."
+        vl.addWidget(_label("Detected interfaces:", size=11, bold=True, color=TEXT_MUTED))
+        il = _label(hint, size=11, color=TEXT_MUTED, mono=True)
+        il.setWordWrap(True)
+        vl.addWidget(il)
+
+        n_unmapped = len(self._unmapped_labels())
+        vl.addWidget(_label(
+            f"{n_unmapped} camera(s) on this page have no IP. Found cameras are "
+            "assigned to those rows in order — verify before pushing.",
+            size=11, color=TEXT_MUTED))
+
+        vl.addWidget(_label("Subnet to scan (CIDR):", size=11, bold=True, color=TEXT_MUTED))
+        cidr_combo = QComboBox()
+        cidr_combo.setEditable(True)
+        cidr_combo.addItems(cidrs)
+        cidr_combo.setCurrentText(cidrs[0] if cidrs else DEFAULT_CAMERA_CIDR)
+        cidr_combo.setStyleSheet(_field_style(mono=True))
+        vl.addWidget(cidr_combo)
+
+        status_lbl = _label("Ready.", size=12, color=TEXT_MUTED)
+        vl.addWidget(status_lbl)
+        result_lbl = _label("", size=12, mono=True)
+        result_lbl.setWordWrap(True)
+        vl.addWidget(result_lbl)
+
+        btns = QHBoxLayout()
+        scan_btn = _button("Scan", primary=True)
+        stop_btn = _button("Stop"); stop_btn.setEnabled(False)
+        close_btn = _button("Close")
+        btns.addWidget(scan_btn); btns.addWidget(stop_btn)
+        btns.addStretch(); btns.addWidget(close_btn)
+        vl.addLayout(btns)
+
+        found_map: Dict[str, str] = {}
+
+        def _render():
+            if not found_map:
+                result_lbl.setText("")
+                return
+            lines = []
+            for ip in sorted(found_map, key=lambda x: tuple(int(p) for p in x.split("."))):
+                info = found_map[ip]
+                lines.append(f"{ip}   {info}" if info else f"{ip}   (port open)")
+            result_lbl.setText(f"Found {len(lines)} device(s):\n" + "\n".join(lines))
+
+        def _on_found(ip, info):
+            if ip not in found_map or info:
+                found_map[ip] = info
+            _render()
+
+        def _on_progress(done, total):
+            status_lbl.setText(f"Scanning… {done}/{total}")
+
+        def _on_done(confirmed):
+            scan_btn.setEnabled(True); stop_btn.setEnabled(False)
+            cameras = [ip for ip, info in confirmed if info]
+            if not found_map:
+                status_lbl.setText("No devices found on port 9998.")
+                return
+            # Confirmed cameras first, then any remaining open ports.
+            ordered = cameras + [ip for ip in sorted(
+                found_map, key=lambda x: tuple(int(p) for p in x.split(".")))
+                if ip not in cameras]
+            assigned = self._assign_detected(ordered)
+            if assigned:
+                status_lbl.setText(
+                    f"Done — assigned {assigned} IP(s) to unmapped camera(s).")
+            elif cameras:
+                status_lbl.setText(
+                    f"Done — {len(cameras)} camera(s) found, but no unmapped rows to fill.")
+            else:
+                status_lbl.setText("Done — ports open but no camera confirmed.")
+
+        def _start():
+            found_map.clear(); _render()
+            try:
+                hosts = _hosts_for_cidr(cidr_combo.currentText().strip())
+            except Exception as exc:
+                status_lbl.setText(f"Invalid subnet: {exc}")
+                return
+            scan_btn.setEnabled(False); stop_btn.setEnabled(True)
+            status_lbl.setText(f"Scanning {len(hosts)} hosts on port {RCP2_SCAN_PORT}…")
+            self._scan_worker = _NetworkScanWorker(hosts)
+            self._scan_worker.found.connect(_on_found)
+            self._scan_worker.progress.connect(_on_progress)
+            self._scan_worker.done.connect(_on_done)
+            self._scan_worker.start()
+
+        def _stop():
+            if getattr(self, "_scan_worker", None):
+                self._scan_worker.stop()
+            stop_btn.setEnabled(False)
+            status_lbl.setText("Stopping…")
+
+        def _close():
+            w = getattr(self, "_scan_worker", None)
+            if w:
+                w.stop()
+                for sig in (w.found, w.progress, w.done):
+                    try:
+                        sig.disconnect()
+                    except Exception:
+                        pass
+            dlg.accept()
+
+        scan_btn.clicked.connect(_start)
+        stop_btn.clicked.connect(_stop)
+        close_btn.clicked.connect(_close)
+        dlg.exec()
+
+    def _assign_detected(self, ordered_ips: List[str]) -> int:
+        """Fill push rows that have no IP with detected IPs, in table order.
+
+        Returns the number of rows assigned. Updates the table, in-memory
+        state, and the persisted IP map so the pairing survives navigation.
+        """
+        targets = self._unmapped_labels()
+        if not targets or not ordered_ips:
+            return 0
+        # Don't reuse an IP that's already mapped to another row.
+        used = {info["ip"] for info in self._camera_rows.values() if info.get("ip")}
+        fresh = [ip for ip in ordered_ips if ip not in used]
+        new_pairs: Dict[str, str] = {}
+        for lbl, ip in zip(targets, fresh):
+            info = self._camera_rows[lbl]
+            info["ip"] = ip
+            row = info["row"]
+            self._table.setItem(row, 1, QTableWidgetItem(lbl))
+            si = QTableWidgetItem("Ready")
+            si.setForeground(QColor(TEXT_PRIMARY))
+            self._table.setItem(row, 6, si)
+            info["checkbox"].setChecked(True)
+            self.state.camera_ips[lbl] = ip
+            new_pairs[lbl] = ip
+            self._log.append(f"[DETECT] {lbl} → {ip}")
+        if new_pairs:
+            self._persist_ips()
+        return len(new_pairs)
+
+    def _persist_ips(self):
+        """Merge the current label→IP map into camera_ips.json."""
+        merged: Dict[str, str] = {}
+        if IP_MAP_PATH.exists():
+            try:
+                merged = json.loads(IP_MAP_PATH.read_text())
+            except Exception:
+                merged = {}
+        merged.update({l: i for l, i in self.state.camera_ips.items() if l and i})
+        self.state.camera_ips = merged
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            IP_MAP_PATH.write_text(json.dumps(merged, indent=2))
+        except Exception:
+            pass
 
     def _start_push(self, dry_run: bool):
         targets = []
@@ -2442,13 +2698,46 @@ class PushScreen(QWidget):
                                     "Select cameras with configured IPs.")
             return
         self._log.append(f"\n[{'DRY-RUN' if dry_run else 'LIVE'}] {len(targets)} cameras…\n")
-        self._push_btn.setEnabled(False)
-        self._dry_btn.setEnabled(False)
+        self._set_busy(True)
         self._worker = PushWorker(targets, dry_run=dry_run)
         self._worker.camera_update.connect(self._on_cam_update)
         self._worker.finished.connect(self._on_done)
         self._worker.errored.connect(self._on_error)
         self._worker.start()
+
+    def _start_reset(self):
+        targets = []
+        for lbl, info in self._camera_rows.items():
+            if not info["checkbox"].isChecked():
+                continue
+            if not info["ip"]:
+                self._log.append(f"[SKIP] {lbl}: no IP")
+                continue
+            targets.append({"camera_label": lbl, "ip": info["ip"]})
+        if not targets:
+            QMessageBox.information(self, "Nothing to Reset",
+                                    "Select cameras with configured IPs.")
+            return
+        resp = QMessageBox.warning(
+            self, "Reset to Default",
+            f"Reset {len(targets)} camera(s) to neutral defaults?\n\n"
+            "This writes 5600K, 0 tint, and 0 exposure adjust to the live "
+            "camera(s), discarding the current calibration.",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if resp != QMessageBox.StandardButton.Ok:
+            return
+        self._log.append(f"\n[RESET] {len(targets)} cameras → neutral defaults…\n")
+        self._set_busy(True)
+        self._worker = PushWorker(targets, dry_run=False, mode="reset")
+        self._worker.camera_update.connect(self._on_cam_update)
+        self._worker.finished.connect(self._on_done)
+        self._worker.errored.connect(self._on_error)
+        self._worker.start()
+
+    def _set_busy(self, busy: bool):
+        for b in (self._push_btn, self._dry_btn, self._reset_btn):
+            b.setEnabled(not busy)
 
     @Slot(str, bool, str)
     def _on_cam_update(self, lbl: str, ok: bool, detail: str):
@@ -2464,12 +2753,12 @@ class PushScreen(QWidget):
         self.state.push_results = results
         s = summarize_push_results(results)["summary"]
         self._log.append(f"\n[DONE] {s['succeeded']}/{s['total_cameras']} succeeded.")
-        self._push_btn.setEnabled(True); self._dry_btn.setEnabled(True)
+        self._set_busy(False)
 
     @Slot(str)
     def _on_error(self, msg: str):
         self._log.append(f"\n[ERROR]\n{msg}")
-        self._push_btn.setEnabled(True); self._dry_btn.setEnabled(True)
+        self._set_busy(False)
 
 
 # ── Screen 5: Camera Network ──────────────────────────────────────────────────
@@ -3072,6 +3361,7 @@ class MainWindow(QMainWindow):
         self._setup.run_requested.connect(self._start_analysis)
         self._qc.assessment_ready.connect(self._on_assessment_ready)
         self._results.push_requested.connect(self._go_push)
+        self._results.commit_requested.connect(self._commit_calibration)
         self._results.rerun_requested.connect(lambda: self._go(0))
         self._push.back_requested.connect(lambda: self._go(3))
 
@@ -3218,6 +3508,24 @@ class MainWindow(QMainWindow):
             btn.setChecked(i == idx)
 
     def _go_push(self):
+        self._push.populate()
+        self._go(4)
+
+    def _commit_calibration(self):
+        """Lock in the per-camera calibration from the Match screen and carry
+        it forward to the Push screen."""
+        rr = self.state.run_result
+        n = sum(1 for cr in rr.cameras if cr.commit) if rr else 0
+        if not n:
+            QMessageBox.information(
+                self, "Nothing to Commit",
+                "No solved cameras with calibration values. Check Sphere QC and "
+                "re-run the match.")
+            return
+        from datetime import datetime
+        self.state.calibration_committed = True
+        self.state.committed_at = datetime.now().isoformat(timespec="seconds")
+        self._results.mark_committed()
         self._push.populate()
         self._go(4)
 
