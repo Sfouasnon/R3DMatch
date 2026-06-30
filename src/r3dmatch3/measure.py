@@ -7,7 +7,10 @@ The four-step chain, proven accurate and kept exactly from the original:
   3. Log2: scalar = median(log2(trimmed_luminance))
   4. IRE: (2^scalar) * 100
 
-All measurements are display-referred (IPP2 / BT.709 / BT.1886 / Medium / Medium).
+The display/color measurement (measure_render) is display-referred (IPP2 /
+BT.709 / BT.1886 / Medium / Medium) and uses BT.709 luminance. The scene-linear
+exposure measurement (measure_center_log2) operates on RWG-linear data and uses
+REDWideGamutRGB luminance weights (see _RWG_LUMA_WEIGHTS).
 
 Zone geometry: three rectangular bands aligned with the luminance gradient axis.
   Sample 1 (bright_side): offset = +0.24 * r from center
@@ -41,6 +44,26 @@ _ZONE_HALF_HEIGHT_RATIO = 0.11
 _TRIM_LOW  = 5.0
 _TRIM_HIGH = 95.0
 _INTERIOR_RADIUS_RATIO = 0.50
+
+# Luminance weights by measurement color space.
+#   Display path (Rec.709 / BT.1886): the shared _luminance (BT.709) — left as-is.
+#   Scene-linear exposure path: the data is REDWideGamutRGB-linear
+#   (SCENE_LINEAR_PIPELINE), so the correct luminance is the Y-row of the
+#   RWG->XYZ matrix, derived from RED's published RWG primaries + D65:
+#       R=0.286694  G=0.842979  B=-0.129673   (sums to 1.0 at D65 white)
+#   Using these instead of BT.709 weights stops a camera's residual color cast
+#   on the sphere from leaking into the exposure solve. For a perfectly neutral
+#   gray both weight sets give the same Y (each sums to 1.0); they only diverge
+#   on color cast. NOTE: the blue weight is negative (RWG blue is a virtual
+#   primary), so weighted luminance is clamped to >=1e-6 before log2 — harmless
+#   for a near-neutral sphere, and the 5-95 trim absorbs stray colored pixels.
+_RWG_LUMA_WEIGHTS = (0.286694, 0.842979, -0.129673)
+
+
+def _luminance_weighted(pixels: np.ndarray, weights: Tuple[float, float, float]) -> np.ndarray:
+    """Weighted luminance over an Nx3 (or HxWx3) RGB array."""
+    wr, wg, wb = weights
+    return wr * pixels[..., 0] + wg * pixels[..., 1] + wb * pixels[..., 2]
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +178,8 @@ def measure_center_log2(render_path: str, roi: SphereROI) -> Optional[float]:
     """
     try:
         image = _load_render_full_depth(render_path)
-        zm = _measure_zone(image, roi, offset=0.0)
+        # RWG-linear data → use REDWideGamutRGB luminance weights, not BT.709.
+        zm = _measure_zone(image, roi, offset=0.0, luma_weights=_RWG_LUMA_WEIGHTS)
         if zm["pixel_count"] < 50:
             return None
         return float(zm["log2"])
@@ -172,9 +196,14 @@ def _measure_zone(
     roi: SphereROI,
     *,
     offset: float,
+    luma_weights: Optional[Tuple[float, float, float]] = None,
 ) -> Dict:
     """
     Measure a single rectangular zone at the given normalized offset from center.
+
+    luma_weights: when None (default), uses the shared BT.709 _luminance — the
+    display/Rec.709 path is byte-for-byte unchanged. When provided (scene-linear
+    exposure path), luminance is the weighted sum for that color space.
 
     Returns dict with: ire, log2, rgb_mean, pixel_count
     """
@@ -194,7 +223,7 @@ def _measure_zone(
     strip = image[y0:y1, x0:x1]   # HxWx3
     pixels = strip.reshape(-1, 3)  # Nx3
 
-    lum = _luminance(pixels)
+    lum = _luminance(pixels) if luma_weights is None else _luminance_weighted(pixels, luma_weights)
     lum = np.clip(lum, 1e-6, None)
 
     if lum.size == 0:
