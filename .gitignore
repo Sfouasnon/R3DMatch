@@ -1,33 +1,30 @@
+# ── Python ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.so
+
+# ── Virtual environments ────────────────────────────────
 .venv/
 venv/
-__pycache__/
-*.pyc
-dist/
+env/
+
+# ── Build / packaging artifacts ─────────────────────────
 build/
-*.egg-info/
+dist/
+*.app/
 *.log
+
+# ── macOS cruft ─────────────────────────────────────────
 .DS_Store
-.codex_runs/
-tools/*_out/
-*.tif
-*.tiff
-*.R3D
-*.exr
-*.mov
+.AppleDouble
+._*
 
-# Working scratch / experiment output — not for publication
-tools/__pycache__/
-tools/golden/
-tools/profiles/
-tools/*BACKUP*.json
+# ── Local settings / scratch ────────────────────────────
+*.tmp
+*.bak
 
-# Build artifacts
-*.spec
-
-
-
-# Loose live-camera test scripts (internal defaults)
-tools/live_camera_test.py
-tools/live_camera_test.command
-tools/refresh_icon.command
-assets/icon_1024.png
+# ── Generated diagnostic output folders ─────────────────
+macbeth_out/
+*_out/

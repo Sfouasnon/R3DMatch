@@ -1,0 +1,7 @@
+# R3DMatch V5 — Macbeth diagnostic
+# opencv-contrib-python required for cv2.mcc (ColorChecker detector)
+# If opencv-python is already installed, uninstall it first:
+#   pip uninstall opencv-python && pip install opencv-contrib-python
+opencv-contrib-python>=4.5
+numpy
+Pillow

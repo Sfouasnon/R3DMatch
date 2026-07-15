@@ -25,15 +25,17 @@ from __future__ import annotations
 import inspect
 import ipaddress
 import json
+import logging
 import re
 import socket
 import subprocess
+import time
 import traceback
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import (
-    QPointF, QRectF, QThread, Qt, QUrl, Signal, Slot,
+    QPointF, QRectF, QThread, QTimer, Qt, QUrl, Signal, Slot,
 )
 from PySide6.QtGui import (
     QColor, QCursor, QPainter, QPen, QPalette,
@@ -65,6 +67,10 @@ from r3dmatch3.rcp2 import (push_all_cameras_sync, reset_all_cameras_sync,
 from r3dmatch3.redline import REDLineNotFoundError, resolve_redline_executable, check_redline_available
 from r3dmatch3.models import SphereROI
 from r3dmatch3.settings import load_settings, save_settings
+from r3dmatch3 import capture as capture_mod
+from r3dmatch3 import capture_ftp
+
+logger = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -147,6 +153,12 @@ class AppState:
         _s = load_settings()
         self.redline_path:    str = _s.get("redline_path", "")
         self.default_out_dir: str = _s.get("default_out_dir", "")
+        # Capture / FTP ingest — blank means "not configured" (never assumed).
+        self.ftp_user:     str = _s.get("ftp_user", "")
+        self.ftp_pass:     str = _s.get("ftp_pass", "")
+        self.ftp_port:     str = _s.get("ftp_port", "21")
+        self.capture_dest: str = _s.get("capture_dest", "")
+        self.capture_cidr: str = _s.get("capture_cidr", "")
 
 
 # ── Workers ────────────────────────────────────────────────────────────────────
@@ -3129,6 +3141,577 @@ class CameraNetworkScreen(QWidget):
 
 # ── Main window ────────────────────────────────────────────────────────────────
 
+# ── Screen 7: Capture ─────────────────────────────────────────────────────────
+#
+# One panel that runs the full single-frame array capture arc:
+#   Detect (TCP CIDR)  →  Connect (one RCP2 session/camera)  →  Frame-limit = 1
+#   →  Verify sync  →  CAPTURE (sync-record roll)  →  Ingest (FTP pull just the
+#   clip we recorded). The CAPTURE button is gated: it only lights when every
+#   connected body is frame-limited to 1 and the array is verified in sync, per
+#   REDConductorV3's field-note safety rules.
+
+class _CaptureDetectWorker(QThread):
+    progress = Signal(int, int)
+    done = Signal(list)
+
+    def __init__(self, array, cidr: str):
+        super().__init__()
+        self._array = array
+        self._cidr = cidr
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        try:
+            ips = self._array.detect(
+                self._cidr, stop=lambda: self._stop,
+                progress=lambda d, t: self.progress.emit(d, t))
+        except Exception as exc:
+            logger.warning("detect failed: %s", exc)
+            ips = []
+        self.done.emit(ips)
+
+
+class _CaptureConnectWorker(QThread):
+    one = Signal(str, bool, str)
+    done = Signal(dict)
+
+    def __init__(self, array, ips: List[str]):
+        super().__init__()
+        self._array = array
+        self._ips = ips
+
+    def run(self):
+        res = self._array.connect(
+            self._ips, progress=lambda ip, ok, err: self.one.emit(ip, ok, err))
+        self.done.emit(res)
+
+
+class _CaptureFrameLimitWorker(QThread):
+    done = Signal(dict)
+
+    def __init__(self, array, frames: int = 1):
+        super().__init__()
+        self._array = array
+        self._frames = frames
+
+    def run(self):
+        self.done.emit(self._array.set_frame_limit(self._frames))
+
+
+class _CaptureRollWorker(QThread):
+    rolled = Signal(bool, str, dict)
+    captured = Signal(bool, dict)
+
+    def __init__(self, array, lead: float):
+        super().__init__()
+        self._array = array
+        self._lead = lead
+
+    def run(self):
+        ok, msg, detail = self._array.roll(self._lead)
+        self.rolled.emit(ok, msg, detail)
+        if ok:
+            cap_ok, clips = self._array.wait_for_capture(timeout=20.0)
+            self.captured.emit(cap_ok, clips)
+
+
+class _CapturePullWorker(QThread):
+    one = Signal(object)
+    done = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, cameras: Dict[str, str], dest: str, user: str, pw: str,
+                 port: str, hints: Dict[str, str]):
+        super().__init__()
+        self._cameras = cameras
+        self._dest = dest
+        self._user = user
+        self._pw = pw
+        self._port = port
+        self._hints = hints
+
+    def run(self):
+        try:
+            results = capture_ftp.pull_array(
+                self._cameras, Path(self._dest), self._user, self._pw,
+                port=int(self._port or 21), clip_hints=self._hints,
+                on_result=lambda r: self.one.emit(r))
+            self.done.emit(results)
+        except capture_ftp.FTPConfigError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class CaptureScreen(QWidget):
+    """Stepped, guarded single-frame array capture + FTP ingest."""
+
+    _COLS = ["Camera", "IP", "Conn", "Timecode", "Rec", "Frm=1", "Sync", "Clip", "Pull"]
+
+    def __init__(self, state: AppState):
+        super().__init__()
+        self.state = state
+        self.array = capture_mod.CaptureArray()
+        self._detected_ips: List[str] = []
+        self._clips: Dict[str, str] = {}
+        self._captured = False
+        self._busy = False
+        self._last_sync = None
+        self._workers: List[QThread] = []
+        self._pull_status: Dict[str, str] = {}
+        self._build_ui()
+        self._poll = QTimer(self)
+        self._poll.setInterval(1000)
+        self._poll.timeout.connect(self._refresh)
+        self._poll.start()
+        self._update_gates()
+
+    # -- UI ---------------------------------------------------------------------
+    def _build_ui(self):
+        self.setStyleSheet(f"background:{DARK_BG};")
+        root = QVBoxLayout(self)
+        root.setContentsMargins(28, 24, 28, 20)
+        root.setSpacing(16)
+
+        head = QHBoxLayout()
+        head.addWidget(_label("Capture", size=22, bold=True))
+        head.addSpacing(10)
+        self._headline = _label("Detect → connect → frame-limit → verify sync → capture → ingest",
+                                color=TEXT_MUTED, size=12)
+        head.addWidget(self._headline)
+        head.addStretch()
+        root.addLayout(head)
+
+        # ── Config card ──
+        cfg = self._card()
+        cfg_l = QVBoxLayout(cfg)
+        cfg_l.setContentsMargins(18, 14, 18, 14)
+        cfg_l.setSpacing(10)
+
+        cidr_row = QHBoxLayout(); cidr_row.setSpacing(8)
+        cidr_row.addWidget(_label("Scan range (CIDR)", size=12), 0)
+        self._cidr = QLineEdit()
+        self._cidr.setStyleSheet(_field_style(mono=True))
+        self._cidr.setText(self.state.capture_cidr or capture_mod_default_cidr())
+        self._cidr.setFixedWidth(220)
+        cidr_row.addWidget(self._cidr, 0)
+        cidr_row.addSpacing(16)
+        cidr_row.addWidget(_label("Destination", size=12), 0)
+        self._dest = QLineEdit()
+        self._dest.setStyleSheet(_field_style())
+        self._dest.setText(self.state.capture_dest)
+        self._dest.setPlaceholderText("Local folder for pulled clips")
+        cidr_row.addWidget(self._dest, 1)
+        browse = _button("Browse…")
+        browse.clicked.connect(self._browse_dest)
+        cidr_row.addWidget(browse, 0)
+        cfg_l.addLayout(cidr_row)
+
+        self._ftp_note = _label("", size=11, color=TEXT_MUTED)
+        cfg_l.addWidget(self._ftp_note)
+        root.addWidget(cfg)
+
+        # ── Pipeline card ──
+        pipe = self._card()
+        pl = QVBoxLayout(pipe)
+        pl.setContentsMargins(18, 14, 18, 14)
+        pl.setSpacing(10)
+
+        step_row = QHBoxLayout(); step_row.setSpacing(8)
+        self._btn_detect = _button("1 · Detect")
+        self._btn_detect.clicked.connect(self._on_detect)
+        self._btn_connect = _button("2 · Connect")
+        self._btn_connect.clicked.connect(self._on_connect)
+        self._btn_frame = _button("3 · Frame-limit = 1")
+        self._btn_frame.clicked.connect(self._on_frame_limit)
+        self._btn_verify = _button("4 · Verify sync")
+        self._btn_verify.clicked.connect(self._on_verify)
+        for b in (self._btn_detect, self._btn_connect, self._btn_frame, self._btn_verify):
+            step_row.addWidget(b)
+        step_row.addStretch()
+        pl.addLayout(step_row)
+
+        self._stage_status = _label("Idle.", size=12, color=TEXT_MUTED)
+        self._stage_status.setWordWrap(True)
+        pl.addWidget(self._stage_status)
+
+        cap_row = QHBoxLayout(); cap_row.setSpacing(10)
+        self._btn_capture = _button("●  CAPTURE", primary=True)
+        self._btn_capture.setFixedHeight(44)
+        self._btn_capture.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._btn_capture.clicked.connect(self._on_capture)
+        cap_row.addWidget(self._btn_capture, 2)
+        self._btn_cut = _button("Cut (safety)", warning=True)
+        self._btn_cut.clicked.connect(self._on_cut)
+        cap_row.addWidget(self._btn_cut, 0)
+        self._btn_pull = _button("6 · Ingest clips →", primary=True)
+        self._btn_pull.clicked.connect(self._on_pull)
+        cap_row.addWidget(self._btn_pull, 1)
+        self._btn_disconnect = _button("Disconnect")
+        self._btn_disconnect.clicked.connect(self._on_disconnect)
+        cap_row.addWidget(self._btn_disconnect, 0)
+        pl.addLayout(cap_row)
+        root.addWidget(pipe)
+
+        # ── Camera table ──
+        self._table = QTableWidget(0, len(self._COLS))
+        self._table.setHorizontalHeaderLabels(self._COLS)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self._table.setStyleSheet(
+            f"QTableWidget{{background:{PANEL_BG};color:{TEXT_PRIMARY};"
+            f"border:1px solid {BORDER_COLOR};border-radius:8px;gridline-color:{BORDER_COLOR};"
+            f"font-size:12px;}}"
+            f"QHeaderView::section{{background:{CARD_BG};color:{TEXT_MUTED};"
+            f"border:none;border-bottom:1px solid {BORDER_COLOR};padding:6px 8px;"
+            f"font-weight:700;font-size:11px;}}")
+        hh = self._table.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        root.addWidget(self._table, 1)
+
+        # ── Log ──
+        self._log_view = QTextEdit()
+        self._log_view.setReadOnly(True)
+        self._log_view.setFixedHeight(120)
+        self._log_view.setStyleSheet(
+            f"QTextEdit{{background:{PANEL_BG};color:{TEXT_MUTED};"
+            f"border:1px solid {BORDER_COLOR};border-radius:8px;padding:8px;"
+            f"font-family:{MONO_FONT};font-size:11px;}}")
+        root.addWidget(self._log_view)
+
+    def _card(self) -> QWidget:
+        w = QWidget()
+        w.setStyleSheet(
+            f"background:{CARD_BG};border-radius:8px;border:1px solid {BORDER_COLOR};")
+        return w
+
+    # -- helpers ----------------------------------------------------------------
+    def _log(self, msg: str):
+        ts = time.strftime("%H:%M:%S")
+        self._log_view.append(f"{ts}  {msg}")
+
+    def _browse_dest(self):
+        p = QFileDialog.getExistingDirectory(self, "Select Capture Destination")
+        if p:
+            self._dest.setText(p)
+            self.state.capture_dest = p
+            self._persist()
+
+    def _persist(self):
+        s = load_settings()
+        s["capture_dest"] = self._dest.text().strip()
+        s["capture_cidr"] = self._cidr.text().strip()
+        save_settings(s)
+
+    def _ftp_ready(self) -> bool:
+        return bool(self.state.ftp_user and self.state.ftp_pass)
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        # Reflect Settings changes each time the tab is shown.
+        if not self._ftp_ready():
+            self._ftp_note.setText("⚠  FTP credentials not set — configure them in "
+                                   "Settings → Capture to enable the ingest step.")
+            self._ftp_note.setStyleSheet(f"color:{WARNING};background:transparent;font-size:11px;")
+        else:
+            self._ftp_note.setText(f"✓  FTP: {self.state.ftp_user}@camera:{self.state.ftp_port} (TLS)")
+            self._ftp_note.setStyleSheet(f"color:{SUCCESS};background:transparent;font-size:11px;")
+        self._update_gates()
+
+    # -- stage 1: detect --------------------------------------------------------
+    def _on_detect(self):
+        cidr = self._cidr.text().strip()
+        try:
+            ipaddress.ip_network(cidr, strict=False)
+        except Exception:
+            self._stage_status.setText(f"Invalid CIDR: {cidr!r}")
+            return
+        self._persist()
+        self._busy = True
+        self._detected_ips = []
+        self._stage_status.setText(f"Scanning {cidr} on port 9998 …")
+        self._log(f"Detect: TCP-sweeping {cidr}")
+        w = _CaptureDetectWorker(self.array, cidr)
+        w.progress.connect(lambda d, t: self._stage_status.setText(
+            f"Scanning {cidr} … {d}/{t} hosts"))
+        w.done.connect(self._detect_done)
+        self._start(w)
+
+    def _detect_done(self, ips: List[str]):
+        self._detected_ips = ips
+        self._busy = False
+        n = len(ips)
+        self._stage_status.setText(
+            f"Detected {n} camera{'s' if n != 1 else ''}: " + ", ".join(ips) if ips
+            else "No cameras responded on port 9998 in that range.")
+        self._log(f"Detect: {n} responder(s)")
+        self._update_gates()
+
+    # -- stage 2: connect -------------------------------------------------------
+    def _on_connect(self):
+        if not self._detected_ips:
+            return
+        self._busy = True
+        self._stage_status.setText(f"Opening RCP2 sessions to {len(self._detected_ips)} camera(s) …")
+        self._log("Connect: opening one session per camera")
+        w = _CaptureConnectWorker(self.array, self._detected_ips)
+        w.one.connect(lambda ip, ok, err: self._log(
+            f"  {ip}: {'connected' if ok else 'FAILED — ' + err}"))
+        w.done.connect(self._connect_done)
+        self._start(w)
+
+    def _connect_done(self, res: dict):
+        self._busy = False
+        ok = sum(1 for v in res.values() if v)
+        self._stage_status.setText(f"Connected {ok}/{len(res)} camera(s).")
+        self._log(f"Connect: {ok}/{len(res)} up")
+        self._update_gates()
+
+    # -- stage 3: frame limit ---------------------------------------------------
+    def _on_frame_limit(self):
+        if not self.array.links:
+            return
+        self._busy = True
+        self._stage_status.setText("Setting frame limit = 1 on all cameras …")
+        self._log("Frame-limit: enabling FRAME_LIMIT_ENABLE, FRAME_LIMIT_FRAMES=1")
+        w = _CaptureFrameLimitWorker(self.array, 1)
+        w.done.connect(self._frame_done)
+        self._start(w)
+
+    def _frame_done(self, res: dict):
+        self._busy = False
+        ok = sum(1 for v in res.values() if v)
+        bad = [k for k, v in res.items() if not v]
+        self._stage_status.setText(
+            f"Frame limit = 1 confirmed on {ok}/{len(res)}."
+            + (f"  Unconfirmed: {', '.join(bad)}" if bad else ""))
+        self._log(f"Frame-limit: {ok}/{len(res)} confirmed")
+        self._update_gates()
+
+    # -- stage 4: verify sync ---------------------------------------------------
+    def _on_verify(self):
+        rep = self.array.verify_sync()
+        self._last_sync = rep
+        if rep.in_sync:
+            self._stage_status.setText(
+                f"✓  In sync — reference {rep.reference_tc}, spread {rep.spread_seconds}s.")
+            self._log(f"Verify: IN SYNC (ref {rep.reference_tc}, spread {rep.spread_seconds}s)")
+        else:
+            self._stage_status.setText("✗  Not in sync — " + "; ".join(rep.problems[:4]))
+            self._log("Verify: NOT in sync — " + "; ".join(rep.problems))
+        self._update_gates()
+
+    # -- CAPTURE ----------------------------------------------------------------
+    def _on_capture(self):
+        self._busy = True
+        self._captured = False
+        self._clips = {}
+        self._stage_status.setText("Arming sync-record roll …")
+        self._log("CAPTURE: reading reference TC, arming SYNC_RECORD_START")
+        w = _CaptureRollWorker(self.array, capture_mod.DEFAULT_ROLL_LEAD)
+        w.rolled.connect(self._rolled)
+        w.captured.connect(self._capture_finished)
+        self._start(w)
+
+    def _rolled(self, ok: bool, msg: str, detail: dict):
+        self._log(f"Roll: {msg}  (target {detail.get('target_tc','?')})")
+        if detail.get("skipped"):
+            for lbl, why in detail["skipped"].items():
+                self._log(f"  ⚠ {lbl}: {why}")
+        self._stage_status.setText(msg)
+        if not ok and not detail.get("armed"):
+            self._busy = False
+            self._update_gates()
+
+    def _capture_finished(self, ok: bool, clips: dict):
+        self._busy = False
+        self._captured = True
+        self._clips = dict(clips)
+        if ok:
+            self._stage_status.setText(f"✓  Captured. {len(clips)} clip(s) written: "
+                                       + ", ".join(f"{k}={v}" for k, v in clips.items()))
+            self._log(f"CAPTURE done: {clips}")
+        else:
+            self._stage_status.setText(
+                "Roll sent; some bodies did not confirm return-to-idle in time — "
+                "check the table, then ingest or Cut as needed.")
+            self._log("CAPTURE: timeout waiting for all bodies to finalize")
+        self._update_gates()
+
+    def _on_cut(self):
+        ok, msg, detail = self.array.cut()
+        self._log(f"Cut: {msg}")
+        for wtext in detail.get("warnings", []):
+            self._log(f"  ⚠ {wtext}")
+        self._stage_status.setText(msg)
+
+    # -- stage 6: ingest --------------------------------------------------------
+    def _on_pull(self):
+        dest = self._dest.text().strip()
+        if not dest:
+            self._stage_status.setText("Choose a destination folder first.")
+            return
+        if not self._ftp_ready():
+            self._stage_status.setText("FTP credentials not set — configure them in Settings → Capture.")
+            return
+        cameras = {label: link.ip for label, link in self.array.links.items()}
+        if not cameras:
+            self._stage_status.setText("No connected cameras to pull from.")
+            return
+        self._persist()
+        self._busy = True
+        self._pull_status = {}
+        self._stage_status.setText(f"Ingesting {len(cameras)} clip(s) → {dest} …")
+        self._log(f"Ingest: pulling captured clip from {len(cameras)} camera(s)")
+        w = _CapturePullWorker(cameras, dest, self.state.ftp_user, self.state.ftp_pass,
+                               self.state.ftp_port, self._clips)
+        w.one.connect(self._pull_one)
+        w.done.connect(self._pull_done)
+        w.failed.connect(self._pull_failed)
+        self._start(w)
+
+    def _pull_one(self, r):
+        if r.ok:
+            self._pull_status[r.label] = "done"
+            self._log(f"  {r.label}: {r.clip} — {r.files} file(s), {_human(r.bytes)}"
+                      + ("  ✓verified" if r.verified else ""))
+        else:
+            self._pull_status[r.label] = "error"
+            self._log(f"  {r.label}: FAILED — {r.error}")
+
+    def _pull_done(self, results: list):
+        self._busy = False
+        ok = sum(1 for r in results if r.ok)
+        self._stage_status.setText(f"Ingest complete — {ok}/{len(results)} clip(s) pulled.")
+        self._log(f"Ingest done: {ok}/{len(results)}")
+        self._update_gates()
+
+    def _pull_failed(self, err: str):
+        self._busy = False
+        self._stage_status.setText(f"Ingest failed: {err}")
+        self._log(f"Ingest error: {err}")
+        self._update_gates()
+
+    def _on_disconnect(self):
+        self.array.close()
+        self._detected_ips = []
+        self._clips = {}
+        self._captured = False
+        self._last_sync = None
+        self._pull_status = {}
+        self._stage_status.setText("Disconnected. All sessions closed.")
+        self._log("Disconnected all cameras (graceful close).")
+        self._table.setRowCount(0)
+        self._update_gates()
+
+    # -- worker plumbing --------------------------------------------------------
+    def _start(self, w: QThread):
+        self._workers.append(w)
+        w.finished.connect(lambda: self._reap(w))
+        self._update_gates()
+        w.start()
+
+    def _reap(self, w: QThread):
+        try:
+            self._workers.remove(w)
+        except ValueError:
+            pass
+        w.deleteLater()
+
+    # -- live refresh + gating --------------------------------------------------
+    def _refresh(self):
+        snaps = self.array.snapshots()
+        # Live sync readout while connected (does not overwrite an explicit verdict
+        # mid-operation).
+        if snaps and not self._busy:
+            self._last_sync = self.array.verify_sync()
+        self._populate_table(snaps)
+        self._update_gates()
+
+    def _populate_table(self, snaps: Dict[str, "capture_mod.LinkState"]):
+        labels = sorted(snaps.keys())
+        self._table.setRowCount(len(labels))
+        for row, label in enumerate(labels):
+            s = snaps[label]
+            conn = ("stale" if s.stale else "up") if s.connected else "—"
+            conn_c = WARNING if s.stale else (SUCCESS if s.connected else TEXT_DIM)
+            rec = capture_mod.RECORD_STATES.get(s.record_state, "—") if s.record_state is not None else "—"
+            frm = ("✓" if (s.frame_limit_enable and s.frame_limit_frames == 1) else "—")
+            frm_c = SUCCESS if frm == "✓" else TEXT_DIM
+            sync_txt = s.sync_state or "—"
+            pull = self._pull_status.get(label, "")
+            pull_txt = {"done": "✓", "error": "✗"}.get(pull, "")
+            pull_c = SUCCESS if pull == "done" else (DANGER if pull == "error" else TEXT_DIM)
+            cells = [
+                (label, TEXT_PRIMARY), (s.ip, TEXT_MUTED),
+                (conn, conn_c), (s.timecode or "—", TEXT_PRIMARY),
+                (rec, TEXT_MUTED), (frm, frm_c), (sync_txt, TEXT_MUTED),
+                (s.clip_name or self._clips.get(label, "—") or "—", TEXT_MUTED),
+                (pull_txt, pull_c),
+            ]
+            for col, (text, color) in enumerate(cells):
+                item = QTableWidgetItem(str(text))
+                item.setForeground(QColor(color))
+                self._table.setItem(row, col, item)
+
+    def _update_gates(self):
+        busy = self._busy
+        snaps = self.array.snapshots()
+        live = [s for s in snaps.values() if s.connected and not s.stale]
+        n_live = len(live)
+        frame_ok = n_live > 0 and all(
+            s.frame_limit_enable and s.frame_limit_frames == 1 for s in live)
+        sync_ok = bool(self._last_sync and self._last_sync.in_sync)
+        capture_ready = (not busy) and n_live > 0 and frame_ok and sync_ok
+
+        self._btn_detect.setEnabled(not busy)
+        self._btn_connect.setEnabled(not busy and bool(self._detected_ips))
+        self._btn_frame.setEnabled(not busy and n_live > 0)
+        self._btn_verify.setEnabled(not busy and n_live > 0)
+        self._btn_capture.setEnabled(capture_ready)
+        self._btn_cut.setEnabled(not busy and n_live > 0)
+        self._btn_disconnect.setEnabled(not busy and bool(snaps))
+        self._btn_pull.setEnabled(
+            not busy and self._captured and self._ftp_ready() and bool(self._dest.text().strip()))
+
+        # Headline reflects the gate the operator is waiting on.
+        if busy:
+            tip = "Working …"
+        elif n_live == 0:
+            tip = "Detect and connect cameras to begin."
+        elif not frame_ok:
+            tip = "Set frame limit = 1 on all cameras to arm capture."
+        elif not sync_ok:
+            tip = "Verify the array is in sync to arm capture."
+        elif not self._captured:
+            tip = "Ready — press CAPTURE."
+        elif not self._ftp_ready():
+            tip = "Captured. Set FTP credentials in Settings to ingest."
+        else:
+            tip = "Captured — press Ingest to pull the clip."
+        self._headline.setText(tip)
+
+
+def _human(nbytes: int) -> str:
+    n = float(nbytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{nbytes} B"
+
+
+def capture_mod_default_cidr() -> str:
+    """Best-guess default scan range: the app's stage default."""
+    return DEFAULT_CAMERA_CIDR
+
+
 # ── Screen 6: Settings ────────────────────────────────────────────────────────
 
 class SettingsScreen(QWidget):
@@ -3219,6 +3802,43 @@ class SettingsScreen(QWidget):
         out_lay.addLayout(out_row)
 
         root.addWidget(out_card)
+
+        # ── Capture / FTP ingest section ─────────────────────────────────────
+        cap_card = QWidget()
+        cap_card.setStyleSheet(
+            f"background:{CARD_BG};border-radius:8px;"
+            f"border:1px solid {BORDER_COLOR};")
+        cap_lay = QVBoxLayout(cap_card)
+        cap_lay.setContentsMargins(20, 16, 20, 16)
+        cap_lay.setSpacing(10)
+        cap_lay.addWidget(_label("Capture — FTP Ingest", bold=True))
+        cap_lay.addWidget(_label(
+            "Credentials for pulling captured clips off the RED bodies (FTP-over-TLS). "
+            "These are never assumed — the Capture tab keeps ingest disabled until they are set.",
+            color=TEXT_MUTED, size=11))
+
+        cred_row = QHBoxLayout(); cred_row.setSpacing(8)
+        cred_row.addWidget(_label("User", size=12))
+        self._ftp_user = QLineEdit()
+        self._ftp_user.setStyleSheet(_field_style())
+        self._ftp_user.setText(state.ftp_user)
+        self._ftp_user.setPlaceholderText("ftp username")
+        cred_row.addWidget(self._ftp_user, 1)
+        cred_row.addWidget(_label("Password", size=12))
+        self._ftp_pass = QLineEdit()
+        self._ftp_pass.setStyleSheet(_field_style())
+        self._ftp_pass.setText(state.ftp_pass)
+        self._ftp_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        self._ftp_pass.setPlaceholderText("ftp password")
+        cred_row.addWidget(self._ftp_pass, 1)
+        cred_row.addWidget(_label("Port", size=12))
+        self._ftp_port = QLineEdit()
+        self._ftp_port.setStyleSheet(_field_style(mono=True))
+        self._ftp_port.setText(state.ftp_port or "21")
+        self._ftp_port.setFixedWidth(64)
+        cred_row.addWidget(self._ftp_port, 0)
+        cap_lay.addLayout(cred_row)
+        root.addWidget(cap_card)
 
         # ── Validation / diagnostic flags ────────────────────────────────────
         val_card = QWidget()
@@ -3317,10 +3937,19 @@ class SettingsScreen(QWidget):
     def _save(self):
         self.state.redline_path    = self._rl_path.text().strip()
         self.state.default_out_dir = self._out_path.text().strip()
-        save_settings({
+        self.state.ftp_user        = self._ftp_user.text().strip()
+        self.state.ftp_pass        = self._ftp_pass.text()
+        self.state.ftp_port        = self._ftp_port.text().strip() or "21"
+        # Preserve capture keys set from the Capture tab (dest/cidr).
+        merged = load_settings()
+        merged.update({
             "redline_path":    self.state.redline_path,
             "default_out_dir": self.state.default_out_dir,
+            "ftp_user":        self.state.ftp_user,
+            "ftp_pass":        self.state.ftp_pass,
+            "ftp_port":        self.state.ftp_port,
         })
+        save_settings(merged)
         self._save_status.setStyleSheet(f"color:#34d399;font-size:12px;")
         self._save_status.setText("Saved.")
 
@@ -3333,6 +3962,7 @@ TABS = [
     ("Push",           4),
     ("Camera Network", 5),
     ("Settings",       6),
+    ("Capture",        7),
 ]
 
 
@@ -3353,9 +3983,11 @@ class MainWindow(QMainWindow):
         self._push     = PushScreen(self.state)
         self._network  = CameraNetworkScreen(self.state)
         self._settings = SettingsScreen(self.state)
+        self._capture  = CaptureScreen(self.state)
 
         for s in (self._setup, self._progress, self._qc,
-                  self._results, self._push, self._network, self._settings):
+                  self._results, self._push, self._network, self._settings,
+                  self._capture):
             self._stack.addWidget(s)
 
         self._setup.run_requested.connect(self._start_analysis)
@@ -3466,6 +4098,7 @@ class MainWindow(QMainWindow):
                 f"QPushButton:checked{{color:{TEXT_PRIMARY};background:{CARD_BG};"
                 f"border:1px solid {BORDER_COLOR};border-left:3px solid {ACCENT};}}")
             btn.clicked.connect(lambda _, i=idx: self._go(i))
+            btn._screen_idx = idx
             return btn
 
         self._tab_btns: List[QPushButton] = []
@@ -3476,6 +4109,11 @@ class MainWindow(QMainWindow):
             btn = _nav_btn(num, name, idx)
             rl.addWidget(btn)
             self._tab_btns.append(btn)
+
+        rl.addWidget(_section("Capture"))
+        cap_btn = _nav_btn("◉", "Capture", 7)
+        rl.addWidget(cap_btn)
+        self._tab_btns.append(cap_btn)
 
         rl.addWidget(_section("System"))
         for num, name, idx in [("◈", "Cameras", 5), ("⚙", "Settings", 6)]:
@@ -3504,8 +4142,8 @@ class MainWindow(QMainWindow):
 
     def _go(self, idx: int):
         self._stack.setCurrentIndex(idx)
-        for i, btn in enumerate(self._tab_btns):
-            btn.setChecked(i == idx)
+        for btn in self._tab_btns:
+            btn.setChecked(getattr(btn, "_screen_idx", -1) == idx)
 
     def _go_push(self):
         self._push.populate()
@@ -3567,6 +4205,15 @@ class MainWindow(QMainWindow):
         self._progress.on_error(msg)
         QMessageBox.critical(self, "Analysis Failed",
                              f"Pipeline error:\n\n{msg[:500]}")
+
+    def closeEvent(self, ev):
+        # Gracefully close any open capture sessions so the camera session pool
+        # is freed on exit (RCP2_FIELD_NOTES rule 3).
+        try:
+            self._capture.array.close()
+        except Exception:
+            pass
+        super().closeEvent(ev)
 
 
 # ── Dark palette ──────────────────────────────────────────────────────────────

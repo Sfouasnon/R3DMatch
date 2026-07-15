@@ -16,6 +16,16 @@ Keys:
                                  Empty string means "use auto-discovery"
     default_out_dir str | ""  — default output folder for new runs
                                  Empty string means "derive from input path"
+
+    Capture / FTP ingest (Capture tab). Credentials are NEVER assumed — an empty
+    value means "not configured" and the Capture tab blocks the pull step until
+    the operator fills them in:
+    ftp_user       str | ""   — FTP username on the camera bodies
+    ftp_pass       str | ""   — FTP password
+    ftp_port       str | "21" — FTP control port (stored as string)
+    capture_dest   str | ""   — default local destination for pulled clips
+    capture_cidr   str | ""   — preferred CIDR to scan for cameras (optional;
+                                 blank falls back to auto interface discovery)
 """
 from __future__ import annotations
 
@@ -33,6 +43,12 @@ _SETTINGS_PATH = _SETTINGS_DIR / "settings.json"
 _DEFAULTS: Dict[str, str] = {
     "redline_path":    "",
     "default_out_dir": "",
+    # Capture / FTP ingest — blank means "not configured" (never assumed).
+    "ftp_user":        "",
+    "ftp_pass":        "",
+    "ftp_port":        "21",
+    "capture_dest":    "",
+    "capture_cidr":    "",
 }
 
 
