@@ -75,7 +75,7 @@ def build_report(run_result: RunResult, out_dir: str) -> str:
 def _render_html(rr: RunResult) -> str:
     run_name = rr.run_id
     run_date = rr.created_at[:10] if rr.created_at else "—"
-    strategy = rr.anchor_source or "Median"
+    strategy = _strategy_label(rr)
 
     # Camera pages sorted alphabetically by camera_label (G007_A → G007_B → ... → I007_D).
     # The overview summary table retains its own status/adj sort independently.
@@ -1183,7 +1183,7 @@ def _render_array_comparison(rr: RunResult, cameras: list, run_name: str) -> str
   <div style="background:#ffffff;border:1px solid #ddd9d3;border-radius:10px;overflow:hidden;margin-bottom:10px;">
     <div class="panel-head">
       <div class="panel-title">IRE Convergence &mdash; Raw vs Calibrated &nbsp;&middot;&nbsp; All {n} Cameras</div>
-      <div class="panel-sub">Anchor: {anchor:.1f}&nbsp;IRE &nbsp;&middot;&nbsp; Strategy: {rr.anchor_source or 'median'} &nbsp;&middot;&nbsp; Acceptance zone: &plusmn;{ACCEPT_IRE:g}&nbsp;IRE</div>
+      <div class="panel-sub">Anchor: {anchor:.1f}&nbsp;IRE &nbsp;&middot;&nbsp; Strategy: {_strategy_label(rr)} &nbsp;&middot;&nbsp; Acceptance zone: &plusmn;{ACCEPT_IRE:g}&nbsp;IRE</div>
     </div>
     <div class="panel-body" style="padding:12px 14px;">
       {svg_html}
@@ -1505,7 +1505,7 @@ def _render_camera_page(cr: CameraResult, rr: RunResult, page_num: int) -> str:
       {anchor_html}
       <div class="hd-cam">{cr.camera_label}</div>
       <div class="hd-clip">{clip_name}</div>
-      <div class="hd-project">REDLine IPP2 / BT.709 / BT.1886 / Medium / Medium<br>Exposure anchor: {rr.anchor_source or 'Median'}</div>
+      <div class="hd-project">REDLine IPP2 / BT.709 / BT.1886 / Medium / Medium<br>Exposure anchor: {_strategy_label(rr)}</div>
     </div>
     {hd_right}
   </div>
@@ -2154,6 +2154,17 @@ def _anchor_ire(rr: RunResult) -> float:
         return float(getattr(rr, "anchor_ire", 36.4))
     except Exception:
         return 36.4
+
+
+def _strategy_label(rr: RunResult) -> str:
+    """Human-facing exposure-strategy name for the report."""
+    src = getattr(rr, "anchor_source", "") or "median"
+    if src == "gray_anchor":
+        gt = getattr(rr, "gray_target_ire", 0.0) or 33.3
+        return f"18% Gray Anchor ({gt:.1f} IRE Log3G10)"
+    if src == "median":
+        return "Median"
+    return src
 
 
 def _corrected_ire_for(cr: CameraResult, ire: Optional[float], adj: float) -> Tuple[Optional[float], bool]:

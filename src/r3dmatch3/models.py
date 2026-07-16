@@ -268,6 +268,7 @@ class CameraResult:
     original_render_path: Optional[str] = None
     corrected_render_path: Optional[str] = None
     linear_render_path: Optional[str] = None   # scene-linear render (exposure solve / QC re-measure)
+    linear_render_error: Optional[str] = None  # populated iff the required scene-linear render failed
 
     # Failure info
     failed_stage: str = ""
@@ -293,6 +294,7 @@ class RunResult:
     anchor_ire: float = 0.0
     anchor_log2: float = 0.0
     anchor_source: str = "median"
+    gray_target_ire: float = 0.0   # gray_anchor: Log3G10 IRE target (e.g. 33.3)
 
     # Overall assessment — match percentage, never FAIL
     assessment_status: str = "PENDING"      # "SOLVED" | "PARTIAL" | "NO_SOLVE"

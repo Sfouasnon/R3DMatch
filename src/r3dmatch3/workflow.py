@@ -41,6 +41,7 @@ from .models import (
 from .redline import (
     read_clip_metadata,
     render_measurement_frame,
+    render_measurement_frame_retried,
     resolve_redline_executable,
     check_redline_available,
     _resolve_output_path,
@@ -55,6 +56,7 @@ from .solve import (
     solve_white_balance,
     verify_wb_closed_loop,
     wb_match_pct,
+    GRAY_ANCHOR_IRE_LOG3G10,
 )
 from .colorpipeline import ColorPipeline, SCENE_LINEAR_PIPELINE
 from .match_export import write_match_export
@@ -156,6 +158,8 @@ def run_analysis(
     disable_priors: bool = False,
     delivery_pipeline: Optional[ColorPipeline] = None,
     wb_mode: str = "match",
+    strategy: str = "median",
+    gray_target_ire: float = GRAY_ANCHOR_IRE_LOG3G10,
 ) -> RunResult:
     """
     Full R3DMatch analysis run.
@@ -268,21 +272,29 @@ def run_analysis(
             slot["render_status"] = render_result.get("status", "OK")
 
         # Scene-linear render for the EXPOSURE solve (separate from the display
-        # reference render above). Best-effort: if it fails, exposure falls back
-        # to the display-space solve. Never blocks the run.
+        # reference render above). REQUIRED: the exposure solve runs in
+        # scene-linear for accuracy, so a persistent failure here is recorded and
+        # the run hard-fails at the solve boundary rather than silently degrading.
+        # Retried to absorb transient GPU/IO contention under parallel rendering.
         try:
             lin_out = measurement_dir / f"{clip_id}.linear.measurement.tiff"
             lin_actual = _resolve_output_path(str(lin_out))
             if reuse_renders and lin_actual.exists() and lin_actual.stat().st_size > 10_000:
                 slot["linear_render_path"] = str(lin_actual)
             else:
-                lin_result = render_measurement_frame(
+                lin_result = render_measurement_frame_retried(
                     str(clip_path), str(lin_out), redline=redline,
                     frame_index=0, use_as_shot=True, pipeline=SCENE_LINEAR_PIPELINE,
                 )
                 if lin_result.get("ok"):
                     slot["linear_render_path"] = lin_result["output_path"]
+                else:
+                    slot["linear_render_error"] = (
+                        f"{lin_result.get('status', 'RENDER_ERROR')}: "
+                        f"{lin_result.get('stderr', '')}"[:400]
+                    )
         except Exception as exc:
+            slot["linear_render_error"] = f"exception: {exc}"[:400]
             log.warning("Scene-linear render failed for %s: %s", clip_id, exc)
 
         return slot
@@ -437,6 +449,7 @@ def run_analysis(
         render_actual = Path(slot["render_path"])
         result.original_render_path = str(render_actual)
         result.linear_render_path = slot.get("linear_render_path")
+        result.linear_render_error = slot.get("linear_render_error")
 
         # --- 3c: Sphere detection ---
         prog.emit("clip_detect", pct=pct_base + 1,
@@ -661,11 +674,32 @@ def run_analysis(
         prog.emit("error", pct=76, detail="No valid measurements — cannot solve", error=True)
         raise ValueError("No valid measurements produced. Check sphere detection.")
 
-    target_log2, target_ire, spread, per_clip_exp_offsets = solve_exposure(valid_measurements)
-    _n_lin = sum(1 for m in valid_measurements if getattr(m, "hero_log2_lin", None) is not None)
-    _exp_space = ("scene-linear" if _n_lin == len(valid_measurements)
-                  else f"DISPLAY fallback ({len(valid_measurements) - _n_lin} missing linear)")
-    prog.emit("solve_exposure", pct=78, detail=f"Target: {target_ire:.1f} IRE — {_exp_space}")
+    # Hard requirement: exposure is solved in scene-linear for accuracy, so every
+    # valid camera must carry a scene-linear measurement. A display render that
+    # succeeded but whose (retried) linear render did not is an abort, not a
+    # silent downgrade to the display-space solve.
+    _missing_lin = [
+        r for r in camera_results
+        if r.measurement and r.measurement.measurement_valid
+        and getattr(r.measurement, "hero_log2_lin", None) is None
+    ]
+    if _missing_lin:
+        _lines = []
+        for r in _missing_lin:
+            why = r.linear_render_error or "linear measurement unavailable"
+            _lines.append(f"{r.clip_id}: {why}")
+        detail = ("Scene-linear render missing for "
+                  f"{len(_missing_lin)} camera(s); cannot solve exposure accurately.")
+        prog.emit("error", pct=76, detail=detail, error=True)
+        raise RuntimeError(detail + " Details:\n  " + "\n  ".join(_lines))
+
+    target_log2, target_ire, spread, per_clip_exp_offsets = solve_exposure(
+        valid_measurements, strategy=strategy, gray_target_ire=gray_target_ire)
+    if strategy == "gray_anchor":
+        prog.emit("solve_exposure", pct=78,
+                  detail=f"Anchor: {gray_target_ire:.1f} IRE Log3G10 (18% gray) — scene-linear")
+    else:
+        prog.emit("solve_exposure", pct=78, detail=f"Target: {target_ire:.1f} IRE — scene-linear")
 
     # WB solve
     prog.emit("solve_wb", pct=79, detail="Computing white balance model")
@@ -700,15 +734,23 @@ def run_analysis(
         )
 
     # --- Phase 5: Corrected renders + verification ---
+    _consensus_log2 = None
     if render_corrected:
-        wb_result = _closed_loop_phase(
+        wb_result, _consensus_log2 = _closed_loop_phase(
             camera_results,
             target_log2=target_log2,
             wb_result=wb_result,
             previews_dir=previews_dir,
             redline=redline,
             delivery_pipeline=delivery_pipeline,
+            score_vs_consensus=(strategy == "gray_anchor"),
         )
+    # For the absolute-gray anchor, the true DISPLAY anchor is only knowable from
+    # the corrected renders (it depends on the display transform). Adopt the
+    # measured corrected consensus as the reported anchor when available.
+    if _consensus_log2 is not None:
+        target_log2 = float(_consensus_log2)
+        target_ire = float((2.0 ** target_log2) * 100.0)
 
     # --- Phase 6: Match scoring (there is no FAIL) ---
     prog.emit("assessing", pct=94, detail="Computing match percentages")
@@ -730,7 +772,8 @@ def run_analysis(
         wb_solve=wb_result,
         anchor_ire=target_ire,
         anchor_log2=target_log2,
-        anchor_source="median",
+        anchor_source=strategy,
+        gray_target_ire=gray_target_ire,
         assessment_status=assessment["assessment_status"],
         array_match_pct=assessment["array_match_pct"],
         min_match_pct=assessment["min_match_pct"],
@@ -787,9 +830,24 @@ def _closed_loop_phase(
     previews_dir: Path,
     redline: str,
     delivery_pipeline: Optional[ColorPipeline] = None,
+    score_vs_consensus: bool = False,
 ):
     """Render corrected frames, measure them, score per-camera match axes.
-    Mutates camera_results in place; returns the (mutated) wb_result.
+    Mutates camera_results in place.
+
+    Returns (wb_result, consensus_log2):
+      wb_result      — the (mutated) WB solve result.
+      consensus_log2 — display-referred median log2 of the corrected renders when
+                       score_vs_consensus is set, else None.
+
+    Exposure scoring:
+      Default — each corrected camera is scored against the fixed target_log2
+                (the median strategy; unchanged, golden-anchored).
+      score_vs_consensus — exposure is scored against the corrected-array median
+                (transform-exact), mirroring the WB and delivery consensus paths.
+                Used by the absolute-gray anchor, where every camera is driven to
+                the same scene-linear value and the true display anchor is only
+                knowable from the corrected renders.
 
     If delivery_pipeline is provided (and not the reference pipeline), each
     corrected frame is ALSO rendered through that pipeline and measured in the
@@ -827,11 +885,15 @@ def _closed_loop_phase(
                 corrected_meas = measure_render(
                     str(corrected_actual), roi, clip_id=cr.clip_id
                 )
-                residual = exposure_residual_stops(corrected_meas.hero_ire, target_log2)
                 cr.exposure_closed_loop_status = "VERIFIED"
                 cr.corrected_ire = corrected_meas.hero_ire
-                cr.corrected_exposure_residual_stops = residual
-                cr.exposure_match_pct = exposure_match_pct(residual)
+                if not score_vs_consensus:
+                    # Fixed-target scoring (median strategy) — unchanged.
+                    residual = exposure_residual_stops(corrected_meas.hero_ire, target_log2)
+                    cr.corrected_exposure_residual_stops = residual
+                    cr.exposure_match_pct = exposure_match_pct(residual)
+                # score_vs_consensus: exposure residual/match set after the loop,
+                # once the corrected-array median is known.
                 # WB closed loop: capture measured WC/GM from the same render
                 if corrected_meas.measurement_valid:
                     wc_c, gm_c = compute_wc_gm(corrected_meas.measured_rgb_mean)
@@ -870,6 +932,26 @@ def _closed_loop_phase(
         prog.emit("corrected_render_done", pct=pct, detail=f"{cr.clip_id} corrected",
                   clip_id=cr.clip_id)
 
+    # Exposure closed-loop assessment for the absolute-gray anchor: score each
+    # camera against the MEASURED corrected-array median (transform-exact). All
+    # cameras were driven to the same scene-linear value, so this median is the
+    # true display anchor; residuals reflect real convergence + render jitter.
+    consensus_log2 = None
+    if score_vs_consensus:
+        corr_log2 = [
+            float(np.log2(max(cr.corrected_ire / 100.0, 1e-6)))
+            for cr in camera_results
+            if cr.is_usable() and cr.corrected_ire and cr.corrected_ire > 0
+        ]
+        if corr_log2:
+            consensus_log2 = float(np.median(corr_log2))
+            for cr in camera_results:
+                if not (cr.is_usable() and cr.corrected_ire and cr.corrected_ire > 0):
+                    continue
+                resid = abs(float(np.log2(max(cr.corrected_ire / 100.0, 1e-6))) - consensus_log2)
+                cr.corrected_exposure_residual_stops = resid
+                cr.exposure_match_pct = exposure_match_pct(resid)
+
     # WB closed-loop assessment: re-gate on MEASURED spread from the
     # corrected renders (solve-time spread_after is only a prediction).
     corrected_wc_gm = {
@@ -898,7 +980,7 @@ def _closed_loop_phase(
         if not cr.is_usable():
             continue
         cr.wb_closed_loop_status = wb_result.status
-    return wb_result
+    return wb_result, consensus_log2
 
 
 def _finalize_delivery(
@@ -983,14 +1065,19 @@ def verify_run(run_result: RunResult, redline_path: str = "",
     previews_dir = out_root / "previews"
     previews_dir.mkdir(parents=True, exist_ok=True)
 
-    run_result.wb_solve = _closed_loop_phase(
+    _gray_anchor = (run_result.anchor_source == "gray_anchor")
+    run_result.wb_solve, _consensus_log2 = _closed_loop_phase(
         run_result.cameras,
         target_log2=run_result.anchor_log2,
         wb_result=run_result.wb_solve,
         previews_dir=previews_dir,
         redline=redline,
         delivery_pipeline=delivery_pipeline,
+        score_vs_consensus=_gray_anchor,
     )
+    if _consensus_log2 is not None:
+        run_result.anchor_log2 = float(_consensus_log2)
+        run_result.anchor_ire = float((2.0 ** _consensus_log2) * 100.0)
 
     _finalize_delivery(run_result, delivery_pipeline)
 

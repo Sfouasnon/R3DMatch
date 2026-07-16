@@ -24,6 +24,7 @@ from .solve import (
     build_commit_values,
     solve_exposure,
     solve_white_balance,
+    GRAY_ANCHOR_IRE_LOG3G10,
 )
 from .sphere_profile import (
     load_project_profile,
@@ -198,10 +199,23 @@ def remeasure_cameras(
         _cb("qc_error", "No valid measurements — cannot re-solve")
         return run_result
 
-    target_log2, target_ire, spread, per_clip_exp = solve_exposure(valid)
-    _n_lin = sum(1 for m in valid if getattr(m, "hero_log2_lin", None) is not None)
-    _cb("qc_solve", f"Exposure re-solved — "
-        f"{'scene-linear' if _n_lin == len(valid) else f'DISPLAY fallback ({len(valid)-_n_lin} missing linear)'}")
+    # Preserve the run's exposure strategy across the QC re-solve (else the
+    # absolute-gray anchor would silently revert to median).
+    _strategy = getattr(run_result, "anchor_source", "median") or "median"
+    _gray_ire = getattr(run_result, "gray_target_ire", 0.0) or GRAY_ANCHOR_IRE_LOG3G10
+    # Exposure requires a scene-linear measurement per camera. The QC re-measure
+    # reuses the main-run linear render, so this only trips if a re-measured ROI
+    # couldn't produce a linear value — surface it rather than crashing the UI.
+    try:
+        if _strategy == "gray_anchor":
+            target_log2, target_ire, spread, per_clip_exp = solve_exposure(
+                valid, strategy="gray_anchor", gray_target_ire=_gray_ire)
+        else:
+            target_log2, target_ire, spread, per_clip_exp = solve_exposure(valid)
+    except ValueError as exc:
+        _cb("qc_error", f"Exposure re-solve failed: {exc}")
+        return run_result
+    _cb("qc_solve", "Exposure re-solved — scene-linear")
 
     as_shot_kelvins = {
         cr.clip_id: cr.metadata.kelvin

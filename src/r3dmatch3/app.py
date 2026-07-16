@@ -117,8 +117,11 @@ BG            = DARK_BG   # alias used in dialogs
 
 STRATEGIES = [
     ("median",      "Median  —  robust, prevents outlier distortion"),
-    ("optimal_ire", "Optimal IRE  —  target a specific gray level"),
+    ("gray_anchor", "18% Gray Anchor  —  absolute 33 IRE (Log3G10)"),
 ]
+
+# Default absolute-gray target, expressed as a Log3G10 IRE (18% gray = 33.3).
+GRAY_ANCHOR_DEFAULT_IRE = 33.3
 
 _RUN_ANALYSIS_PARAMS = set(inspect.signature(run_analysis).parameters.keys())
 
@@ -130,6 +133,7 @@ class AppState:
         self.input_path:   Optional[str]  = None
         self.out_dir:      Optional[str]  = None
         self.strategy:     str            = "median"
+        self.gray_target_ire: float       = GRAY_ANCHOR_DEFAULT_IRE
         self.disable_priors: bool         = False
         # Delivery look — must be explicitly chosen before each run.
         # None = reference-only; a ColorPipeline = score through that look too.
@@ -175,6 +179,7 @@ class AnalysisWorker(QThread):
         strategy: str,
         disable_priors: bool = False,
         wb_mode: str = "match",
+        gray_target_ire: float = GRAY_ANCHOR_DEFAULT_IRE,
     ):
         super().__init__()
         self.input_path = input_path
@@ -182,6 +187,7 @@ class AnalysisWorker(QThread):
         self.strategy   = strategy
         self.disable_priors = disable_priors
         self.wb_mode    = wb_mode
+        self.gray_target_ire = gray_target_ire
 
     def run(self):
         import io
@@ -224,6 +230,8 @@ class AnalysisWorker(QThread):
                 kwargs["strategy"] = self.strategy
             if "anchor_source" in _RUN_ANALYSIS_PARAMS:
                 kwargs["anchor_source"] = self.strategy
+            if "gray_target_ire" in _RUN_ANALYSIS_PARAMS:
+                kwargs["gray_target_ire"] = self.gray_target_ire
             if "disable_priors" in _RUN_ANALYSIS_PARAMS:
                 kwargs["disable_priors"] = self.disable_priors
             if "wb_mode" in _RUN_ANALYSIS_PARAMS:
@@ -857,6 +865,26 @@ class SetupScreen(QWidget):
         self._strat_desc.setStyleSheet(
             f"color:{TEXT_MUTED};background:transparent;border:none;font-size:11px;")
         v.addWidget(self._strat_desc)
+
+        # ── Gray-anchor target (Log3G10 IRE) — shown only for gray_anchor ──
+        self._gray_target_row = QWidget()
+        _gtl = QHBoxLayout(self._gray_target_row)
+        _gtl.setSpacing(8); _gtl.setContentsMargins(0, 4, 0, 0)
+        _gt_lbl = _label("Target IRE (Log3G10):", size=11, color=TEXT_MUTED)
+        _gt_lbl.setStyleSheet(
+            f"color:{TEXT_MUTED};background:transparent;border:none;font-size:11px;")
+        self._gray_target = QLineEdit()
+        self._gray_target.setText(f"{GRAY_ANCHOR_DEFAULT_IRE:g}")
+        self._gray_target.setPlaceholderText(f"{GRAY_ANCHOR_DEFAULT_IRE:g}")
+        self._gray_target.setFixedWidth(80)
+        self._gray_target.setStyleSheet(inset_field())
+        _gt_hint = _label("18% gray = 33.3", size=11, color=TEXT_DIM)
+        _gt_hint.setStyleSheet(
+            f"color:{TEXT_DIM};background:transparent;border:none;font-size:11px;")
+        _gtl.addWidget(_gt_lbl); _gtl.addWidget(self._gray_target)
+        _gtl.addWidget(_gt_hint); _gtl.addStretch(1)
+        v.addWidget(self._gray_target_row)
+
         self._on_strategy_changed(0)
 
         # ── Delivery look — explicit, required before each run ─────────────
@@ -978,10 +1006,13 @@ class SetupScreen(QWidget):
     def _on_strategy_changed(self, _index: int = 0):
         key = self._strategy.currentData()
         descs = {
-            "median": "Median of all camera IRE values — robust against outliers. Recommended for most multi-camera arrays.",
-            "optimal_ire": "Target a specific gray card IRE level. Use when you have a reference gray value from the gaffer.",
+            "median": "Median of all camera IRE values — robust against outliers. The array converges on its own centre. Recommended for most multi-camera arrays.",
+            "gray_anchor": "Absolute anchor: every camera is driven to the same 18% gray level (33.3 IRE in Log3G10 = 0.18 scene-linear), not to the array median. Solved in scene-linear, so the display/delivery transform is untouched. Set the target below if you're deliberately rating the sphere off 18%.",
         }
         self._strat_desc.setText(descs.get(key, ""))
+        # The Log3G10 IRE target only applies to the gray anchor.
+        if hasattr(self, "_gray_target_row"):
+            self._gray_target_row.setVisible(key == "gray_anchor")
 
     def _on_delivery_changed(self, _index: int = 0):
         choice = self._delivery_combo.currentData()
@@ -1066,6 +1097,16 @@ class SetupScreen(QWidget):
         self.state.input_path = ip
         self.state.out_dir    = od
         self.state.strategy   = st
+        # Parse the gray-anchor Log3G10 IRE target (default if blank/invalid).
+        gt = GRAY_ANCHOR_DEFAULT_IRE
+        try:
+            txt = self._gray_target.text().strip()
+            if txt:
+                gt = float(txt)
+        except (ValueError, AttributeError):
+            gt = GRAY_ANCHOR_DEFAULT_IRE
+        gt = max(0.1, min(100.0, gt))
+        self.state.gray_target_ire = gt
         self.run_requested.emit(ip, od, st)
 
 
@@ -4177,7 +4218,9 @@ class MainWindow(QMainWindow):
         self._progress.reset(ip)
         self._go(1)
         self._worker = AnalysisWorker(ip, od, st, disable_priors=self.state.disable_priors,
-                                      wb_mode=getattr(self.state, "wb_mode", "match"))
+                                      wb_mode=getattr(self.state, "wb_mode", "match"),
+                                      gray_target_ire=getattr(self.state, "gray_target_ire",
+                                                              GRAY_ANCHOR_DEFAULT_IRE))
         self._worker.progress.connect(self._progress.on_progress)
         self._worker.finished.connect(self._on_analysis_done)
         self._worker.errored.connect(self._on_analysis_error)

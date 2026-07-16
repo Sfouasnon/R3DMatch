@@ -54,12 +54,12 @@ OPTIONS = {
         "CFBundleName": "R3DMatch",
         "CFBundleDisplayName": "R3DMatch",
         "CFBundleIdentifier": "com.ilm.r3dmatch",
-        "CFBundleVersion": "4.0.0",
-        "CFBundleShortVersionString": "4.0.0",
+        "CFBundleVersion": "5.1.0",
+        "CFBundleShortVersionString": "5.1.0",
         "CFBundleIconFile": "R3DMatch.icns",
         "NSHighResolutionCapable": True,
         "LSMinimumSystemVersion": "11.0",
-        "NSHumanReadableCopyright": "ILM — R3DMatch v4",
+        "NSHumanReadableCopyright": "ILM — R3DMatch v5",
     },
 }
 

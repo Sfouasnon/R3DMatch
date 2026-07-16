@@ -1,4 +1,4 @@
-# R3DMatch v4
+# R3DMatch v5
 
 Multi-camera exposure & color alignment for RED KOMODO-X arrays.
 
@@ -61,7 +61,8 @@ r3dmatch                 # console entry point
 ## Workflow
 
 1. **Ingest** — point at the card folder (single frame R3D per camera). Choose the
-   matching strategy (Median is the robust default), the delivery look the
+   matching strategy (Median is the robust default; **18% Gray Anchor** targets an
+   absolute gray level — see *Matching strategies* below), the delivery look the
    match is scored through, and the white-balance mode (scene-temp per-camera
    Kelvin is recommended; **Exposure only** skips WB entirely).
 2. **Analyze** — renders each clip through REDLine, auto-solves the gray-sphere
@@ -79,6 +80,35 @@ The HTML report (written to the output folder) is the chain-of-custody document:
 an overview, the IRE-convergence chart, a before/after **Array Coherence**
 contact sheet, and a per-camera page with the measured closed-loop result. 
 Post renders with --useMeta to inherit the changes.
+
+---
+
+## Matching strategies
+
+The exposure solve offers two ways to choose the array's target level. Both solve
+per-camera `exposureAdjust` in scene-linear; they differ only in *what* the array
+is driven to.
+
+- **Median** (default) — the target is the robust inlier-median of the measured
+  cameras, so the array converges on its own center. Outlier-tolerant and
+  independent of any absolute reference; best for general multi-camera matching
+  where internal consistency is what matters.
+- **18% Gray Anchor** — an *absolute* target. Every camera is driven to a fixed
+  scene-linear reflectance rather than the array median. The level is named as a
+  **Log3G10 IRE** (default **33.3 IRE = 0.18 scene-linear = an 18% gray**), which
+  is the value a DIT reads on a waveform; it is editable on the Setup screen for
+  deliberately rating the sphere off 18%. The solve runs entirely in scene-linear,
+  so it never touches the display/delivery transform — Log3G10 is only the unit
+  the target is entered in. Use it when you need the array pinned to a known,
+  repeatable gray level (e.g. a gaffer's reference) rather than to itself.
+
+Because both solve in scene-linear, exposure requires a scene-linear measurement
+for every camera; a missing scene-linear render is retried and, if it still can't
+be produced, the run stops with a diagnostic rather than silently falling back to
+a less accurate display-space solve.
+
+The reported exposure anchor is shown in display IRE (BT.1886) — e.g. an 18% gray
+anchor lands near ~44 IRE through IPP2 — with the Log3G10 target noted alongside.
 
 ---
 

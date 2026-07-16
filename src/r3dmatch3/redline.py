@@ -452,6 +452,40 @@ def render_measurement_frame(
         }
 
 
+def render_measurement_frame_retried(
+    *args,
+    attempts: int = 3,
+    retry_backoff: float = 0.75,
+    **kwargs,
+) -> Dict[str, object]:
+    """Retry wrapper around render_measurement_frame.
+
+    A single measurement frame is cheap to transcode, and the common cause of a
+    failed render is transient GPU/IO contention (the run fires several REDLine
+    invocations in parallel). Retrying serially, with a small linear backoff,
+    recovers those transient misses. A persistent failure (corrupt frame, bad
+    flag) still fails after `attempts` and returns the last result so the caller
+    can hard-fail with a diagnostic.
+
+    render_measurement_frame itself is left untouched, so the reference/display
+    render path stays byte-identical when it is called directly.
+    """
+    result: Dict[str, object] = {}
+    for i in range(1, max(1, attempts) + 1):
+        result = render_measurement_frame(*args, **kwargs)
+        if result.get("ok"):
+            if i > 1:
+                log.info("REDLine render recovered on attempt %d/%d", i, attempts)
+            return result
+        if i < attempts:
+            log.warning(
+                "REDLine render attempt %d/%d failed (%s); retrying",
+                i, attempts, result.get("status"),
+            )
+            time.sleep(retry_backoff * i)
+    return result
+
+
 def _resolve_output_path(requested: str) -> Path:
     """
     REDLine appends ".000000.tif" to output paths.

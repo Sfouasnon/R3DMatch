@@ -42,6 +42,43 @@ from .models import (
 _OUTLIER_MAD_MULTIPLIER = 3.0            # exclude cameras > 3*MAD from median
 
 # ---------------------------------------------------------------------------
+# RED Log3G10 encoding — scene-linear reflectance <-> code value in [0, 1].
+#
+# Used by the "gray_anchor" exposure strategy. An 18% gray sphere encodes to
+# ~0.333 (33.3 IRE) in Log3G10, which is the human-facing target a DIT reads on
+# a waveform. The exposure SOLVE never runs in Log3G10 — it runs in scene-linear
+# (exposureAdjust is a scene-linear stop). Log3G10 is only the unit the target
+# is named in: we convert the entered IRE to a scene-linear reflectance once,
+# then anchor every camera to it. Constants are RED's published Log3G10 curve.
+#   Log3G10(0.18) = 0.224282 * log10((0.18 + 0.01) * 155.975327 + 1) = 0.3333
+# ---------------------------------------------------------------------------
+_LOG3G10_A = 0.224282
+_LOG3G10_B = 155.975327
+_LOG3G10_C = 0.01
+_LOG3G10_G = 15.1927                      # linear-segment slope below black
+
+
+def log3g10_from_linear(x: float) -> float:
+    """RED Log3G10 forward: scene-linear reflectance -> code value in [0, 1]."""
+    x = x + _LOG3G10_C
+    if x < 0.0:
+        return x * _LOG3G10_G
+    return _LOG3G10_A * math.log10(x * _LOG3G10_B + 1.0)
+
+
+def linear_from_log3g10(y: float) -> float:
+    """RED Log3G10 inverse: code value in [0, 1] -> scene-linear reflectance."""
+    if y < 0.0:
+        return (y / _LOG3G10_G) - _LOG3G10_C
+    return ((10.0 ** (y / _LOG3G10_A)) - 1.0) / _LOG3G10_B - _LOG3G10_C
+
+
+# Default absolute anchor for the gray_anchor strategy: an 18% gray sphere,
+# expressed as a Log3G10 IRE for the operator (0.18 lin -> ~33.3 IRE).
+GRAY_ANCHOR_LIN = 0.18
+GRAY_ANCHOR_IRE_LOG3G10 = 100.0 * log3g10_from_linear(GRAY_ANCHOR_LIN)
+
+# ---------------------------------------------------------------------------
 # Match scoring — noise-floor anchored
 #
 # There is no FAIL. Every solved camera gets a match percentage.
@@ -80,25 +117,57 @@ _KELVIN_SNAP_CANDIDATES = [3200, 4300, 5000, 5500, 5600, 5900, 6500]
 
 def solve_exposure(
     measurements: List[MeasurementResult],
+    *,
+    strategy: str = "median",
+    gray_target_ire: float = GRAY_ANCHOR_IRE_LOG3G10,
 ) -> Tuple[float, float, ExposureSpread, Dict[str, float]]:
     """
     Compute exposure target and per-camera offsets.
 
+    strategy:
+      "median"      (default, proven) — target = robust inlier-median of the
+                    measured cameras; the array converges on its own centre.
+                    Byte-identical to prior behaviour.
+      "gray_anchor" — absolute anchor. Every camera is driven to a fixed
+                    scene-linear reflectance (gray_target_ire, named as a
+                    Log3G10 IRE; default 33.3 IRE = 0.18 lin = 18% gray),
+                    independent of the array's own centre. The solve is done in
+                    scene-linear (exposureAdjust is a scene-linear stop), so it
+                    never touches any display transform. The returned display
+                    target is provisional — the closed loop re-derives the true
+                    display anchor from the corrected renders (transform-exact).
+
     Returns:
-      target_log2: float
-      target_ire: float
+      target_log2: float   (DISPLAY-referred, for scoring + report)
+      target_ire: float    (DISPLAY-referred)
       spread: ExposureSpread
-      per_clip_offsets: {clip_id: offset_stops}
+      per_clip_offsets: {clip_id: offset_stops}   (scene-linear stops)
     """
     valid = [m for m in measurements if m.measurement_valid]
     if not valid:
         raise ValueError("No valid measurements for exposure solve")
+
+    # Exposure is solved in scene-linear for both strategies. Every valid camera
+    # must carry a scene-linear measurement; there is no silent display-space
+    # fallback (it undershoots and hides accuracy loss). The workflow hard-fails
+    # earlier with per-clip detail — this guard also covers the QC re-solve path.
+    _missing = [m.clip_id for m in valid if getattr(m, "hero_log2_lin", None) is None]
+    if _missing:
+        raise ValueError(
+            "Exposure solve requires a scene-linear measurement for every camera; "
+            f"missing for: {', '.join(_missing)}"
+        )
 
     log2_values = np.array([m.hero_log2 for m in valid], dtype=np.float64)
     ire_values = np.array([m.hero_ire for m in valid], dtype=np.float64)
 
     median_log2 = float(np.median(log2_values))
     median_ire = float(np.median(ire_values))
+
+    if strategy == "gray_anchor":
+        return _solve_exposure_gray_anchor(
+            valid, log2_values, ire_values, median_log2, median_ire, gray_target_ire
+        )
 
     # Outlier detection via MAD
     mad = float(np.median(np.abs(log2_values - median_log2)))
@@ -118,29 +187,81 @@ def solve_exposure(
         outlier_clip_ids=outlier_clip_ids,
     )
 
-    # Per-camera exposureAdjust is a SCENE-LINEAR stop, so it must be solved in
+    # Per-camera exposureAdjust is a SCENE-LINEAR stop, so it is solved in
     # scene-linear: offset = log2(target_linear / measured_linear). Solving it in
     # display IRE (the non-linear IPP2 output) under-predicts the stops and the
-    # cameras land short of target. When every camera carries a scene-linear
-    # measurement (hero_log2_lin), use it; otherwise fall back to display-space.
-    # target_log2 / target_ire above stay DISPLAY-referred for scoring + report.
-    lin_log2 = [getattr(m, "hero_log2_lin", None) for m in valid]
-    if all(v is not None for v in lin_log2):
-        lin_arr = np.array(lin_log2, dtype=np.float64)
-        # Match cameras to the inlier-median scene-linear value (same inlier mask
-        # as the display target, for consistent outlier handling).
-        target_log2_lin = float(np.median(lin_arr[inlier_mask])) if inlier_mask.any() \
-            else float(np.median(lin_arr))
-        per_clip_offsets = {
-            m.clip_id: float(target_log2_lin - lv)
-            for m, lv in zip(valid, lin_log2)
-        }
-    else:
-        per_clip_offsets = {
-            m.clip_id: exposure_offset_stops(m.hero_log2, target_log2)
-            for m in valid
-        }
+    # cameras land short of target. Scene-linear measurements are guaranteed
+    # present by the guard above. target_log2 / target_ire stay DISPLAY-referred
+    # for scoring + report.
+    lin_log2 = [m.hero_log2_lin for m in valid]
+    lin_arr = np.array(lin_log2, dtype=np.float64)
+    # Match cameras to the inlier-median scene-linear value (same inlier mask
+    # as the display target, for consistent outlier handling).
+    target_log2_lin = float(np.median(lin_arr[inlier_mask])) if inlier_mask.any() \
+        else float(np.median(lin_arr))
+    per_clip_offsets = {
+        m.clip_id: float(target_log2_lin - lv)
+        for m, lv in zip(valid, lin_log2)
+    }
 
+    return target_log2, target_ire, spread, per_clip_offsets
+
+
+def _solve_exposure_gray_anchor(
+    valid: List[MeasurementResult],
+    log2_values: np.ndarray,
+    ire_values: np.ndarray,
+    median_log2: float,
+    median_ire: float,
+    gray_target_ire: float,
+) -> Tuple[float, float, ExposureSpread, Dict[str, float]]:
+    """Absolute-gray anchor exposure solve (see solve_exposure).
+
+    Anchors every camera to a fixed scene-linear reflectance derived from a
+    Log3G10 IRE target. Offsets are solved in scene-linear:
+        offset_stops = log2(target_lin / measured_lin)
+    which lands each camera exactly on the target (and therefore on the target
+    Log3G10 IRE). The display target returned here is a provisional estimate;
+    the closed loop measures the true display value from the corrected renders.
+    """
+    # Log3G10 IRE (0-100) -> scene-linear reflectance -> log2.
+    target_lin = max(linear_from_log3g10(gray_target_ire / 100.0), 1e-6)
+    target_log2_lin = math.log2(target_lin)
+
+    # Scene-linear measurements are guaranteed present by the guard in
+    # solve_exposure. Anchor every camera exactly to the target reflectance.
+    lin_log2 = [m.hero_log2_lin for m in valid]
+    median_lin = float(np.median(np.array(lin_log2, dtype=np.float64)))
+
+    # Provisional DISPLAY target: shift the measured display median by the same
+    # scene-linear stop delta the anchor applies. This is only a placeholder for
+    # scoring/report; the closed loop overrides it with the measured corrected
+    # consensus (transform-exact). Assumes ~unit display slope near mid-gray.
+    disp_target_log2 = median_log2 + (target_log2_lin - median_lin)
+
+    per_clip_offsets: Dict[str, float] = {
+        m.clip_id: float(target_log2_lin - lv)
+        for m, lv in zip(valid, lin_log2)
+    }
+
+    # Descriptive spread (same MAD outlier flagging as the median path).
+    mad = float(np.median(np.abs(log2_values - median_log2)))
+    threshold = mad * _OUTLIER_MAD_MULTIPLIER if mad > 0 else 0.5
+    outlier_clip_ids = [
+        valid[i].clip_id
+        for i in range(len(valid))
+        if abs(log2_values[i] - median_log2) > threshold
+    ]
+    spread = ExposureSpread(
+        median_ire=median_ire,
+        min_ire=float(np.min(ire_values)),
+        max_ire=float(np.max(ire_values)),
+        spread_stops=float(np.max(log2_values) - np.min(log2_values)),
+        outlier_clip_ids=outlier_clip_ids,
+    )
+
+    target_log2 = float(disp_target_log2)
+    target_ire = float((2.0 ** target_log2) * 100.0)
     return target_log2, target_ire, spread, per_clip_offsets
 
 

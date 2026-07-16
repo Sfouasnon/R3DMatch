@@ -85,22 +85,33 @@ def _camera_fingerprint(cam) -> dict:
     }
 
 
-def _run(input_path: str, out_dir: str, reuse: bool, disable_priors: bool) -> dict:
-    result = run_analysis(
-        input_path,
+def _run(input_path: str, out_dir: str, reuse: bool, disable_priors: bool,
+         strategy: str = "median", gray_target_ire: float = 33.3) -> dict:
+    kwargs = dict(
         out_dir=out_dir,
         reuse_renders=reuse,
         render_corrected=True,
         read_lens_metadata=True,
         disable_priors=disable_priors,
     )
+    # Thread strategy only if this build's run_analysis accepts it (keeps the
+    # harness usable against older checkouts).
+    import inspect
+    _params = inspect.signature(run_analysis).parameters
+    if "strategy" in _params:
+        kwargs["strategy"] = strategy
+    if "gray_target_ire" in _params:
+        kwargs["gray_target_ire"] = gray_target_ire
+    result = run_analysis(input_path, **kwargs)
     cams = sorted(result.cameras, key=lambda c: c.camera_label)
     return {
         "input_path": input_path,
         "priors_disabled": disable_priors,
+        "strategy": strategy,
         "assessment_status": result.assessment_status,
         "anchor_ire": result.anchor_ire,
         "anchor_log2": result.anchor_log2,
+        "anchor_source": getattr(result, "anchor_source", None),
         "shared_kelvin": result.wb_solve.shared_kelvin if result.wb_solve else None,
         "cameras": [_camera_fingerprint(c) for c in cams],
     }
@@ -158,13 +169,18 @@ def main() -> int:
     ap.add_argument("--out", required=True, help="working output dir for the run")
     ap.add_argument("--golden", required=True, help="path to the golden JSON")
     ap.add_argument("--tol", type=float, default=0.0, help="abs tolerance for float compares (default 0 = exact)")
+    ap.add_argument("--strategy", default="median", choices=["median", "gray_anchor"],
+                    help="exposure matching strategy to capture/compare (default: median)")
+    ap.add_argument("--gray-target-ire", type=float, default=33.3,
+                    help="gray_anchor Log3G10 IRE target (default: 33.3 = 18%% gray)")
     ap.add_argument("--no-reuse", action="store_true", help="force fresh renders (NOT recommended for identity check)")
     ap.add_argument("--use-priors", action="store_true",
                     help="enable the live sphere-profile priors (NOT recommended: the profile store "
                          "mutates across runs, making the golden non-deterministic). Default: priors disabled.")
     args = ap.parse_args()
 
-    fresh = _run(args.input, args.out, reuse=not args.no_reuse, disable_priors=not args.use_priors)
+    fresh = _run(args.input, args.out, reuse=not args.no_reuse, disable_priors=not args.use_priors,
+                 strategy=args.strategy, gray_target_ire=args.gray_target_ire)
 
     golden_path = Path(args.golden)
     if args.mode == "capture":
