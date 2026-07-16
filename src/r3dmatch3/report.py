@@ -95,7 +95,7 @@ def _render_html(rr: RunResult) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>R3DMatch Assessment — {run_name}</title>
+  <title>R3DMatch Assessment: {run_name}</title>
   <style>{_css()}</style>
 </head>
 <body>
@@ -856,7 +856,7 @@ def _render_overview(
         result_class = "result" if array_pct >= 95.0 else "result-warn"
         min_pct = getattr(rr, "min_match_pct", None)
         min_clip = getattr(rr, "min_match_clip_id", "")
-        result_note = "Array match — mean of camera match scores."
+        result_note = "Array match. Mean of camera match scores."
         if min_pct is not None and min_pct < array_pct - 0.5:
             result_note = f"Array match. Lowest: {min_clip} at {min_pct:.0f}%."
     elif needs_assist > 0:
@@ -879,6 +879,17 @@ def _render_overview(
 
     top3 = sorted_by_adj[:3]
 
+    # Strategy note depends on the matching strategy — the median description is
+    # wrong for the absolute gray anchor (which doesn't use a median at all).
+    if (getattr(rr, "anchor_source", "") or "median") == "gray_anchor":
+        _gt = getattr(rr, "gray_target_ire", 0.0) or 33.3
+        strategy_note = (f"Absolute anchor. Every camera is driven to "
+                         f"{_gt:.1f}&nbsp;IRE Log3G10 (18% gray, 0.18 scene-linear), "
+                         f"not the array median.")
+    else:
+        strategy_note = ("Median of the array in stops, with 3&times;MAD outlier "
+                         "rejection so a stray camera can&rsquo;t skew the target.")
+
     cards_html = f"""
     <div class="cards">
       <div class="card">
@@ -887,7 +898,7 @@ def _render_overview(
           <div class="card-label">Matching<br>Strategy</div>
         </div>
         <div class="card-value mono">{strategy}</div>
-        <div class="card-note">Robust median in stops (3&times;MAD outlier rejection) &mdash; an off-exposure camera can&rsquo;t pull the target.</div>
+        <div class="card-note">{strategy_note}</div>
       </div>
       <div class="card">
         <div class="card-head">
@@ -1019,7 +1030,7 @@ def _render_overview(
       {'' if eo else f'''<div class="panel wb-panel">
         <div class="panel-head">
           <div class="panel-title">White Balance (Neutral Placement)</div>
-          <div class="panel-sub">Hollow = as-shot &rarr; filled = corrected, measured from render. Centered on group neutral &mdash; cameras match each other, not absolute white.</div>
+          <div class="panel-sub">Hollow = as-shot &rarr; filled = corrected, measured from render. Centered on group neutral, so cameras match each other, not absolute white.</div>
         </div>
         <div class="panel-body">{vectorscope_svg}</div>
       </div>'''}
@@ -1169,7 +1180,7 @@ def _render_array_comparison(rr: RunResult, cameras: list, run_name: str) -> str
   <div class="array-header">
     <div>
       <div style="font-size:11px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#6e6962;margin-bottom:6px;"><span class="r3d-mark">R3D</span>Match Assessment &nbsp;&middot;&nbsp; Array-Level Comparison</div>
-      <div class="section-headline">Before / After &mdash; Full Array Overview</div>
+      <div class="section-headline">Before / After: Full Array Overview</div>
       <div class="section-sub">
         Each column = one camera. <strong>Gray bars</strong> = raw measured IRE before calibration.
         <strong>Colored bars</strong> = corrected IRE after commit values are applied via
@@ -1182,7 +1193,7 @@ def _render_array_comparison(rr: RunResult, cameras: list, run_name: str) -> str
 
   <div style="background:#ffffff;border:1px solid #ddd9d3;border-radius:10px;overflow:hidden;margin-bottom:10px;">
     <div class="panel-head">
-      <div class="panel-title">IRE Convergence &mdash; Raw vs Calibrated &nbsp;&middot;&nbsp; All {n} Cameras</div>
+      <div class="panel-title">IRE Convergence: Raw vs Calibrated &nbsp;&middot;&nbsp; All {n} Cameras</div>
       <div class="panel-sub">Anchor: {anchor:.1f}&nbsp;IRE &nbsp;&middot;&nbsp; Strategy: {_strategy_label(rr)} &nbsp;&middot;&nbsp; Acceptance zone: &plusmn;{ACCEPT_IRE:g}&nbsp;IRE</div>
     </div>
     <div class="panel-body" style="padding:12px 14px;">
@@ -1193,7 +1204,7 @@ def _render_array_comparison(rr: RunResult, cameras: list, run_name: str) -> str
   <div class="post-callout">
     <div class="pc-icon">&#x1F4EC;</div>
     <div>
-      <strong>Note for Post Production &mdash;</strong>
+      <strong>Note for Post Production.</strong>
       The correction values in this report are embedded in each clip&rsquo;s R3D metadata.
       Apply them in your colour pipeline by rendering with REDline using the
       <code>--useMeta</code> flag, which tells REDline to read the
@@ -1279,10 +1290,10 @@ def _render_export_page(rr: RunResult, cameras: List[CameraResult]) -> str:
         <thead><tr><th>File</th><th>Purpose</th></tr></thead>
         <tbody>
           <tr><td><code>match_export.json</code></td><td>Tool-agnostic, full fidelity. Per camera: exposureAdjust (plus Kelvin/tint on white-balance runs), as-shot metadata, match&nbsp;%, and the raw/divider integer form RCP2 uses. Carries the REDLine recipe block.</td></tr>
-          <tr><td><code>redline_batch.sh</code></td><td>Runnable, camera-wide REDLine batch. <code>bash redline_batch.sh</code> — prompts for the REDLine binary (auto-found if possible), media root, output dir, and your REDLine flags. Groups clips by camera subfolder, so each camera's EV applies to <b>every</b> clip that camera shot that day (not just the calibrated one). Offers a dry run first. Build&nbsp;65.1.3+, no RMD.</td></tr>
-          <tr><td><code>camera_offsets.csv</code></td><td>One EV per camera code (GA, GB, … ID) — the offsets the batch reads.</td></tr>
-          <tr><td><code>clips.csv</code></td><td>The calibrated clips per camera (reference only — the batch discovers the full day from the media root).</td></tr>
-          <tr><td><code>redcinex_develop.csv</code></td><td>REDCINE-X develop-panel reference (Exposure / Color Temp / Tint). For GUI work — build one Exposure-Adjust Look Preset per camera and apply by bin.</td></tr>
+          <tr><td><code>redline_batch.sh</code></td><td>Runnable, camera-wide REDLine batch. <code>bash redline_batch.sh</code> prompts for the REDLine binary (auto-found if possible), media root, output dir, and your REDLine flags. Groups clips by camera subfolder, so each camera's EV applies to <b>every</b> clip that camera shot that day (not just the calibrated one). Offers a dry run first. Build&nbsp;65.1.3+, no RMD.</td></tr>
+          <tr><td><code>camera_offsets.csv</code></td><td>One EV per camera code (GA, GB, … ID), the offsets the batch reads.</td></tr>
+          <tr><td><code>clips.csv</code></td><td>The calibrated clips per camera (reference only; the batch discovers the full day from the media root).</td></tr>
+          <tr><td><code>redcinex_develop.csv</code></td><td>REDCINE-X develop-panel reference (Exposure / Color Temp / Tint). For GUI work, build one Exposure-Adjust Look Preset per camera and apply by bin.</td></tr>
         </tbody>
       </table>"""
 
@@ -1297,7 +1308,7 @@ def _render_export_page(rr: RunResult, cameras: List[CameraResult]) -> str:
     <div>
       <div class="hd-brand"><span class="r3d-mark">R3D</span>Match Assessment · {rr.run_id}</div>
       <div class="hd-cam">Offline Match Export</div>
-      <div class="hd-project">Network-down fallback — written to the calibration folder on every run, alongside summary.json</div>
+      <div class="hd-project">Network-down fallback, written to the calibration folder on every run, alongside summary.json</div>
     </div>
   </div>
 
@@ -1307,18 +1318,18 @@ def _render_export_page(rr: RunResult, cameras: List[CameraResult]) -> str:
       <li><b>On set (primary path).</b> R3DMatch measures each camera against the 18% gray sphere and
           solves a per-camera exposure offset (and white balance, unless Exposure-only). Those values are
           pushed live to the cameras over RCP2 before recording, so the array is matched in-camera.</li>
-      <li><b>Fallback (these files).</b> If RCP2 is unreachable — network down, camera offline, or the push
-          is skipped — every run still writes the solved corrections to this calibration folder. Nothing is
+      <li><b>Fallback (these files).</b> If RCP2 is unreachable (network down, camera offline, or the push
+          is skipped), every run still writes the solved corrections to this calibration folder. Nothing is
           lost; the match is captured on disk.</li>
       <li><b>In post.</b> The offsets are the same IPP2 Exposure Adjust values the camera would have taken,
           so a REDLine render reproduces the on-set match exactly. <code>redline_batch.sh</code> applies each
-          camera's offset to <b>every clip that camera shot that day</b> — it reads the camera identity from
+          camera's offset to <b>every clip that camera shot that day</b>. It reads the camera identity from
           each clip's name (reel + position → GA, GB, … ID), so it works whether the day's media is foldered
           by camera or laid out flat as <code>media/RDM/RDC/R3D</code>.</li>
     </ol>
     <p style="font-size:10.5px;color:#6e6962;max-width:1020px;line-height:1.5;margin-top:4px;">
       Calibration runs on one clip per camera; the batch expands that to the camera's whole day. Exposure is
-      applied in the RAW/IPP2 domain via <code>--exposureAdjust</code> — not baked into a LUT or CDL. White
+      applied in the RAW/IPP2 domain via <code>--exposureAdjust</code>, not baked into a LUT or CDL. White
       balance, when solved, travels via the RMD / REDCINE-X develop path.
     </p>
 
@@ -1329,7 +1340,7 @@ def _render_export_page(rr: RunResult, cameras: List[CameraResult]) -> str:
     <div class="recipe-box"><code>{recipe}</code></div>
     <p style="font-size:10.5px;color:#6e6962;max-width:1020px;line-height:1.5;">
       Use <code>--exposureAdjust</code> (IPP2 Exposure Adjust), <b>not</b> <code>--exposure</code>.
-      <code>--colorSciVersion 3</code> forces IPP2 explicitly. Do not bake offsets into LUTs or CDLs —
+      <code>--colorSciVersion 3</code> forces IPP2 explicitly. Do not bake offsets into LUTs or CDLs,
       that is not RAW-domain matching. This batch applies <b>exposure only</b>; white balance travels via
       the RMD / REDCINE-X develop path. Validate with a one-frame render or <code>--printMeta 2</code> first.
     </p>
@@ -1378,10 +1389,10 @@ def _render_coherence_pages(rr: RunResult, cameras: List[CameraResult]) -> str:
 
     grid_style = f"grid-template-columns:repeat({cols},1fr)"
     before_block = (
-        '<div class="coh-block"><div class="coh-blocklabel">Before &mdash; as shot</div>'
+        '<div class="coh-block"><div class="coh-blocklabel">Before (as shot)</div>'
         f'<div class="coh-grid" style="{grid_style}">' + "".join(before_cells) + '</div></div>')
     after_block = (
-        '<div class="coh-block"><div class="coh-blocklabel coh-after">After &mdash; matched</div>'
+        '<div class="coh-block"><div class="coh-blocklabel coh-after">After (matched)</div>'
         f'<div class="coh-grid" style="{grid_style}">' + "".join(after_cells) + '</div></div>')
 
     # Accuracy claim — placed where the match is seen.
@@ -1398,7 +1409,7 @@ def _render_coherence_pages(rr: RunResult, cameras: List[CameraResult]) -> str:
         return f"""
 <section class="landscape-page coherence-page">
   <div class="coh-top">
-    <div class="coh-title"><span class="r3d-mark">R3D</span>Array Coherence &mdash; Before vs After</div>
+    <div class="coh-title"><span class="r3d-mark">R3D</span>Array Coherence: Before vs After</div>
     <div class="coh-claim">{claim}</div>
   </div>
   {blocks}
@@ -1411,7 +1422,7 @@ def _render_coherence_pages(rr: RunResult, cameras: List[CameraResult]) -> str:
 
     if single_page:
         return page(before_block + after_block, "Coherence")
-    return page(before_block, "Coherence — Before") + page(after_block, "Coherence — After")
+    return page(before_block, "Coherence: Before") + page(after_block, "Coherence: After")
 
 
 # ---------------------------------------------------------------------------
@@ -1607,17 +1618,26 @@ def _render_wb_col(cr: CameraResult, k: int, tint: float) -> str:
     as_t = cr.metadata.tint if cr.metadata else 0.0
 
     # Simple 2-axis mini WB visualization (SVG)
-    # Normalize tint to ±5.0 range → position on a 180px track (center=90)
+    # Track spans x=28..208 (center=118). Normalize tint to ±5.0 → track position.
     tint_norm = max(-5.0, min(5.0, tint)) / 5.0   # -1..1
-    tint_pos  = 90 + tint_norm * 60                  # px from left (center=90)
+    tint_pos  = 118 + tint_norm * 90                 # px from left (center=118, half-span 90)
+    # Unique gradient id per camera so multiple inline SVGs don't collide.
+    _uid = "".join(c if c.isalnum() else "_" for c in cr.clip_id)
 
     wb_svg = f"""<svg viewBox="0 0 236 84" role="img" aria-label="Neutral chromaticity placement">
+      <defs>
+        <linearGradient id="gm_{_uid}" gradientUnits="userSpaceOnUse" x1="28" y1="0" x2="208" y2="0">
+          <stop offset="0" stop-color="#3fae5a"/>
+          <stop offset="0.5" stop-color="#ece9e3"/>
+          <stop offset="1" stop-color="#c0499b"/>
+        </linearGradient>
+      </defs>
       <rect x="0" y="0" width="236" height="84" rx="10" fill="#faf9f7" stroke="#d7dee8"/>
-      <text x="28" y="15" fill="#6e6962" font-size="10" font-weight="700">Green ←→ Magenta</text>
-      <text x="118" y="15" text-anchor="middle" fill="#1a1816" font-size="9" font-weight="700">Neutral</text>
-      <line x1="28" y1="28" x2="208" y2="28" stroke="#d6d3cd" stroke-width="5" stroke-linecap="round"/>
+      <text x="118" y="15" text-anchor="middle" fill="#6e6962" font-size="10" font-weight="700">Green ←→ Magenta</text>
+      <rect x="28" y="25" width="180" height="6" rx="3" fill="url(#gm_{_uid})"/>
       <line x1="118" y1="20" x2="118" y2="36" stroke="#1a1816" stroke-width="2"/>
       <circle cx="{tint_pos:.1f}" cy="28" r="6.5" fill="#1a1816" stroke="white" stroke-width="2"/>
+      <text x="118" y="48" text-anchor="middle" fill="#6e6962" font-size="9" font-weight="700">Neutral</text>
       <text x="118" y="70" text-anchor="middle" fill="#1a1816" font-size="10" font-weight="700">Tint offset: {tint:+.1f} units</text>
     </svg>"""
 
@@ -1637,7 +1657,7 @@ def _render_wb_col(cr: CameraResult, k: int, tint: float) -> str:
     else:
         verified_row = (
             '<div class="mc-row"><span class="mc-key">Corrected GM / WC</span>'
-            '<span class="mc-val mono" title="No corrected render measured — solve-time prediction only">'
+            '<span class="mc-val mono" title="No corrected render measured, solve-time prediction only">'
             'predicted only</span></div>'
         )
 
@@ -1741,7 +1761,7 @@ def _render_notes_strip(cr: CameraResult, status: str, adj: float) -> str:
         items.append(("Failure", cr.failure_reason))
     ire_ctx = getattr(cr.detection, "ire_context_status", "ok") if cr.detection else "ok"
     if ire_ctx == "needs_assist":
-        items.append(("IRE context", "NEEDS ASSIST — operator verification required"))
+        items.append(("IRE context", "NEEDS ASSIST, operator verification required"))
 
     items_html = "".join(
         f'<div class="note-item"><span class="note-key">{k}</span><span class="note-val">{v}</span></div>'
@@ -2087,7 +2107,7 @@ def _render_quick_notes(
         assist_html = f"""
         <div class="quick-group">
           <div class="quick-label">Needs operator verification</div>
-          {"".join(f'<div class="quick-item"><span class="num" style="background:#7c3aed">!</span><span>{cr.camera_label} — IRE context flag</span></div>' for cr in needs_assist_cameras)}
+          {"".join(f'<div class="quick-item"><span class="num" style="background:#7c3aed">!</span><span>{cr.camera_label}: IRE context flag</span></div>' for cr in needs_assist_cameras)}
         </div>"""
 
     return f"""

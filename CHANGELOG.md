@@ -21,6 +21,14 @@ All notable changes to R3DMatch are recorded here.
 - README: document the **Capture** tab (RCP2 synchronized single-frame record +
   FTP-over-TLS ingest) and the two matching strategies; refresh the project layout.
 
+### Report
+- Strategy chip now describes the active strategy (median vs 18% gray anchor)
+  instead of always showing the median description.
+- White-balance neutral slider: green-to-magenta gradient track, "Neutral" label
+  moved below the track to fix overlap, and corrected marker centering.
+- Plain-language copy pass: prose em dashes replaced with commas, colons, and
+  parentheses; a few performative lines simplified. Empty-value placeholders kept.
+
 ### Changed
 - **Exposure now hard-requires a scene-linear measurement for every camera.** The
   previous silent all-or-nothing fallback to a display-space solve (which
