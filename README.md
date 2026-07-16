@@ -24,7 +24,10 @@ report is *measured* from a corrected re-render, not estimated.
 - **REDCINE-X PRO / REDLine** installed (used for all rendering and metadata).
   R3DMatch auto-detects it at the standard install path; set it in
   **Settings → REDLine** if it lives elsewhere.
-- Camera network access for the RCP2 push step (cameras reachable by IP).
+- Camera network access for the **Capture** and RCP2 **push** steps (cameras
+  reachable by IP). Capture's clip ingest uses FTP-over-TLS — set the body
+  credentials, a destination folder, and the camera network in **Settings**
+  (nothing is assumed; the pull step stays disabled until they're filled).
 
 Python dependencies are pinned in `requirements.txt` / `pyproject.toml`
 (PySide6, NumPy, Pillow, OpenCV, scikit-image, SciPy, tifffile, websockets,
@@ -60,7 +63,9 @@ r3dmatch                 # console entry point
 
 ## Workflow
 
-1. **Ingest** — point at the card folder (single frame R3D per camera). Choose the
+1. **Ingest** — point at the card folder (single frame R3D per camera), or grab the
+   frames straight from the array with the **Capture** tab (see *Capture* below).
+   Choose the
    matching strategy (Median is the robust default; **18% Gray Anchor** targets an
    absolute gray level — see *Matching strategies* below), the delivery look the
    match is scored through, and the white-balance mode (scene-temp per-camera
@@ -80,6 +85,36 @@ The HTML report (written to the output folder) is the chain-of-custody document:
 an overview, the IRE-convergence chart, a before/after **Array Coherence**
 contact sheet, and a per-camera page with the measured closed-loop result. 
 Post renders with --useMeta to inherit the changes.
+
+---
+
+## Capture (optional)
+
+Instead of offloading cards, R3DMatch can acquire the calibration frame directly
+from the array over the camera network. The **Capture** tab runs three steps,
+driving the same RCP2 protocol (port 9998) used by the push:
+
+1. **Detect** — a TCP probe sweeps the camera network to find the RED KOMODO-X
+   bodies. It scans the stage network first, then a `/24` derived from the host's
+   own NIC (link-local `/16` ranges are narrowed so a scan never explodes to 65k
+   hosts). Detection opens **no** session — it only lists what's reachable.
+2. **Synchronized single-frame record** — one persistent RCP2 session per body,
+   frame-limit set to 1, sync verified, then `SYNC_RECORD_START` fired at a shared
+   timecode a few seconds out so every body grabs the *same* instant. Scales to a
+   full array (up to 36 bodies).
+3. **Ingest** — the clip just recorded is pulled off each body over **FTP-over-TLS**
+   into the destination folder (newest clip only — it never sweeps whole reels),
+   staged to `.part` with a size verify.
+
+The ingested frames drop straight into **Ingest → Analyze**, so a full
+calibration — capture, solve, and RCP2 push — can run without a card reader.
+Credentials, destination, and the camera network are set in **Settings** and are
+never assumed.
+
+> **Hardware status:** the capture transport encodes the documented RCP2 sync-record
+> flow and the field rules from the proven reference tools, but paths not yet
+> confirmed on a live body are marked `# UNVERIFIED` in `capture.py` — validate on
+> a camera before relying on them in production.
 
 ---
 
@@ -145,14 +180,17 @@ In an Exposure-only run, only `exposureAdjust` is written; otherwise
 ## Project layout
 
 ```
-R3DMatch_v4/
+R3DMatch_v5/
 ├── src/r3dmatch3/        # application package
 │   ├── app.py            # PySide6 GUI (entry: r3dmatch / python -m r3dmatch3.app)
 │   ├── workflow.py       # render → detect → measure → solve → verify
 │   ├── sphere.py         # gray-sphere detection (Hough/ALT + gate pipeline)
 │   ├── measure.py        # measurement math (display + scene-linear)
-│   ├── solve.py          # exposure + white-balance solve
-│   ├── rcp2.py           # RCP2 camera push (WebSocket)
+│   ├── solve.py          # exposure (median / 18% gray anchor) + white-balance solve
+│   ├── capture.py        # RCP2 synchronized single-frame capture (WebSocket)
+│   ├── capture_ftp.py    # single-clip FTP-over-TLS ingest from each body
+│   ├── rcp2.py           # RCP2 calibration push (WebSocket)
+│   ├── settings.py       # persisted settings (REDLine path, camera net, FTP creds)
 │   ├── report.py         # HTML assessment report
 │   └── colorpipeline.py  # REDLine color-science configs
 ├── tools/                # diagnostic + validation scripts

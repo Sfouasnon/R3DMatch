@@ -17,6 +17,10 @@ All notable changes to R3DMatch are recorded here.
 - Fresh golden baselines for the `GraySphere_GrayBackdrop_FocusChart` set (median
   and gray-anchor), replacing the stale display-space median baseline.
 
+### Documentation
+- README: document the **Capture** tab (RCP2 synchronized single-frame record +
+  FTP-over-TLS ingest) and the two matching strategies; refresh the project layout.
+
 ### Changed
 - **Exposure now hard-requires a scene-linear measurement for every camera.** The
   previous silent all-or-nothing fallback to a display-space solve (which
